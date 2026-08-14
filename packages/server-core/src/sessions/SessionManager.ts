@@ -4754,6 +4754,25 @@ export class SessionManager implements ISessionManager {
       // Notify all windows for this workspace
       this.sendEvent({ type: 'session_archived', sessionId }, managed.workspace.id)
       this.emitUnreadSummaryChanged()
+
+      // An archived session must not keep an agent runtime alive. Without this,
+      // its subprocess, pool server, MCP connections and config watchers survive
+      // for the lifetime of the server: ~30 MB each, and nothing can reclaim them
+      // afterwards because the OS carries no session identity on those processes —
+      // an external reaper can only guess by cwd and must refuse whenever a live
+      // session shares it. Long-running fleets accumulate hundreds.
+      //
+      // The ManagedSession itself stays in the map, so unarchive and every read
+      // path keep working and the next turn lazily rebuilds the runtime through
+      // getOrCreateAgent().
+      if (managed.isProcessing && managed.agent) {
+        // Archiving retires the session; a turn in flight is stopped explicitly
+        // so teardown never races a live query. (The archive_session tool guard
+        // already refuses mid-turn targets; direct RPC callers do not.)
+        managed.agent.forceAbort(AbortReason.UserStop)
+        await new Promise(resolve => setTimeout(resolve, 100))
+      }
+      await this.disposeManagedAgentRuntime(managed, 'session archived')
     }
   }
 
