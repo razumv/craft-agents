@@ -117,3 +117,33 @@ describe('mode transition session_state context', () => {
     cleanupModeState(sessionId);
   });
 });
+
+describe('mode display lookup survives foreign state', () => {
+  it('formats session state when the stored mode is not a config key', () => {
+    // A session whose mode state was written by another path can hold a canonical
+    // alias ('execute') instead of an internal key. Indexing PERMISSION_MODE_CONFIG
+    // with it threw, and the same diagnostics feed both the agent turn and the
+    // renderer: one spawned coordinator could neither answer a message nor have its
+    // mode repaired, and opening it crashed the desktop app.
+    const sessionId = `mode-foreign-${Date.now()}`;
+    initializeModeState(sessionId, 'allow-all');
+    hydratePreviousPermissionMode(sessionId, 'execute' as never);
+
+    const diagnostics = getPermissionModeDiagnostics(sessionId);
+    expect(diagnostics.transitionDisplay).toBe('Execute -> Execute');
+    expect(() => formatSessionState(sessionId)).not.toThrow();
+
+    cleanupModeState(sessionId);
+  });
+
+  it('formats session state for a session whose mode state was never created', () => {
+    // Exactly the spawned-coordinator case: the session exists, nothing ever went
+    // through the mode manager for it, and the first message must still render.
+    const sessionId = `mode-absent-${Date.now()}`;
+
+    expect(() => formatSessionState(sessionId)).not.toThrow();
+    expect(formatSessionState(sessionId)).toContain(`sessionId: ${sessionId}`);
+
+    cleanupModeState(sessionId);
+  });
+});

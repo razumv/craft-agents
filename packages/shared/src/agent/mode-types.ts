@@ -64,6 +64,20 @@ export function toCanonicalPermissionMode(mode: PermissionMode): PermissionModeC
  * Accepts canonical values (explore/ask/execute) and legacy aliases
  * (safe/allow-all, ask-to-edit) for backward compatibility.
  */
+/**
+ * Display name for any mode value, including ones this module never produced.
+ *
+ * Persisted session state can carry a canonical alias ('execute'), a legacy
+ * alias, or nothing at all — and indexing PERMISSION_MODE_CONFIG with any of
+ * those throws, taking down both the agent turn and the renderer that shows the
+ * same diagnostics. Looking a display name up must never be able to fail.
+ */
+export function permissionModeDisplayName(mode: string | null | undefined): string {
+  if (!mode) return 'Unknown';
+  const parsed = parsePermissionMode(mode);
+  return parsed ? PERMISSION_MODE_CONFIG[parsed].displayName : 'Unknown';
+}
+
 export function parsePermissionMode(mode: string): PermissionMode | null {
   const normalized = mode.trim().toLowerCase();
 

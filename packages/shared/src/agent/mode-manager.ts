@@ -47,6 +47,7 @@ import {
   type PermissionModeCanonical,
   toCanonicalPermissionMode,
   parsePermissionMode,
+  permissionModeDisplayName,
 } from './mode-types.ts';
 
 // Import incr-regex-package for smart pattern mismatch diagnostics
@@ -470,7 +471,7 @@ export function getPermissionModeDiagnostics(sessionId: string): {
 } {
   const state = modeManager.getState(sessionId);
   const transitionDisplay = state.previousPermissionMode
-    ? `${PERMISSION_MODE_CONFIG[state.previousPermissionMode].displayName} -> ${PERMISSION_MODE_CONFIG[state.permissionMode].displayName}`
+    ? `${permissionModeDisplayName(state.previousPermissionMode)} -> ${permissionModeDisplayName(state.permissionMode)}`
     : undefined;
   const userModeSignalPending =
     state.lastChangedBy === 'user' &&
@@ -2150,7 +2151,7 @@ export function formatSessionState(
   result += `\nmodeChangedAt: ${diagnostics.lastChangedAt}`;
   result += `\nmodeVersion: ${diagnostics.modeVersion}`;
 
-  const transitionLabel = diagnostics.transitionDisplay ?? `Unknown -> ${PERMISSION_MODE_CONFIG[diagnostics.permissionMode].displayName}`;
+  const transitionLabel = diagnostics.transitionDisplay ?? `Unknown -> ${permissionModeDisplayName(diagnostics.permissionMode)}`;
   result += `\nmodeChangeSummary: Last mode change by ${diagnostics.lastChangedBy} at ${diagnostics.lastChangedAt} (${transitionLabel}, modeVersion=${diagnostics.modeVersion})`;
 
   if (diagnostics.userModeSignalPending) {
