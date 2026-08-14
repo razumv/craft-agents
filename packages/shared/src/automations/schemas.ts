@@ -29,6 +29,13 @@ export const PromptActionSchema = z.object({
   thinkingLevel: ThinkingLevelInputSchema,
 });
 
+export const SessionMessageActionSchema = z.object({
+  type: z.literal('session-message'),
+  sessionId: z.string().trim().min(1, 'Session ID cannot be empty'),
+  message: z.string().min(1, 'Message cannot be empty'),
+  idempotencyKey: z.string().trim().min(1, 'Idempotency key cannot be empty').optional(),
+});
+
 export const WebhookActionSchema = z.object({
   type: z.literal('webhook'),
   url: z.string().min(1, 'URL cannot be empty').refine(
@@ -63,11 +70,16 @@ export const WebhookActionSchema = z.object({
   ]).optional(),
 });
 
-/** Accepts prompt and webhook actions strictly; passes through legacy/unknown action types without erroring */
+/** Accepts supported actions strictly; passes through legacy/unknown action types without erroring */
 export const ActionDefinitionSchema = z.union([
   PromptActionSchema,
+  SessionMessageActionSchema,
   WebhookActionSchema,
-  z.object({ type: z.string() }).passthrough(),
+  z.object({
+    // Preserve forward compatibility for genuinely unknown legacy actions, but
+    // never let this fallback bypass validation of a supported action type.
+    type: z.string().refine((type) => !['prompt', 'webhook', 'session-message'].includes(type), 'Supported action must satisfy its schema'),
+  }).passthrough(),
 ]);
 
 // ============================================================================

@@ -21,8 +21,8 @@ import { resolveAutomationsConfigPath, generateShortId } from './resolve-config-
 import { compactAutomationHistorySync } from './history-store.ts';
 import { createLogger } from '../utils/debug.ts';
 import { WorkspaceEventBus, type EventPayloadMap } from './event-bus.ts';
-import { PromptHandler, EventLogHandler, WebhookHandler, type AutomationsConfigProvider } from './handlers/index.ts';
-import { type AutomationsConfig, type AutomationEvent, type AutomationMatcher, type PendingPrompt, type WebhookActionResult, type AppEvent, type AgentEvent, type SdkAutomationCallbackMatcher, type SdkAutomationInput } from './types.ts';
+import { PromptHandler, SessionMessageHandler, EventLogHandler, WebhookHandler, type AutomationsConfigProvider } from './handlers/index.ts';
+import { type AutomationsConfig, type AutomationEvent, type AutomationMatcher, type PendingPrompt, type PendingSessionMessage, type WebhookActionResult, type AppEvent, type AgentEvent, type SdkAutomationCallbackMatcher, type SdkAutomationInput } from './types.ts';
 import { validateAutomationsConfig } from './validation.ts';
 import { matcherMatchesSdk } from './utils.ts';
 import { SchedulerService, type SchedulerTickPayload } from '../scheduler/scheduler-service.ts';
@@ -52,6 +52,8 @@ export interface AutomationSystemOptions {
   onPromptsReady?: (prompts: PendingPrompt[]) => void;
   /** Called when webhook results are available */
   onWebhookResults?: (results: WebhookActionResult[]) => void;
+  /** Called when existing-session messages are ready for durable admission. */
+  onSessionMessagesReady?: (messages: PendingSessionMessage[]) => void | Promise<void>;
   /** Called when an error occurs during automation execution */
   onError?: (event: AutomationEvent, error: Error) => void;
   /** Called when events are lost after retries */
@@ -68,6 +70,7 @@ export class AutomationSystem implements AutomationsConfigProvider {
   private readonly options: AutomationSystemOptions;
   private config: AutomationsConfig | null = null;
   private promptHandler: PromptHandler | null = null;
+  private sessionMessageHandler: SessionMessageHandler | null = null;
   private webhookHandler: WebhookHandler | null = null;
   private eventLogHandler: EventLogHandler | null = null;
   private scheduler: SchedulerService | null = null;
@@ -255,6 +258,16 @@ export class AutomationSystem implements AutomationsConfigProvider {
       this
     );
     this.promptHandler.subscribe(this.eventBus);
+
+    this.sessionMessageHandler = new SessionMessageHandler(
+      {
+        workspaceId: this.options.workspaceId,
+        workspaceRootPath: this.options.workspaceRootPath,
+        onSessionMessagesReady: this.options.onSessionMessagesReady,
+      },
+      this,
+    );
+    this.sessionMessageHandler.subscribe(this.eventBus);
 
     // Webhook handler
     this.webhookHandler = new WebhookHandler(
@@ -548,6 +561,7 @@ export class AutomationSystem implements AutomationsConfigProvider {
 
     // Dispose handlers
     this.promptHandler?.dispose();
+    this.sessionMessageHandler?.dispose();
     this.webhookHandler?.dispose();
     await this.eventLogHandler?.dispose();
 

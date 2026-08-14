@@ -3,6 +3,7 @@ import { join } from 'path'
 import { RPC_CHANNELS } from '@craft-agent/shared/protocol'
 import { getWorkspaceByNameOrId } from '@craft-agent/shared/config'
 import { appendAutomationHistoryEntry } from '@craft-agent/shared/automations/history-store'
+import { AutomationAdmissionStore, type AutomationAdmissionScope } from '@craft-agent/shared/automations/admission-store'
 import { AUTOMATION_HISTORY_MAX_RUNS_PER_MATCHER } from '@craft-agent/shared/automations/constants'
 import type { RpcServer } from '@craft-agent/server-core/transport'
 import type { HandlerDeps } from '../handler-deps'
@@ -63,10 +64,128 @@ export const HANDLED_CHANNELS = [
   RPC_CHANNELS.automations.GET_HISTORY,
   RPC_CHANNELS.automations.GET_LAST_EXECUTED,
   RPC_CHANNELS.automations.REPLAY,
+  RPC_CHANNELS.automations.ADMISSION_CAPABILITIES,
+  RPC_CHANNELS.automations.ADMISSION_CLAIM,
+  RPC_CHANNELS.automations.ADMISSION_DELIVER,
+  RPC_CHANNELS.automations.ADMISSION_INSPECT,
+  RPC_CHANNELS.automations.ADMISSION_RECOVER,
 ] as const
 
 export function registerAutomationsHandlers(server: RpcServer, deps: HandlerDeps): void {
   const log = deps.platform.logger
+
+  // Durable admission discovery is available only after the transport's
+  // authenticated handshake. The registered channel is also advertised in the
+  // handshake acknowledgement for capability-aware clients.
+  server.handle(RPC_CHANNELS.automations.ADMISSION_CAPABILITIES, async () => ({
+    version: 2,
+    // Deployment identity is explicit rather than inferred from Node/Electron
+    // versions. Capability-aware controllers fail closed when either value is
+    // absent or does not match their accepted pinned runtime.
+    runtimeVersion: process.env.CRAFT_VERSION ?? null,
+    runtimeCommit: process.env.CRAFT_BUILD_SHA ?? null,
+    actions: ['session-message'],
+    states: ['prepared', 'delivering', 'committed', 'completed', 'blocked'],
+    deliveryStates: ['delivered', 'pending-consumption', 'consumed', 'duplicate', 'busy', 'blocked'],
+    targetKinds: ['controller', 'coordinator'],
+    minimumRecoveryAgeMs: 60_000,
+    claimChannel: RPC_CHANNELS.automations.ADMISSION_CLAIM,
+    deliverChannel: RPC_CHANNELS.automations.ADMISSION_DELIVER,
+    inspectChannel: RPC_CHANNELS.automations.ADMISSION_INSPECT,
+    recoverChannel: RPC_CHANNELS.automations.ADMISSION_RECOVER,
+  }))
+
+  // Generic atomic admission claim surface for authenticated RPC clients.
+  // It only reserves work; product-specific side effects remain with their
+  // owning runtime (for session-message, SessionManager).
+  server.handle(RPC_CHANNELS.automations.ADMISSION_CLAIM, async (_ctx, workspaceId: string, scope: AutomationAdmissionScope) => {
+    const workspace = getWorkspaceByNameOrId(workspaceId)
+    if (!workspace) throw new Error('Workspace not found')
+    if (!scope || scope.workspaceId !== workspace.id) throw new Error('Admission scope workspace does not match requested workspace')
+    return new AutomationAdmissionStore(workspace.rootPath).claim(scope)
+  })
+
+  // Supported addressable delivery surface. Claim and message persistence are
+  // one SessionManager operation, so clients never need to compose a non-atomic
+  // `claim` plus ordinary `sessions:sendMessage` sequence.
+  server.handle(RPC_CHANNELS.automations.ADMISSION_DELIVER, async (_ctx, workspaceId: string, input: {
+    sessionId: string
+    message: string
+    matcherId: string
+    actionId: string
+    occurrenceId: string
+    idempotencyKey: string
+    targetKind: 'controller' | 'coordinator'
+    targetId: string
+    targetGeneration: string
+  }) => {
+    const workspace = getWorkspaceByNameOrId(workspaceId)
+    if (!workspace) throw new Error('Workspace not found')
+    for (const field of ['sessionId', 'message', 'matcherId', 'actionId', 'occurrenceId', 'idempotencyKey', 'targetId', 'targetGeneration'] as const) {
+      if (typeof input?.[field] !== 'string' || input[field].trim().length === 0) throw new Error(`Admission delivery ${field} must be a non-empty string`)
+    }
+    if (input.targetKind !== 'controller' && input.targetKind !== 'coordinator') throw new Error('Admission delivery targetKind must be controller or coordinator')
+    return deps.sessionManager.deliverAutomationSessionMessage({
+      workspaceId: workspace.id,
+      workspaceRootPath: workspace.rootPath,
+      sessionId: input.sessionId,
+      message: input.message,
+      matcherId: input.matcherId,
+      actionId: input.actionId,
+      occurrenceId: input.occurrenceId,
+      idempotencyKey: input.idempotencyKey,
+      targetKind: input.targetKind,
+      targetId: input.targetId,
+      targetGeneration: input.targetGeneration,
+    })
+  })
+
+  server.handle(RPC_CHANNELS.automations.ADMISSION_INSPECT, async (_ctx, workspaceId: string, input: {
+    sessionId: string
+    matcherId: string
+    actionId: string
+    occurrenceId: string
+    idempotencyKey: string
+  }) => {
+    const workspace = getWorkspaceByNameOrId(workspaceId)
+    if (!workspace) throw new Error('Workspace not found')
+    for (const field of ['sessionId', 'matcherId', 'actionId', 'occurrenceId', 'idempotencyKey'] as const) {
+      if (typeof input?.[field] !== 'string' || input[field].trim().length === 0) throw new Error(`Admission inspection ${field} must be a non-empty string`)
+    }
+    return deps.sessionManager.inspectAutomationSessionMessage({
+      workspaceId: workspace.id,
+      workspaceRootPath: workspace.rootPath,
+      ...input,
+    })
+  })
+
+  server.handle(RPC_CHANNELS.automations.ADMISSION_RECOVER, async (_ctx, workspaceId: string, input: {
+    sessionId: string
+    matcherId: string
+    actionId: string
+    occurrenceId: string
+    idempotencyKey: string
+    targetKind: 'controller' | 'coordinator'
+    targetId: string
+    targetGeneration: string
+    messageId: string
+    runtimeVersion: string
+    runtimeCommit: string
+    processingGeneration: number
+    minimumProcessingAgeMs: number
+  }) => {
+    const workspace = getWorkspaceByNameOrId(workspaceId)
+    if (!workspace) throw new Error('Workspace not found')
+    for (const field of ['sessionId', 'matcherId', 'actionId', 'occurrenceId', 'idempotencyKey', 'targetId', 'targetGeneration', 'messageId', 'runtimeVersion', 'runtimeCommit'] as const) {
+      if (typeof input?.[field] !== 'string' || input[field].trim().length === 0) throw new Error(`Admission recovery ${field} must be a non-empty string`)
+    }
+    if (input.targetKind !== 'controller' && input.targetKind !== 'coordinator') throw new Error('Admission recovery targetKind must be controller or coordinator')
+    return deps.sessionManager.recoverAutomationSessionMessage({
+      workspaceId: workspace.id,
+      workspaceRootPath: workspace.rootPath,
+      ...input,
+    })
+  })
 
   // Get automations config for a workspace (read-only, resolves path server-side)
   server.handle(RPC_CHANNELS.automations.GET, async (_ctx, workspaceId: string) => {
@@ -103,8 +222,34 @@ export function registerAutomationsHandlers(server: RpcServer, deps: HandlerDeps
     const { parsePromptReferences } = await import('@craft-agent/shared/automations')
     const { executeWebhookRequest, createWebhookHistoryEntry, createPromptHistoryEntry } = await import('@craft-agent/shared/automations/webhook-utils')
 
-    for (const action of payload.actions) {
+    for (const [actionIndex, action] of payload.actions.entries()) {
       const start = Date.now()
+
+      if (action.type === 'session-message') {
+        const delivery = await deps.sessionManager.deliverAutomationSessionMessage({
+          workspaceId: payload.workspaceId,
+          workspaceRootPath: workspace.rootPath,
+          sessionId: action.sessionId,
+          message: action.message,
+          matcherId: payload.automationId ?? 'test',
+          actionId: String(actionIndex),
+          occurrenceId: `test:${Date.now()}:${actionIndex}`,
+          idempotencyKey: action.idempotencyKey ?? 'test',
+          targetKind: 'controller',
+          targetId: action.sessionId,
+          targetGeneration: 'automation-test',
+        })
+        const success = delivery.status === 'delivered' || delivery.status === 'pending-consumption' || delivery.status === 'consumed' || delivery.status === 'duplicate'
+        results.push({
+          type: 'session-message',
+          success,
+          messageId: delivery.messageId,
+          delivery: delivery.status,
+          stderr: success ? undefined : delivery.reason ?? delivery.status,
+          duration: Date.now() - start,
+        })
+        continue
+      }
 
       if (action.type === 'webhook') {
         // Execute webhook action using shared utility (no env expansion for test — raw URLs)

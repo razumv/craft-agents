@@ -115,8 +115,10 @@ export interface ISessionManager {
     options?: SendMessageOptions,
     existingMessageId?: string,
     _isAuthRetry?: boolean,
-    onAck?: (messageId: string) => void,
+    onAck?: (messageId: string) => void | Promise<void>,
     rpcContext?: { callerClientId?: string },
+    deliveryMessageId?: string,
+    internalDelivery?: { forceQueue?: boolean },
   ): Promise<void>
   cancelProcessing(sessionId: string, silent?: boolean): Promise<void>
   killShell(sessionId: string, shellId: string): Promise<{ success: boolean; error?: string }>
@@ -270,6 +272,10 @@ export interface ISessionManager {
    */
   refreshConnectionRuntime(connectionSlug: string): Promise<void>
   completeAuthRequest(sessionId: string, result: AuthResult): Promise<void>
+  /** Deliver an admitted automation message to an existing same-workspace session. */
+  deliverAutomationSessionMessage(input: AutomationSessionMessageDeliveryInput): Promise<AutomationSessionMessageDeliveryResult>
+  inspectAutomationSessionMessage(input: AutomationSessionMessageInspectionInput): Promise<AutomationSessionMessageInspectionResult>
+  recoverAutomationSessionMessage(input: AutomationSessionMessageRecoveryInput): Promise<AutomationSessionMessageRecoveryResult>
   executePromptAutomation(input: ExecutePromptAutomationInput): Promise<{ sessionId: string }>
 
   /**
@@ -291,6 +297,96 @@ export interface ISessionManager {
  * readability — new optional fields (thinkingLevel, future cwd/permissions
  * overrides) can be added without churn at every call site.
  */
+export interface AutomationAdmissionTargetIdentity {
+  targetKind: 'controller' | 'coordinator'
+  targetId: string
+  /** Opaque Protocol-owned controller/coordinator generation. */
+  targetGeneration: string
+}
+
+export interface AutomationSessionMessageScopeInput {
+  workspaceId: string
+  workspaceRootPath: string
+  sessionId: string
+  matcherId: string
+  actionId: string
+  occurrenceId: string
+  idempotencyKey: string
+}
+
+export interface AutomationSessionMessageDeliveryInput extends AutomationSessionMessageScopeInput, AutomationAdmissionTargetIdentity {
+  message: string
+}
+
+export interface AutomationSessionMessageReceipt extends AutomationAdmissionTargetIdentity {
+  workspaceId: string
+  matcherId: string
+  actionId: string
+  occurrenceId: string
+  idempotencyKey: string
+  sessionId: string
+  messageId: string
+  deliveredAt: number
+  deliveryState: 'delivered' | 'pending-consumption' | 'consumed' | 'blocked'
+  acceptedProcessingGeneration: number
+  contentRevision: string
+  completedContentRevision?: string
+  recoveryAttemptedAt?: number
+  recoveryProcessingGeneration?: number
+  consumedAt?: number
+  completedProcessingGeneration?: number
+  completedMessageId?: string
+  completedMessageAt?: number
+}
+
+export interface AutomationSessionMessageDeliveryResult {
+  status: 'delivered' | 'pending-consumption' | 'consumed' | 'duplicate' | 'busy' | 'blocked'
+  messageId?: string
+  receipt?: AutomationSessionMessageReceipt
+  reason?: string
+}
+
+export interface AutomationSessionMessageInspectionInput extends AutomationSessionMessageScopeInput {}
+
+export interface AutomationSessionProcessingInspection {
+  isProcessing: boolean
+  processingGeneration: number
+  processingStartedAt: number | null
+  processingAgeMs: number | null
+  queueDepth: number
+  lastFinalMessageId: string | null
+  lastFinalMessageAt: number | null
+  lastErrorMessageId: string | null
+  lastErrorMessageAt: number | null
+}
+
+export interface AutomationSessionMessageInspectionResult {
+  status: 'missing' | 'delivered' | 'pending-consumption' | 'consumed' | 'blocked'
+  receipt: AutomationSessionMessageReceipt | null
+  session: AutomationSessionProcessingInspection
+  reason?: string
+}
+
+export interface AutomationSessionMessageRecoveryInput extends AutomationSessionMessageScopeInput, AutomationAdmissionTargetIdentity {
+  messageId: string
+  runtimeVersion: string
+  runtimeCommit: string
+  processingGeneration: number
+  minimumProcessingAgeMs: number
+}
+
+export interface AutomationSessionMessageRecoveryResult {
+  status: 'recovered' | 'consumed' | 'busy' | 'blocked'
+  messageId?: string
+  /** Present only when a recovery transition won; equals the requested generation. */
+  previousProcessingGeneration?: number
+  /** New generation for recovered; current durable generation for consumed. */
+  processingGeneration?: number
+  /** Present on consumed to prove the completed generation and exact content revision. */
+  receipt?: AutomationSessionMessageReceipt
+  reason?: string
+}
+
 export interface ExecutePromptAutomationInput {
   workspaceId: string
   workspaceRootPath: string

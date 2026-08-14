@@ -387,6 +387,16 @@ export const RPC_CHANNELS = {
     GET_HISTORY: 'automations:getHistory',
     GET_LAST_EXECUTED: 'automations:getLastExecuted',
     REPLAY: 'automations:replay',
+    /** Discover durable admission support on an authenticated server. */
+    ADMISSION_CAPABILITIES: 'automations:admissionCapabilities',
+    /** Atomically reserve a generic automation side-effect admission. */
+    ADMISSION_CLAIM: 'automations:admissionClaim',
+    /** Atomically admit and deliver an existing-session automation message. */
+    ADMISSION_DELIVER: 'automations:admissionDeliver',
+    /** Inspect one exact outstanding admission without transcript disclosure. */
+    ADMISSION_INSPECT: 'automations:admissionInspect',
+    /** Perform one exact-generation, bounded stuck-turn recovery. */
+    ADMISSION_RECOVER: 'automations:admissionRecover',
     CHANGED: 'automations:changed',
   },
   resources: {

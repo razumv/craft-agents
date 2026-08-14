@@ -26,8 +26,12 @@ import type { StoredAttachment, MessageRole, ToolStatus, AuthRequestType, AuthSt
 export const SESSION_PERSISTENT_FIELDS = [
   // Identity
   'id', 'workspaceRootPath', 'sdkSessionId', 'sdkCwd',
-  // Timestamps
+  // Timestamps and durable processing receipts
   'createdAt', 'lastUsedAt', 'lastMessageAt',
+  'processingGeneration', 'processingStartedAt', 'processingMessageId', 'processingMessageRevision',
+  'lastCompletedProcessingGeneration', 'lastCompletedAt', 'lastCompletedMessageId', 'lastCompletedMessageRevision',
+  'lastCompletedFinalMessageId', 'lastCompletedFinalMessageAt',
+  'lastCompletedErrorMessageId', 'lastCompletedErrorMessageAt',
   // Display
   'name', 'isFlagged', 'sessionStatus', 'labels', 'hidden',
   // Read tracking
@@ -120,6 +124,23 @@ export interface SessionConfig {
   /** Timestamp of last meaningful message (user or final assistant). Used for date grouping in session list.
    *  Separate from lastUsedAt which tracks any session access (auto-save, open to read, etc.). */
   lastMessageAt?: number;
+  /** Monotonic per-session processing generation used to fence stale callbacks. */
+  processingGeneration?: number;
+  /** Wall-clock start of the active generation. Cleared after proven stop/restart reconciliation. */
+  processingStartedAt?: number;
+  /** User message being consumed by the active generation. */
+  processingMessageId?: string;
+  /** SHA-256 revision of the exact message content submitted to that generation. */
+  processingMessageRevision?: string;
+  /** Last generation for which SessionManager completed stop bookkeeping. */
+  lastCompletedProcessingGeneration?: number;
+  lastCompletedAt?: number;
+  lastCompletedMessageId?: string;
+  lastCompletedMessageRevision?: string;
+  lastCompletedFinalMessageId?: string;
+  lastCompletedFinalMessageAt?: number;
+  lastCompletedErrorMessageId?: string;
+  lastCompletedErrorMessageAt?: number;
   /** Whether this session is flagged */
   isFlagged?: boolean;
   /** Permission mode for this session ('safe', 'ask', 'allow-all') */
@@ -252,6 +273,18 @@ export interface SessionHeader {
   lastUsedAt: number;
   /** Timestamp of last meaningful message — persisted separately from lastUsedAt for stable date grouping across restarts. */
   lastMessageAt?: number;
+  processingGeneration?: number;
+  processingStartedAt?: number;
+  processingMessageId?: string;
+  processingMessageRevision?: string;
+  lastCompletedProcessingGeneration?: number;
+  lastCompletedAt?: number;
+  lastCompletedMessageId?: string;
+  lastCompletedMessageRevision?: string;
+  lastCompletedFinalMessageId?: string;
+  lastCompletedFinalMessageAt?: number;
+  lastCompletedErrorMessageId?: string;
+  lastCompletedErrorMessageAt?: number;
   /** Whether this session is flagged */
   isFlagged?: boolean;
   /** Permission mode for this session ('safe', 'ask', 'allow-all') */

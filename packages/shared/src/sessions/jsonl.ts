@@ -5,7 +5,7 @@
  * Format: Line 1 = SessionHeader, Lines 2+ = StoredMessage (one per line)
  */
 
-import { openSync, readSync, closeSync, readFileSync, writeFileSync, renameSync, unlinkSync } from 'fs';
+import { openSync, readSync, closeSync, fsyncSync, readFileSync, writeFileSync, renameSync, unlinkSync } from 'fs';
 import { open, readFile } from 'fs/promises';
 import { dirname } from 'path';
 import type { SessionHeader, StoredSession, StoredMessage, SessionTokenUsage } from './types.ts';
@@ -47,6 +47,20 @@ export function makeSessionPathPortable(jsonLine: string, sessionDir: string): s
 export function expandSessionPath(jsonLine: string, sessionDir: string): string {
   if (!jsonLine.includes(SESSION_PATH_TOKEN)) return jsonLine;
   return jsonLine.replaceAll(SESSION_PATH_TOKEN, normalizePath(sessionDir));
+}
+
+function fsyncContainingDirectorySync(filePath: string): void {
+  if (process.platform === 'win32') return;
+  let fd: number | undefined;
+  try {
+    fd = openSync(dirname(filePath), 'r');
+    fsyncSync(fd);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code !== 'EINVAL' && code !== 'ENOTSUP' && code !== 'EBADF' && code !== 'EISDIR') throw error;
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
 }
 
 function normalizePermissionMode(value: unknown): PermissionMode | undefined {
@@ -156,11 +170,22 @@ export function writeSessionJsonl(sessionFile: string, session: StoredSession): 
     ...session.messages.map(m => makeSessionPathPortable(JSON.stringify(m), sessionDir)),
   ];
 
-  const tmpFile = sessionFile + '.tmp';
-  writeFileSync(tmpFile, lines.join('\n') + '\n');
-  // On Windows, rename fails if target exists. Delete first for cross-platform compatibility.
-  try { unlinkSync(sessionFile); } catch { /* ignore if doesn't exist */ }
-  renameSync(tmpFile, sessionFile);
+  const tmpFile = `${sessionFile}.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`;
+  try {
+    const fd = openSync(tmpFile, 'wx', 0o600);
+    try {
+      writeFileSync(fd, lines.join('\n') + '\n');
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+    // Fail closed if atomic replacement is unsupported. Never unlink the
+    // authoritative session file as a rename fallback.
+    renameSync(tmpFile, sessionFile);
+    fsyncContainingDirectorySync(sessionFile);
+  } finally {
+    try { unlinkSync(tmpFile); } catch { /* renamed or already removed */ }
+  }
 }
 
 /**

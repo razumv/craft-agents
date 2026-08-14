@@ -99,7 +99,21 @@ export interface WebhookAction {
   auth?: WebhookAuth;
 }
 
-export type AutomationAction = PromptAction | WebhookAction;
+/**
+ * A durable message delivery to an existing session in the same workspace.
+ * This action never creates a session.
+ */
+export interface SessionMessageAction {
+  type: 'session-message';
+  /** Existing target session ID. Supports automation environment expansion. */
+  sessionId: string;
+  /** Message content to persist and deliver. Supports automation environment expansion. */
+  message: string;
+  /** Optional stable key for independently idempotent effects in one occurrence. */
+  idempotencyKey?: string;
+}
+
+export type AutomationAction = PromptAction | WebhookAction | SessionMessageAction;
 
 // ============================================================================
 // Condition Types
@@ -232,6 +246,17 @@ export interface WebhookActionResult {
 export type ActionExecutionResult = PromptActionResult | WebhookActionResult;
 
 /** A pending prompt with its metadata */
+/** A session-message delivery that has been matched but not yet admitted. */
+export interface PendingSessionMessage {
+  workspaceId: string;
+  sessionId: string;
+  message: string;
+  matcherId: string;
+  actionId: string;
+  occurrenceId: string;
+  idempotencyKey: string;
+}
+
 export interface PendingPrompt {
   /** The session ID this prompt should be sent to */
   sessionId: string | undefined;

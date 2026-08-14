@@ -9,7 +9,7 @@
  */
 
 import type { EventBus, BaseEventPayload } from '../event-bus.ts';
-import type { AutomationEvent, AutomationsConfig, AutomationMatcher, PendingPrompt } from '../types.ts';
+import type { AutomationEvent, AutomationsConfig, AutomationMatcher, PendingPrompt, PendingSessionMessage } from '../types.ts';
 
 // ============================================================================
 // Handler Interface
@@ -43,6 +43,13 @@ export interface PromptHandlerOptions {
   onPromptsReady?: (prompts: PendingPrompt[]) => void;
   /** Called when a prompt execution fails */
   onError?: (event: AutomationEvent, error: Error) => void;
+}
+
+/** Options for converting matching events into existing-session deliveries. */
+export interface SessionMessageHandlerOptions {
+  workspaceId: string;
+  workspaceRootPath: string;
+  onSessionMessagesReady?: (messages: PendingSessionMessage[]) => void | Promise<void>;
 }
 
 /** Options for creating an EventLogHandler */
