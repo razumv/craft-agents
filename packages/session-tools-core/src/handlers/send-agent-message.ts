@@ -55,6 +55,12 @@ export async function handleSendAgentMessage(
       );
     }
 
+    if (result.targetBusy) {
+      return successResponse(
+        `Message delivered to the in-flight turn for session ${args.sessionId}.`
+      );
+    }
+
     return successResponse(
       `Message delivered to session ${args.sessionId}; it will start processing independently now.`
     );

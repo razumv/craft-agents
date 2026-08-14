@@ -177,6 +177,13 @@ export class PiAgent extends BaseAgent {
 
   // State
   private _isProcessing: boolean = false;
+  /** Invalidates subprocess tool/pre-tool requests from an aborted turn. */
+  private subprocessRequestGeneration = 0;
+  /** Atomic gate used by guarded recovery to prevent new side effects. */
+  private recoveryFenceActive = false;
+  private activeProxyToolDispatches = 0;
+  private activeToolDispatchIds = new Set<string>();
+  private preToolCallIdByRequestId = new Map<string, string>();
   private abortReason?: AbortReason;
 
   // Event adapter
@@ -883,6 +890,16 @@ export class PiAgent extends BaseAgent {
       this.debug('Cannot send to subprocess: stdin not writable');
       return;
     }
+    if (cmd.type === 'pre_tool_use_response' && typeof cmd.requestId === 'string') {
+      const toolCallId = this.preToolCallIdByRequestId.get(cmd.requestId);
+      if ((cmd.action === 'allow' || cmd.action === 'modify') && toolCallId) {
+        // Mark active before publishing authorization. This closes the gap in
+        // which the subprocess can begin a side effect before its start event
+        // returns over stdout.
+        this.activeToolDispatchIds.add(toolCallId);
+      }
+      this.preToolCallIdByRequestId.delete(cmd.requestId);
+    }
     const line = JSON.stringify(cmd);
     this.subprocess.stdin.write(line + '\n');
   }
@@ -924,6 +941,12 @@ export class PiAgent extends BaseAgent {
         break;
 
       case 'pre_tool_use_request':
+        // A poisoned/fenced subprocess may keep writing after abort. Never
+        // allow a request that is no longer attached to the active turn.
+        if (!this._isProcessing || this.recoveryFenceActive) {
+          this.send({ type: 'pre_tool_use_response', requestId: msg.requestId, action: 'block', reason: 'Stale processing generation' });
+          break;
+        }
         // Subprocess needs permission check + transforms before tool execution
         this.handlePreToolUseRequest(msg as {
           requestId: string;
@@ -934,6 +957,14 @@ export class PiAgent extends BaseAgent {
         break;
 
       case 'tool_execute_request':
+        if (!this._isProcessing || this.recoveryFenceActive) {
+          this.send({
+            type: 'tool_execute_response',
+            requestId: msg.requestId,
+            result: { content: 'Stale processing generation', isError: true },
+          });
+          break;
+        }
         // Subprocess wants main process to execute a proxy tool (MCP/API/session)
         this.handleToolExecuteRequest(msg as {
           requestId: string;
@@ -1109,6 +1140,8 @@ export class PiAgent extends BaseAgent {
 
     if (eventType === 'tool_execution_start') {
       const toolName = event.toolName as string;
+      const activeToolId = (event.toolCallId ?? event.toolUseId) as string | undefined;
+      if (activeToolId) this.activeToolDispatchIds.add(activeToolId);
       if (toolName?.startsWith('session__') || toolName?.startsWith('mcp__session__')) {
         // Session tool tracking is handled by the subprocess; it sends
         // session_tool_completed events when appropriate.
@@ -1136,6 +1169,8 @@ export class PiAgent extends BaseAgent {
 
     if (eventType === 'tool_execution_end') {
       const toolCallId = event.toolCallId as string | undefined;
+      const activeToolId = (event.toolCallId ?? event.toolUseId) as string | undefined;
+      if (activeToolId) this.activeToolDispatchIds.delete(activeToolId);
       if (toolCallId) {
         this.preToolMetadataByCallId.delete(toolCallId);
       }
@@ -1192,8 +1227,16 @@ export class PiAgent extends BaseAgent {
     input: Record<string, unknown>;
   }): Promise<void> {
     const { requestId, toolName, toolCallId, input } = req;
+    const requestGeneration = this.subprocessRequestGeneration;
+    // A missing call ID cannot later be correlated with a terminal event. Keep
+    // a synthetic ID permanently active after authorization: conservative
+    // fail-closed recovery is safer than overlapping an untrackable side effect.
+    this.preToolCallIdByRequestId.set(requestId, toolCallId ?? `untracked:${requestId}`);
     const debugSessionId = this.config.session?.id || this._sessionId;
     this.debug(`PreToolUse request from subprocess: ${toolName} (${requestId}, sessionId=${debugSessionId})`);
+    if (this.recoveryFenceActive) return;
+    this.activeProxyToolDispatches++;
+    try {
 
     // Capture metadata BEFORE centralized checks strip it out.
     // This bridge is deterministic and avoids relying solely on side-channel store lookups.
@@ -1214,6 +1257,10 @@ export class PiAgent extends BaseAgent {
       tool_name: toolName,
       tool_input: input,
     });
+    if (requestGeneration !== this.subprocessRequestGeneration) {
+      this.send({ type: 'pre_tool_use_response', requestId, action: 'block', reason: 'Stale processing generation' });
+      return;
+    }
 
     const rootPath = this.config.workspace.rootPath ?? this.workingDirectory;
     const workspaceSlug = extractWorkspaceSlug(rootPath, this.config.workspace.id);
@@ -1281,6 +1328,10 @@ export class PiAgent extends BaseAgent {
         if (this.onSourceActivationRequest) {
           try {
             const activated = await this.onSourceActivationRequest(sourceSlug);
+            if (requestGeneration !== this.subprocessRequestGeneration) {
+              this.send({ type: 'pre_tool_use_response', requestId, action: 'block', reason: 'Stale processing generation' });
+              return;
+            }
             if (!activated) {
               const reason = sourceExists
                 ? `Source "${sourceSlug}" is not active. Activate it by @mentioning it in your message or via the source icon at the bottom of the input field.`
@@ -1379,6 +1430,10 @@ export class PiAgent extends BaseAgent {
         const allowed = await permissionPromise;
         this.pendingPermissions.delete(permRequestId);
 
+        if (requestGeneration !== this.subprocessRequestGeneration) {
+          this.send({ type: 'pre_tool_use_response', requestId, action: 'block', reason: 'Stale processing generation' });
+          return;
+        }
         if (!allowed) {
           this.send({ type: 'pre_tool_use_response', requestId, action: 'block', reason: 'Permission denied by user.' });
           return;
@@ -1391,6 +1446,9 @@ export class PiAgent extends BaseAgent {
         }
         return;
       }
+    }
+    } finally {
+      this.activeProxyToolDispatches--;
     }
   }
 
@@ -1406,6 +1464,7 @@ export class PiAgent extends BaseAgent {
     toolName: string;
     args: Record<string, unknown>;
   }): Promise<void> {
+    const requestGeneration = this.subprocessRequestGeneration;
     // Prerequisite check: block source tools until guide.md is read
     const prereqResult = this.prerequisiteManager.checkPrerequisites(request.toolName);
     if (!prereqResult.allowed) {
@@ -1417,14 +1476,20 @@ export class PiAgent extends BaseAgent {
       return;
     }
 
+    if (this.recoveryFenceActive) return;
+    this.activeProxyToolDispatches++;
     try {
       const result = await this.routeToolCall(request.toolName, request.args);
+      if (requestGeneration !== this.subprocessRequestGeneration || this.recoveryFenceActive) return;
       this.send({
         type: 'tool_execute_response',
         requestId: request.requestId,
         result,
       });
     } catch (error) {
+      // Error responses are terminal tool responses too. Fence them exactly as
+      // success responses so an aborted generation cannot resume after recovery.
+      if (requestGeneration !== this.subprocessRequestGeneration || this.recoveryFenceActive) return;
       this.send({
         type: 'tool_execute_response',
         requestId: request.requestId,
@@ -1433,6 +1498,8 @@ export class PiAgent extends BaseAgent {
           isError: true,
         },
       });
+    } finally {
+      this.activeProxyToolDispatches--;
     }
   }
 
@@ -1785,8 +1852,12 @@ export class PiAgent extends BaseAgent {
     }
     this.pendingToolExecutions.clear();
 
-    // Drop any cached pre-tool metadata for the dead subprocess.
+    // Drop request metadata for the dead subprocess, but deliberately retain
+    // authorized/started tool IDs without a terminal event. A child process or
+    // external side effect may outlive the Pi subprocess, so recovery must stay
+    // fail-closed rather than assuming process exit proves side-effect quiescence.
     this.preToolMetadataByCallId.clear();
+    this.preToolCallIdByRequestId.clear();
   }
 
   /**
@@ -1958,7 +2029,9 @@ export class PiAgent extends BaseAgent {
     options?: ChatOptions
   ): AsyncGenerator<AgentEvent> {
     let message = messageParam;
-    // Reset state for new turn
+    // Reset state for new turn. Every subprocess request is tied to this epoch.
+    this.subprocessRequestGeneration++;
+    this.recoveryFenceActive = false;
     this._isProcessing = true;
     this.abortReason = undefined;
     this.eventQueue.reset();
@@ -2296,11 +2369,30 @@ export class PiAgent extends BaseAgent {
     this.preToolMetadataByCallId.clear();
   }
 
+  tryBeginRecoveryFence(): boolean {
+    // JavaScript run-to-completion makes this check-and-set atomic with each
+    // handler's synchronous count increment before its first await.
+    if (this.recoveryFenceActive
+      || this.activeProxyToolDispatches !== 0
+      || this.activeToolDispatchIds.size !== 0) return false;
+    this.recoveryFenceActive = true;
+    return true;
+  }
+
+  releaseRecoveryFence(): void {
+    this.recoveryFenceActive = false;
+  }
+
+  getActiveToolDispatchCount(): number {
+    return this.activeProxyToolDispatches + this.activeToolDispatchIds.size;
+  }
+
   forceAbort(reason: AbortReason): void {
     // Fire Stop hook event (fire-and-forget)
     this.emitAutomationEvent('Stop', { hook_event_name: 'Stop' });
 
     this.abortReason = reason;
+    this.subprocessRequestGeneration++;
     this._isProcessing = false;
 
     // Reject all pending permissions

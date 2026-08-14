@@ -21,6 +21,7 @@ export type {
   AutomationEvent,
   PromptAction,
   WebhookAction,
+  SessionMessageAction,
   WebhookHttpMethod,
   WebhookBodyFormat,
   WebhookAuth,
@@ -32,6 +33,7 @@ export type {
   WebhookActionResult,
   ActionExecutionResult,
   PendingPrompt,
+  PendingSessionMessage,
   AutomationResult,
   AutomationsValidationResult,
   SdkAutomationInput,
@@ -76,7 +78,7 @@ export { parsePromptReferences } from './utils.ts';
 export { AutomationEventLogger, type LoggedAutomationEvent, type LoggedAutomationEventInput } from './event-logger.ts';
 
 // Schemas
-export { AutomationsConfigSchema, AutomationConditionSchema, TimeConditionSchema, StateConditionSchema, zodErrorToIssues, VALID_EVENTS } from './schemas.ts';
+export { AutomationsConfigSchema, AutomationConditionSchema, TimeConditionSchema, StateConditionSchema, SessionMessageActionSchema, zodErrorToIssues, VALID_EVENTS } from './schemas.ts';
 
 // Condition evaluator
 export { evaluateConditions, type ConditionContext } from './conditions.ts';
@@ -101,6 +103,19 @@ export { resolveAutomationsConfigPath, generateShortId } from './resolve-config-
 
 // Cron matching
 export { matchesCron } from './cron-matcher.ts';
+
+// Durable admission ledger
+export {
+  AutomationAdmissionStore,
+  type AutomationAdmissionState,
+  type AutomationAdmissionDeliveryState,
+  type AutomationAdmissionScope,
+  type AutomationAdmissionReceipt,
+  type AutomationAdmissionRecord,
+  type AutomationAdmissionClaimResult,
+  type AutomationAdmissionRecoveryClaimResult,
+  type AutomationAdmissionStoreOptions,
+} from './admission-store.ts';
 
 // Event Bus
 export {
@@ -129,10 +144,12 @@ export {
 // Handlers
 export {
   PromptHandler,
+  SessionMessageHandler,
   EventLogHandler,
   WebhookHandler,
   type AutomationHandler,
   type PromptHandlerOptions,
+  type SessionMessageHandlerOptions,
   type EventLogHandlerOptions,
   type WebhookHandlerOptions,
   type AutomationsConfigProvider,

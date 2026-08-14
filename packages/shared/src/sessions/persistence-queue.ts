@@ -1,4 +1,4 @@
-import { writeFile, rename, unlink } from 'fs/promises'
+import { open, rename, rm } from 'fs/promises'
 import { dirname } from 'path'
 import type { StoredSession, SessionHeader } from './types.js'
 import { getSessionFilePath, ensureSessionsDir, ensureSessionDir } from './storage.js'
@@ -32,6 +32,20 @@ function getHeaderMetadataSignature(header: SessionHeader): string {
     lastReadMessageId: header.lastReadMessageId,
   }
   return JSON.stringify(signature)
+}
+
+async function fsyncContainingDirectory(filePath: string): Promise<void> {
+  if (process.platform === 'win32') return
+  let handle: Awaited<ReturnType<typeof open>> | undefined
+  try {
+    handle = await open(dirname(filePath), 'r')
+    await handle.sync()
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code
+    if (code !== 'EINVAL' && code !== 'ENOTSUP' && code !== 'EBADF' && code !== 'EISDIR') throw error
+  } finally {
+    await handle?.close().catch(() => {})
+  }
 }
 
 function mergeHeaderWithExternalMetadata(localHeader: SessionHeader, diskHeader: SessionHeader): SessionHeader {
@@ -77,7 +91,9 @@ class SessionPersistenceQueue {
     }
 
     const timer = setTimeout(() => {
-      void this.write(session.id)
+      // Debounced background writes are logged by write(); explicit flushes
+      // still receive the rejection so durable acknowledgements fail closed.
+      void this.scheduleWrite(session.id).catch(() => {})
     }, this.debounceMs)
 
     this.pending.set(session.id, { data: session, timer })
@@ -154,43 +170,54 @@ class SessionPersistenceQueue {
       const finalSignature = getHeaderMetadataSignature(header)
       this.lastWrittenHeaderSignature.set(sessionId, finalSignature)
 
-      const tmpFile = filePath + '.tmp'
-      await writeFile(tmpFile, lines.join('\n') + '\n', 'utf-8')
-      // On Windows, rename fails if target exists. Delete first for cross-platform compatibility.
-      try { await unlink(filePath) } catch { /* ignore if doesn't exist */ }
-      await rename(tmpFile, filePath)
+      const tmpFile = `${filePath}.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`
+      try {
+        const handle = await open(tmpFile, 'wx', 0o600)
+        try {
+          await handle.writeFile(lines.join('\n') + '\n', 'utf-8')
+          await handle.sync()
+        } finally {
+          await handle.close()
+        }
+        // Fail closed if the platform cannot atomically replace the target.
+        // Never unlink the authoritative destination as a rename fallback.
+        await rename(tmpFile, filePath)
+        await fsyncContainingDirectory(filePath)
+      } finally {
+        await rm(tmpFile, { force: true }).catch(() => {})
+      }
       debug(`[PersistenceQueue] Wrote session ${sessionId}`)
     } catch (error) {
       console.error(`[PersistenceQueue] Failed to write session ${sessionId}:`, error)
+      throw error
     }
   }
 
+  /** Serialize every write trigger (timer and explicit flush) per session. */
+  private scheduleWrite(sessionId: string): Promise<void> {
+    const previous = this.writeInProgress.get(sessionId) ?? Promise.resolve()
+    const next = previous.catch(() => {}).then(() => this.write(sessionId))
+    this.writeInProgress.set(sessionId, next)
+    const cleanup = () => {
+      if (this.writeInProgress.get(sessionId) === next) this.writeInProgress.delete(sessionId)
+    }
+    void next.then(cleanup, cleanup)
+    return next
+  }
+
   /**
-   * Immediately flush a specific session if pending.
-   * Waits for any in-progress write to complete before starting a new one
-   * to prevent race conditions on the shared .tmp file.
+   * Immediately flush a specific session if pending and wait for any timer-
+   * initiated write already in flight. All callers share scheduleWrite(), so a
+   * debounce callback can no longer race a flush on one static temp pathname.
    */
   async flush(sessionId: string): Promise<void> {
     const entry = this.pending.get(sessionId)
     if (entry) {
       clearTimeout(entry.timer)
-
-      // Wait for any in-progress write to complete first
-      const inProgress = this.writeInProgress.get(sessionId)
-      if (inProgress) {
-        await inProgress
-      }
-
-      // Start new write and track it
-      const writePromise = this.write(sessionId)
-      this.writeInProgress.set(sessionId, writePromise)
-
-      try {
-        await writePromise
-      } finally {
-        this.writeInProgress.delete(sessionId)
-      }
+      await this.scheduleWrite(sessionId)
+      return
     }
+    await this.writeInProgress.get(sessionId)
   }
 
   /**
@@ -210,8 +237,8 @@ class SessionPersistenceQueue {
    * Flush all pending sessions. Call this on app quit.
    */
   async flushAll(): Promise<void> {
-    const sessionIds = [...this.pending.keys()]
-    await Promise.all(sessionIds.map(id => this.flush(id)))
+    const sessionIds = new Set([...this.pending.keys(), ...this.writeInProgress.keys()])
+    await Promise.all([...sessionIds].map(id => this.flush(id)))
   }
 
   /**

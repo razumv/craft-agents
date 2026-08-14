@@ -1,13 +1,24 @@
 import type { EventSink, RpcServer } from '@craft-agent/server-core/transport'
 import { CLIENT_BROWSER_INVOKE } from '@craft-agent/server-core/transport'
-import type { ISessionManager, IBrowserPaneManager, ExecutePromptAutomationInput } from '@craft-agent/server-core/handlers'
+import type {
+  ISessionManager,
+  IBrowserPaneManager,
+  ExecutePromptAutomationInput,
+  AutomationSessionMessageDeliveryInput,
+  AutomationSessionMessageDeliveryResult,
+  AutomationSessionMessageInspectionInput,
+  AutomationSessionMessageInspectionResult,
+  AutomationSessionMessageReceipt,
+  AutomationSessionMessageRecoveryInput,
+  AutomationSessionMessageRecoveryResult,
+} from '@craft-agent/server-core/handlers'
 import { RemoteBrowserPaneManager } from './RemoteBrowserPaneManager'
 import { validateFilePath, getWorkspaceAllowedDirs } from '@craft-agent/server-core/handlers'
 import { createScopedLogger, CONSOLE_LOGGER, type PlatformServices, type Logger } from '@craft-agent/server-core/runtime'
 import { basename, dirname, join } from 'path'
 import { existsSync } from 'fs'
 import { readFile, writeFile, mkdir } from 'fs/promises'
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { type AgentEvent, setPermissionMode, hydratePreviousPermissionMode, getPermissionModeDiagnostics, type PermissionMode, unregisterSessionScopedToolCallbacks, mergeSessionScopedToolCallbacks, AbortReason, type AuthRequest, type AuthResult, type CredentialAuthRequest, type BrowserPaneFns, generateConversationSummary, resolveKeepBackgroundTasksAlive } from '@craft-agent/shared/agent'
 import {
   resolveSessionConnection,
@@ -97,8 +108,9 @@ import { evaluateAutoLabels } from '@craft-agent/shared/labels/auto'
 import { listLabels, loadLabelConfig } from '@craft-agent/shared/labels/storage'
 import { extractLabelId, resolveSessionLabels, findTaskItemLabelId } from '@craft-agent/shared/labels'
 import { ensureLabelsExist, ensureTaskItemLabel } from '@craft-agent/shared/labels/crud'
+import { resolveCrossSessionAgentDeliveryPolicy } from './cross-session-agent-delivery.ts'
 import { loadStatusConfig } from '@craft-agent/shared/statuses/storage'
-import { AutomationSystem, createPromptHistoryEntry, appendAutomationHistoryEntry, type AutomationSystemMetadataSnapshot } from '@craft-agent/shared/automations'
+import { AutomationSystem, AutomationAdmissionStore, createPromptHistoryEntry, appendAutomationHistoryEntry, type AutomationAdmissionRecord, type AutomationAdmissionScope, type AutomationSystemMetadataSnapshot } from '@craft-agent/shared/automations'
 import { buildBackendRuntimeSignature, buildRestartRequiredSignature, filterAttachmentsForModelInput } from './runtime-config'
 import { validateArchiveTarget } from './archive-guards'
 
@@ -179,6 +191,12 @@ const MAX_ANNOTATION_JSON_BYTES = 32 * 1024
 // are ignored, so the watcher does not roll back the in-memory mutation we
 // just persisted. See onSessionMetadataChange.
 const METADATA_WRITE_GUARD_MS = 5000
+export const AUTOMATION_ADMISSION_MIN_RECOVERY_AGE_MS = 60_000
+const AUTOMATION_ADMISSION_ABORT_GRACE_MS = 250
+
+function automationMessageRevision(content: string): string {
+  return createHash('sha256').update(content).digest('hex')
+}
 
 /**
  * Text sent to the session when a plan is approved from outside the desktop
@@ -800,15 +818,28 @@ interface ManagedSession {
   id: string
   workspace: Workspace
   agent: AgentInstance | null  // Lazy-loaded - null until first message
+  /** Runtime-instance epoch used to reject callbacks from disposed agents. */
+  agentRuntimeGeneration?: number
   messages: Message[]
   isProcessing: boolean
   /** Set when user requests stop - allows event loop to drain before clearing isProcessing */
   stopRequested?: boolean
   lastMessageAt: number
   streamingText: string
-  // Incremented each time a new message starts processing.
-  // Used to detect if a follow-up message has superseded the current one (stale-request guard).
+  // Incremented each time a new message starts processing and whenever a stuck
+  // generation is fenced. Durable so authenticated recovery can use exact CAS.
   processingGeneration: number
+  processingStartedAt?: number
+  processingMessageId?: string
+  processingMessageRevision?: string
+  lastCompletedProcessingGeneration?: number
+  lastCompletedAt?: number
+  lastCompletedMessageId?: string
+  lastCompletedMessageRevision?: string
+  lastCompletedFinalMessageId?: string
+  lastCompletedFinalMessageAt?: number
+  lastCompletedErrorMessageId?: string
+  lastCompletedErrorMessageAt?: number
   // NOTE: Parent-child tracking state (pendingTools, parentToolStack, toolToParentMap,
   // pendingTextParent) has been removed. CraftAgent now provides parentToolUseId
   // directly on all events using the SDK's authoritative parent_tool_use_id field.
@@ -1084,7 +1115,7 @@ export function createManagedSession(
     isProcessing: false,
     lastMessageAt: (s.lastMessageAt ?? s.lastUsedAt ?? Date.now()) as number,
     streamingText: '',
-    processingGeneration: 0,
+    processingGeneration: typeof s.processingGeneration === 'number' ? s.processingGeneration : 0,
     isFlagged: (s.isFlagged ?? false) as boolean,
     messageQueue: [],
     backgroundShellCommands: new Map(),
@@ -1211,6 +1242,9 @@ export class SessionManager implements ISessionManager {
   private configWatchers: Map<string, ConfigWatcher> = new Map()
   // Automation systems for workspace event automations - one per workspace (includes scheduler, diffing, and handlers)
   private automationSystems: Map<string, AutomationSystem> = new Map()
+  // Durable cross-process admission ledgers, keyed by workspace root.
+  private automationAdmissionStores: Map<string, AutomationAdmissionStore> = new Map()
+  private automationAdmissionReconciliations: Map<string, Promise<{ error?: string }>> = new Map()
   // Pending credential request resolvers (keyed by requestId)
   private pendingCredentialResolvers: Map<string, (response: import('@craft-agent/shared/protocol').CredentialResponse) => void> = new Map()
   // Permission request metadata tracking (keyed by requestId)
@@ -1703,6 +1737,9 @@ export class SessionManager implements ISessionManager {
 
     // Initialize AutomationSystem for this workspace (includes scheduler, handlers, and event logging)
     if (!this.automationSystems.has(workspaceRootPath)) {
+      // Reconcile pre-ack deliveries from a prior process before accepting new
+      // event work. Committed receipts are intentionally never replayed.
+      void this.ensureAutomationAdmissionReconciliation(workspaceRootPath)
       const automationSystem = new AutomationSystem({
         workspaceRootPath,
         workspaceId,
@@ -1746,6 +1783,28 @@ export class SessionManager implements ISessionManager {
               sessionLog.error(`[Automations] Failed to execute prompt action ${idx + 1}:`, result.reason)
             } else {
               sessionLog.info(`[Automations] Created session ${result.value.sessionId} from prompt action`)
+            }
+          }
+        },
+        onSessionMessagesReady: async (messages) => {
+          const results = await Promise.all(messages.map((pending) =>
+            this.deliverAutomationSessionMessage({
+              workspaceId,
+              workspaceRootPath,
+              sessionId: pending.sessionId,
+              message: pending.message,
+              matcherId: pending.matcherId,
+              actionId: pending.actionId,
+              occurrenceId: pending.occurrenceId,
+              idempotencyKey: pending.idempotencyKey,
+              targetKind: 'controller',
+              targetId: pending.sessionId,
+              targetGeneration: 'workspace-automation',
+            })
+          ))
+          for (const result of results) {
+            if (result.status === 'blocked') {
+              sessionLog.warn('[Automations] session-message delivery blocked', result)
             }
           }
         },
@@ -2084,7 +2143,7 @@ export class SessionManager implements ISessionManager {
             messageId: msg.id,
             attachments: undefined,
             storedAttachments: msg.attachments,
-            options: undefined,
+            options: msg.hidden || msg.badges ? { hidden: msg.hidden, badges: msg.badges } : undefined,
           })
         }
         if (!managed.isProcessing && managed.messageQueue.length > 0) {
@@ -2564,7 +2623,7 @@ export class SessionManager implements ISessionManager {
             messageId: msg.id,
             attachments: undefined,  // Attachments already stored on disk
             storedAttachments: msg.attachments,
-            options: undefined,
+            options: msg.hidden || msg.badges ? { hidden: msg.hidden, badges: msg.badges } : undefined,
           })
         }
         // Process queue when session becomes active (will be triggered by first message or interaction)
@@ -3114,6 +3173,9 @@ export class SessionManager implements ISessionManager {
 
   private async disposeManagedAgentRuntime(managed: ManagedSession, reason: string): Promise<void> {
     const sessionId = managed.id
+    // Invalidate every callback closure owned by this runtime before asking the
+    // subprocess to stop; late SDK/tool events cannot target the successor.
+    managed.agentRuntimeGeneration = (managed.agentRuntimeGeneration ?? 0) + 1
 
     if (managed.agent) {
       try {
@@ -3383,8 +3445,13 @@ export class SessionManager implements ISessionManager {
       process.env.CRAFT_SESSION_DIR = sessionDirForMetadata
       toolMetadataStore.setSessionDir(sessionDirForMetadata)
 
-      // Set up agentReady promise so title generation can await agent creation
+      // Set up agentReady promise so title generation can await agent creation.
+      // Capture a runtime-instance epoch for callbacks created below; processing
+      // generation alone is insufficient before/after turns.
       managed.agentReady = new Promise<void>(r => { managed.agentReadyResolve = r })
+      const agentRuntimeGeneration = (managed.agentRuntimeGeneration ?? 0) + 1
+      managed.agentRuntimeGeneration = agentRuntimeGeneration
+      const isCurrentAgentRuntime = () => managed.agentRuntimeGeneration === agentRuntimeGeneration
 
       // ============================================================
       // Common setup: sources, MCP pool, session config
@@ -3447,6 +3514,10 @@ export class SessionManager implements ISessionManager {
       }
 
       const onSdkSessionIdUpdate = (sdkSessionId: string) => {
+        if (!isCurrentAgentRuntime()) {
+          sessionLog.warn(`Ignoring SDK session ID from stale agent runtime ${agentRuntimeGeneration} for ${managed.id}`)
+          return
+        }
         managed.sdkSessionId = sdkSessionId
         // Retire branch-only fork metadata now that child session is established
         if (managed.branchFromSdkSessionId) {
@@ -3462,6 +3533,7 @@ export class SessionManager implements ISessionManager {
       }
 
       const onSdkSessionIdCleared = () => {
+        if (!isCurrentAgentRuntime()) return
         managed.sdkSessionId = undefined
         sessionLog.info(`SDK session ID cleared for ${managed.id} (resume recovery)`)
         this.persistSession(managed)
@@ -3469,6 +3541,7 @@ export class SessionManager implements ISessionManager {
       }
 
       const onBranchForkInvalidated = () => {
+        if (!isCurrentAgentRuntime()) return
         managed.sdkSessionId = undefined
         managed.branchFromSdkSessionId = undefined
         managed.branchFromSdkCwd = undefined
@@ -4480,17 +4553,7 @@ export class SessionManager implements ISessionManager {
             if (builtAttachments.length > 0) fileAttachments = builtAttachments
           }
 
-          // Capture the target's busy state BEFORE delivery so the sender gets a
-          // truthful ack. A busy (mid-turn) target queues the message and replays
-          // it after the current turn (anthropic defaults to 'queue'); an idle
-          // target starts processing immediately. sendMessage throws for an
-          // unknown session — that rejection propagates to the handler's catch.
-          const targetBusy = this.sessions.get(sessionId)?.isProcessing === true
-          await this.sendMessage(sessionId, message, fileAttachments)
-          return {
-            delivery: targetBusy ? ('queued' as const) : ('delivered' as const),
-            targetBusy,
-          }
+          return this.deliverCrossSessionAgentMessage(sessionId, message, fileAttachments)
         },
         activateSourceInSessionFn: async (sourceSlug: string) => {
           const cb = managed.agent?.onSourceActivationRequest
@@ -5769,6 +5832,53 @@ export class SessionManager implements ISessionManager {
     sessionLog.info(`Deleted session ${sessionId}`)
   }
 
+  /**
+   * Agent-to-agent delivery boundary. Exact coordinator and recovery-controller
+   * manifest roles are queue-only while busy; ordinary peers retain their
+   * connection's steer/queue policy. Direct UI sends bypass this method.
+   */
+  private async deliverCrossSessionAgentMessage(
+    sessionId: string,
+    message: string,
+    attachments?: FileAttachment[],
+  ): Promise<{ delivery: 'delivered' | 'queued'; targetBusy: boolean }> {
+    const target = this.sessions.get(sessionId)
+    const policy = resolveCrossSessionAgentDeliveryPolicy(target, sessionId)
+    const targetBusy = target!.isProcessing === true
+    const internalDelivery = targetBusy && policy.forceQueueWhileBusy
+      ? { forceQueue: true }
+      : undefined
+    let delivery: 'delivered' | 'queued' | undefined
+
+    await this.sendMessage(
+      sessionId,
+      message,
+      attachments,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      messageId => {
+        delivery = target!.messageQueue.some(entry => entry.messageId === messageId)
+          ? 'queued'
+          : 'delivered'
+      },
+      undefined,
+      undefined,
+      internalDelivery,
+    )
+
+    if (!delivery) throw new Error(`Session ${sessionId} did not acknowledge message delivery`)
+    sessionLog.info('cross-session agent delivery', {
+      targetSessionId: sessionId,
+      targetBusy,
+      targetRole: policy.targetRole ?? 'unclassified',
+      deliveryPolicy: policy.policy,
+      delivery,
+    })
+    return { delivery, targetBusy }
+  }
+
   async sendMessage(
     sessionId: string,
     message: string,
@@ -5784,7 +5894,7 @@ export class SessionManager implements ISessionManager {
      * ack to the client so a crash mid-stream doesn't lose the user message
      * (#616). Pre-persist errors still reject the outer promise as before.
      */
-    onAck?: (messageId: string) => void,
+    onAck?: (messageId: string) => void | Promise<void>,
     /**
      * Optional transport context. The `sessions.sendMessage` RPC handler passes
      * `{ callerClientId: ctx.clientId }` so the SM can pin the desktop client
@@ -5792,6 +5902,10 @@ export class SessionManager implements ISessionManager {
      * directly (tests, intra-server flows) to leave the existing pin in place.
      */
     rpcContext?: { callerClientId?: string },
+    /** Stable internal ID for a persisted automation delivery message. */
+    deliveryMessageId?: string,
+    /** Internal-only delivery policy. Durable admissions must never steer. */
+    internalDelivery?: { forceQueue?: boolean },
   ): Promise<void> {
     const managed = this.sessions.get(sessionId)
     if (!managed) {
@@ -5830,9 +5944,12 @@ export class SessionManager implements ISessionManager {
     //   `agent.redirect()`, NO forceAbort, NO interruption.
     if (managed.isProcessing) {
       const connection = resolveSessionConnection(managed.llmConnection, undefined)
-      // Fallback to 'steer' when no connection is resolvable — preserves
-      // today's exact behavior (call redirect, take whatever it returns).
-      const behavior = connection ? resolveMidStreamBehavior(connection) : 'steer'
+      // Durable controller/coordinator admissions are explicitly queue-only:
+      // steering a liveness envelope into a poisoned turn was the v3.2.1
+      // controller outage. Ordinary interactive messages retain connection policy.
+      const behavior = internalDelivery?.forceQueue
+        ? 'queue'
+        : connection ? resolveMidStreamBehavior(connection) : 'steer'
 
       const agent = managed.agent
       let steered = false
@@ -5852,7 +5969,7 @@ export class SessionManager implements ISessionManager {
 
       // Create user message for UI
       const userMessage: Message = {
-        id: generateMessageId(),
+        id: deliveryMessageId ?? generateMessageId(),
         role: 'user',
         content: message,
         timestamp: this.monotonic(),
@@ -5895,7 +6012,7 @@ export class SessionManager implements ISessionManager {
       // before we tell the renderer "accepted" — `persistSession` only
       // enqueues with a 500ms debounce. (#616 reliability fix.)
       await this.flushSession(managed.id)
-      onAck?.(userMessage.id)
+      await onAck?.(userMessage.id)
       return
     }
 
@@ -5903,15 +6020,24 @@ export class SessionManager implements ISessionManager {
     // Skip if existingMessageId is provided (message was already created when queued)
     let userMessage: Message
     if (existingMessageId) {
-      // Find existing message (already added when queued)
+      // Find existing message (already added when queued). Clear isQueued only
+      // in memory here; the processing-generation persist below commits both
+      // changes together. A crash before that point therefore remains replayable.
       userMessage = managed.messages.find(m => m.id === existingMessageId)!
       if (!userMessage) {
         throw new Error(`Existing message ${existingMessageId} not found`)
       }
+      // The queue entry is authoritative for a replay. In particular, a
+      // capability-v2 admission may have coalesced newer incident evidence
+      // while the old revision was already inside an active Pi turn. Reapply
+      // that queued content before making the replay generation durable so a
+      // stale transcript snapshot cannot poison completion/recovery proof.
+      userMessage.content = message
+      userMessage.isQueued = false
     } else {
       // Create new message
       userMessage = {
-        id: generateMessageId(),
+        id: deliveryMessageId ?? generateMessageId(),
         role: 'user',
         content: message,
         timestamp: this.monotonic(),
@@ -5934,7 +6060,7 @@ export class SessionManager implements ISessionManager {
       // `persistSession` is debounced (500ms). #616.
       this.persistSession(managed)
       await this.flushSession(managed.id)
-      onAck?.(userMessage.id)
+      await onAck?.(userMessage.id)
 
       // Emit user_message event so UI can confirm the optimistic message
       this.sendEvent({
@@ -6007,10 +6133,19 @@ export class SessionManager implements ISessionManager {
     }
 
     managed.lastMessageAt = Date.now()
+    managed.processingGeneration++
+    managed.processingStartedAt = Date.now()
+    managed.processingMessageId = userMessage.id
+    managed.processingMessageRevision = automationMessageRevision(userMessage.content)
     this.setProcessing(managed, true)
     managed.streamingText = ''
-    managed.processingGeneration++
     managed.turnStartFinalMessageId = this.getLastFinalAssistantMessageId(managed.messages)
+
+    // Make the generation/start receipt durable before an admitted turn can
+    // reach tools. This closes the ACK -> process-start crash window used by
+    // authenticated inspection and recovery CAS.
+    this.persistSession(managed)
+    if (deliveryMessageId) await this.flushSession(managed.id)
 
     // Reset auth retry flag for this new message (allows one retry per message)
     // IMPORTANT: Skip reset if this is an auth retry call - the flag is already true
@@ -6205,6 +6340,13 @@ export class SessionManager implements ISessionManager {
       sessionLog.info('Got chat iterator, starting iteration...')
 
       for await (const event of chatIterator) {
+        if (managed.processingGeneration !== myGeneration) {
+          sessionLog.warn(`Discarding stale generation ${myGeneration} event for ${sessionId}; active generation is ${managed.processingGeneration}`)
+          sendSpan.mark('chat.stale_generation')
+          sendSpan.end()
+          return
+        }
+
         // Log events (skip noisy text_delta)
         if (event.type !== 'text_delta') {
           if (event.type === 'tool_start') {
@@ -6216,8 +6358,15 @@ export class SessionManager implements ISessionManager {
           }
         }
 
-        // Process the event first
+        // Process the event first. Re-check after awaits so a concurrent guarded
+        // recovery cannot let this old iterator continue into fallback/cleanup.
         await this.processEvent(managed, event)
+        if (managed.processingGeneration !== myGeneration) {
+          sessionLog.warn(`Generation ${myGeneration} was fenced while handling ${event.type} for ${sessionId}`)
+          sendSpan.mark('chat.stale_generation')
+          sendSpan.end()
+          return
+        }
 
         // Fallback: Capture SDK session ID if the onSdkSessionIdUpdate callback didn't fire.
         // Primary capture happens in getOrCreateAgent() via onSdkSessionIdUpdate callback,
@@ -6313,7 +6462,7 @@ export class SessionManager implements ISessionManager {
 
           sendSpan.mark('chat.complete')
           sendSpan.end()
-          this.onProcessingStopped(sessionId, 'complete')
+          this.onProcessingStopped(sessionId, 'complete', myGeneration)
           return  // Exit function, skip finally block (onProcessingStopped handles cleanup)
         }
 
@@ -6330,11 +6479,18 @@ export class SessionManager implements ISessionManager {
         sendSpan.end()
       } else if (managed.stopRequested) {
         sessionLog.info('Chat loop completed after stop request - events drained successfully')
-        this.onProcessingStopped(sessionId, 'interrupted')
+        this.onProcessingStopped(sessionId, 'interrupted', myGeneration)
       } else {
         sessionLog.info('Chat loop exited unexpectedly')
       }
     } catch (error) {
+      if (managed.processingGeneration !== myGeneration) {
+        sessionLog.info(`Ignoring stale generation ${myGeneration} chat rejection for ${sessionId}`)
+        sendSpan.mark('chat.stale_generation')
+        sendSpan.end()
+        return
+      }
+
       // Check if this is an abort error (expected when interrupted)
       const isAbortError = error instanceof Error && (
         error.name === 'AbortError' ||
@@ -6355,7 +6511,7 @@ export class SessionManager implements ISessionManager {
         // by setting isProcessing = false directly. All other abort reasons route
         // through onProcessingStopped for queue draining.
         if (reason === AbortReason.UserStop || reason === AbortReason.Redirect || reason === undefined) {
-          this.onProcessingStopped(sessionId, 'interrupted')
+          this.onProcessingStopped(sessionId, 'interrupted', myGeneration)
         }
       } else {
         sessionLog.error('Error in chat:', error)
@@ -6374,7 +6530,7 @@ export class SessionManager implements ISessionManager {
           error: error instanceof Error ? error.message : 'Unknown error'
         }, managed.workspace.id)
         // Handle error via centralized handler
-        this.onProcessingStopped(sessionId, 'error')
+        this.onProcessingStopped(sessionId, 'error', myGeneration)
       }
     } finally {
       // Only handle cleanup for unexpected exits (loop break without complete event)
@@ -6384,7 +6540,7 @@ export class SessionManager implements ISessionManager {
         sessionLog.info('Finally block cleanup - unexpected exit')
         sendSpan.mark('chat.unexpected_exit')
         sendSpan.end()
-        this.onProcessingStopped(sessionId, 'interrupted')
+        this.onProcessingStopped(sessionId, 'interrupted', myGeneration)
       }
     }
   }
@@ -6396,6 +6552,7 @@ export class SessionManager implements ISessionManager {
     }
 
     sessionLog.info('Cancelling processing for session:', sessionId, silent ? '(silent)' : '')
+    const cancelledGeneration = managed.processingGeneration
 
     // Collect queued message text for input restoration before clearing
     const queuedTexts = managed.messageQueue.map(q => q.message)
@@ -6457,9 +6614,9 @@ export class SessionManager implements ISessionManager {
     // Safety timeout: if event loop doesn't complete within 5 seconds, force cleanup
     // This handles cases where the generator gets stuck
     setTimeout(() => {
-      if (managed.stopRequested && managed.isProcessing) {
+      if (managed.stopRequested && managed.isProcessing && managed.processingGeneration === cancelledGeneration) {
         sessionLog.warn('Generator did not complete after stop request, forcing cleanup')
-        this.onProcessingStopped(sessionId, 'timeout')
+        this.onProcessingStopped(sessionId, 'timeout', cancelledGeneration)
       }
     }, 5000)
 
@@ -6483,6 +6640,7 @@ export class SessionManager implements ISessionManager {
     sessionLog.info(`Auth error detected, attempting token refresh and retry for session ${sessionId}`)
     managed.authRetryAttempted = true
     managed.authRetryInProgress = true
+    const authRetryGeneration = managed.processingGeneration
 
     // Emit lightweight info so the user sees progress instead of a scary red error
     this.sendEvent({
@@ -6493,6 +6651,10 @@ export class SessionManager implements ISessionManager {
     }, workspaceId)
 
     setImmediate(async () => {
+      if (managed.processingGeneration !== authRetryGeneration || !managed.authRetryInProgress) {
+        sessionLog.info(`[auth-retry] Ignoring stale retry callback for generation ${authRetryGeneration}`)
+        return
+      }
       try {
         // 1. Reset summarization client so it picks up fresh credentials
         sessionLog.info(`[auth-retry] Resetting summarization client for session ${sessionId}`)
@@ -6535,6 +6697,10 @@ export class SessionManager implements ISessionManager {
           managed.authRetryInProgress = false
         }
       } catch (retryError) {
+        if (!managed.authRetryInProgress) {
+          sessionLog.info(`[auth-retry] Ignoring failure from fenced generation ${authRetryGeneration}`)
+          return
+        }
         managed.authRetryInProgress = false
         sessionLog.error(`[auth-retry] Failed to retry after auth refresh for session ${sessionId}:`, retryError)
         sessionRuntimeHooks.captureException(retryError, { errorSource: 'auth-retry', sessionId })
@@ -6552,7 +6718,7 @@ export class SessionManager implements ISessionManager {
           error: 'Authentication failed. Please check your credentials.',
           timestamp: failedMessage.timestamp,
         }, workspaceId)
-        this.onProcessingStopped(sessionId, 'error')
+        this.onProcessingStopped(sessionId, 'error', managed.processingGeneration)
       }
     })
 
@@ -6596,16 +6762,74 @@ export class SessionManager implements ISessionManager {
    */
   private async onProcessingStopped(
     sessionId: string,
-    reason: 'complete' | 'interrupted' | 'error' | 'timeout'
+    reason: 'complete' | 'interrupted' | 'error' | 'timeout',
+    expectedGeneration?: number,
   ): Promise<void> {
     const managed = this.sessions.get(sessionId)
     if (!managed) return
+    if (expectedGeneration !== undefined && managed.processingGeneration !== expectedGeneration) {
+      sessionLog.warn(`Ignoring stale processing-stop callback for ${sessionId}: expected generation ${expectedGeneration}, active ${managed.processingGeneration}`)
+      return
+    }
 
-    sessionLog.info(`Processing stopped for session ${sessionId}: ${reason}`)
+    const completedGeneration = managed.processingGeneration
+    const completedMessageId = managed.processingMessageId
+    const completedMessageRevision = managed.processingMessageRevision
+    const turnStartFinalMessageId = managed.turnStartFinalMessageId
+    const currentFinalMessageId = this.getLastFinalAssistantMessageId(managed.messages)
+    const currentFinalMessage = currentFinalMessageId
+      ? managed.messages.find(message => message.id === currentFinalMessageId)
+      : undefined
+    const didReceiveNewFinalMessage = !!currentFinalMessageId && currentFinalMessageId !== turnStartFinalMessageId
+    const currentErrorMessage = [...managed.messages].reverse().find(message => message.role === 'error')
 
-    // 1. Cleanup state
+    sessionLog.info(`Processing stopped for session ${sessionId}: ${reason} (generation ${completedGeneration})`)
+
+    // 1. Publish durable completion evidence before releasing the processing
+    // gate. A newer final assistant turn is the only proof that an admitted
+    // recovery envelope was consumed.
+    managed.lastCompletedProcessingGeneration = completedGeneration
+    managed.lastCompletedAt = Date.now()
+    managed.lastCompletedMessageId = completedMessageId
+    managed.lastCompletedMessageRevision = completedMessageRevision
+    managed.lastCompletedFinalMessageId = didReceiveNewFinalMessage ? currentFinalMessageId : undefined
+    managed.lastCompletedFinalMessageAt = didReceiveNewFinalMessage ? currentFinalMessage?.timestamp : undefined
+    managed.lastCompletedErrorMessageId = currentErrorMessage?.id
+    managed.lastCompletedErrorMessageAt = currentErrorMessage?.timestamp
+    managed.processingStartedAt = undefined
+    managed.processingMessageId = undefined
+    managed.processingMessageRevision = undefined
     this.setProcessing(managed, false)
     managed.stopRequested = false  // Reset for next turn
+
+    const hasQueuedAdmissionRevision = completedMessageId
+      ? managed.messageQueue.some(entry => entry.messageId === completedMessageId)
+      : false
+    if (reason === 'complete'
+      && didReceiveNewFinalMessage
+      && completedMessageId?.startsWith('automation-')
+      && completedMessageRevision
+      && !hasQueuedAdmissionRevision) {
+      // The transcript final + generation/revision receipt must reach stable
+      // session storage before the separate admission ledger may say consumed.
+      // A crash after ledger consume can therefore never erase its proof.
+      this.persistSession(managed)
+      try {
+        await this.flushSession(managed.id)
+        await this.getAutomationAdmissionStore(managed.workspace.rootPath).consumeByMessageId(completedMessageId, {
+          processingGeneration: completedGeneration,
+          completedMessageId: currentFinalMessageId!,
+          completedMessageAt: currentFinalMessage!.timestamp,
+          contentRevision: completedMessageRevision,
+        })
+      } catch (error) {
+        sessionLog.error('[Automations] Failed to durably publish admission consumption proof', {
+          sessionId,
+          messageId: completedMessageId,
+          error: error instanceof Error ? error.message : String(error),
+        })
+      }
+    }
 
     // 1b. Orphan backstop: with the default per-turn subprocess model, any
     // background sub-agent still marked `running` dies when this turn's
@@ -6614,7 +6838,6 @@ export class SessionManager implements ISessionManager {
     // when WS2 keep-alive keeps the query alive across turns.
     this.markOrphanedBackgroundTasks(sessionId)
 
-    const turnStartFinalMessageId = managed.turnStartFinalMessageId
     managed.turnStartFinalMessageId = undefined
 
     // Clear agent control overlay between turns. The session keeps browser
@@ -6637,8 +6860,6 @@ export class SessionManager implements ISessionManager {
     //    - If user is NOT viewing: mark as unread (they have new content)
     //    IMPORTANT: only apply this when the turn produced a NEW final assistant message.
     const isViewing = this.isSessionBeingViewed(sessionId, managed.workspace.id)
-    const currentFinalMessageId = this.getLastFinalAssistantMessageId(managed.messages)
-    const didReceiveNewFinalMessage = !!currentFinalMessageId && currentFinalMessageId !== turnStartFinalMessageId
 
     if (reason === 'complete' && didReceiveNewFinalMessage) {
       if (isViewing) {
@@ -6743,8 +6964,9 @@ export class SessionManager implements ISessionManager {
     if (next.messageId) {
       const existingMessage = managed.messages.find(m => m.id === next.messageId)
       if (existingMessage) {
-        // Clear isQueued flag and persist - prevents re-queueing if crash during processing
-        existingMessage.isQueued = false
+        // Keep isQueued=true on disk until sendMessage atomically persists the
+        // new processing generation. This preserves the envelope across the
+        // queue-shift -> setImmediate crash window.
         // Re-stamp so this replayed message sorts AFTER the previous turn's
         // finalized assistant reply. It was created mid-stream (an earlier
         // timestamp) while queued; groupMessagesByTurn sorts by timestamp, so
@@ -6764,19 +6986,47 @@ export class SessionManager implements ISessionManager {
 
     // Process message (use setImmediate to allow current stack to clear)
     setImmediate(() => {
+      const isAutomationAdmission = next.messageId?.startsWith('automation-') === true
+      const expectedReplayGeneration = managed.processingGeneration + 1
       this.sendMessage(
         sessionId,
         next.message,
         next.attachments,
         next.storedAttachments,
         next.options,
-        next.messageId
-      ).catch(err => {
+        next.messageId,
+        undefined,
+        undefined,
+        undefined,
+        isAutomationAdmission ? next.messageId : undefined,
+        isAutomationAdmission ? { forceQueue: true } : undefined,
+      ).catch(async err => {
+        if (managed.processingGeneration !== expectedReplayGeneration) {
+          sessionLog.info(`Ignoring stale queued replay failure for ${sessionId}: expected generation ${expectedReplayGeneration}, active ${managed.processingGeneration}`)
+          return
+        }
         sessionLog.error('replay failed', {
           sessionId,
           messageId: next.messageId,
           error: err instanceof Error ? err.message : String(err),
         })
+        if (isAutomationAdmission) {
+          const message = next.messageId ? managed.messages.find(candidate => candidate.id === next.messageId) : undefined
+          if (message) message.isQueued = true
+          if (!managed.messageQueue.some(entry => entry.messageId === next.messageId)) {
+            managed.messageQueue.unshift(next)
+          }
+          this.setProcessing(managed, false)
+          managed.processingStartedAt = undefined
+          managed.processingMessageId = undefined
+          managed.stopRequested = false
+          this.persistSession(managed)
+          try {
+            await this.flushSession(managed.id)
+          } catch (persistError) {
+            sessionLog.error('Failed to restore admitted replay envelope', persistError)
+          }
+        }
         // Report queued message failures via runtime hooks
         sessionRuntimeHooks.captureException(err, { errorSource: 'chat-queue', sessionId })
         // Surface a typed error so the UI can show a clear, actionable banner
@@ -6793,8 +7043,10 @@ export class SessionManager implements ISessionManager {
             originalError: err instanceof Error ? err.message : String(err),
           },
         }, managed.workspace.id)
-        // Call onProcessingStopped to handle cleanup and check for more queued messages
-        this.onProcessingStopped(sessionId, 'error')
+        // Ordinary interactive queue failures retain the existing cleanup path.
+        // Admitted envelopes remain idle+queued for the next inspect/deliver tick
+        // instead of entering an unbounded immediate retry loop.
+        if (!isAutomationAdmission) this.onProcessingStopped(sessionId, 'error', expectedReplayGeneration)
       })
     })
   }
@@ -8472,12 +8724,588 @@ export class SessionManager implements ISessionManager {
   }
 
   /**
+   * Deliver an automation message to an existing session with a durable,
+   * cross-process admission record. Capability-v2 deliveries are queue-only
+   * while busy and coalesce retries into the original deterministic envelope.
+   */
+  async deliverAutomationSessionMessage(
+    input: AutomationSessionMessageDeliveryInput,
+  ): Promise<AutomationSessionMessageDeliveryResult> {
+    const reconciliation = await this.ensureAutomationAdmissionReconciliation(input.workspaceRootPath)
+    if (reconciliation?.error) return { status: 'blocked', reason: `Admission reconciliation failed: ${reconciliation.error}` }
+    const scope = this.automationAdmissionScope(input)
+    const store = this.getAutomationAdmissionStore(input.workspaceRootPath)
+    const messageId = `automation-${createHash('sha256').update(AutomationAdmissionStore.keyFor(scope)).digest('hex').slice(0, 40)}`
+    const incomingRevision = automationMessageRevision(input.message)
+    const targetError = this.validateAutomationAdmissionTarget(input)
+    if (targetError) return { status: 'blocked', reason: targetError }
+    const target = this.sessions.get(input.sessionId)!
+    await this.ensureMessagesLoaded(target)
+
+    const claim = await store.claim(scope)
+    if (claim.status === 'blocked') return { status: 'blocked', reason: claim.reason }
+    if (claim.record.receipt?.recoveryClaim) return { status: 'busy', messageId }
+
+    const existingMessage = target.messages.find(message => message.id === messageId)
+    const existingReceipt = this.toAutomationSessionMessageReceipt(claim.record)
+    if (existingReceipt) {
+      if (!this.matchesAutomationAdmissionIdentity(existingReceipt, input)) {
+        return { status: 'blocked', messageId, reason: 'Outstanding admission target identity does not match' }
+      }
+      if (existingReceipt.deliveryState === 'blocked') {
+        return { status: 'blocked', messageId, receipt: existingReceipt, reason: claim.record.blockedReason ?? 'Delivery is blocked' }
+      }
+    }
+
+    // Coalesce changing incident evidence into the same durable envelope. When
+    // the old generation is poisoned this updated content is what recover()
+    // preserves and replays; no second transcript or queue entry is appended.
+    if (existingMessage) {
+      const contentChanged = existingMessage.content !== input.message
+        || existingReceipt?.contentRevision !== incomingRevision
+      existingMessage.content = input.message
+      if (!contentChanged
+        && existingReceipt?.deliveryState === 'consumed'
+        && existingReceipt.completedContentRevision === incomingRevision) {
+        return { status: 'consumed', messageId, receipt: existingReceipt }
+      }
+      if (!contentChanged
+        && existingReceipt
+        && target.lastCompletedMessageId === messageId
+        && target.lastCompletedMessageRevision === incomingRevision
+        && target.lastCompletedFinalMessageId
+        && target.lastCompletedFinalMessageAt !== undefined) {
+        const consumedRecord = await store.consume(scope, {
+          messageId,
+          processingGeneration: target.lastCompletedProcessingGeneration ?? target.processingGeneration,
+          completedMessageId: target.lastCompletedFinalMessageId,
+          completedMessageAt: target.lastCompletedFinalMessageAt,
+          contentRevision: incomingRevision,
+        })
+        return {
+          status: 'consumed',
+          messageId,
+          receipt: this.toAutomationSessionMessageReceipt(consumedRecord) ?? undefined,
+        }
+      }
+
+      let queued = target.messageQueue.filter(entry => entry.messageId === messageId)
+      // If evidence changed after this envelope already entered the model, the
+      // active turn cannot prove that newer revision consumed. Preserve one
+      // follow-up replay under the same message ID and coalesce further updates
+      // into it.
+      const needsUpdatedReplay = target.isProcessing
+        && target.processingMessageId === messageId
+        && contentChanged
+        && queued.length === 0
+      if ((!target.isProcessing || needsUpdatedReplay) && queued.length === 0) {
+        existingMessage.isQueued = true
+        target.messageQueue.push({
+          message: input.message,
+          messageId,
+          storedAttachments: existingMessage.attachments,
+          options: existingMessage.hidden || existingMessage.badges
+            ? { hidden: existingMessage.hidden, badges: existingMessage.badges }
+            : undefined,
+        })
+        queued = target.messageQueue.filter(entry => entry.messageId === messageId)
+      }
+      if (queued.length > 0) {
+        queued[0].message = input.message
+        target.messageQueue = target.messageQueue.filter((entry, index, all) =>
+          entry.messageId !== messageId || index === all.findIndex(candidate => candidate.messageId === messageId)
+        )
+        existingMessage.isQueued = true
+      }
+      this.persistSession(target)
+      await this.flushSession(target.id)
+
+      let effectiveReceipt = existingReceipt
+      if (effectiveReceipt && (contentChanged || (queued.length > 0 && effectiveReceipt.deliveryState !== 'pending-consumption'))) {
+        const updated = await store.updateReceipt(scope, {
+          deliveryState: 'pending-consumption',
+          contentRevision: incomingRevision,
+          completedContentRevision: undefined,
+          consumedAt: undefined,
+          completedProcessingGeneration: undefined,
+          completedMessageId: undefined,
+          completedMessageAt: undefined,
+          acceptedProcessingGeneration: target.isProcessing
+            ? target.processingGeneration + 1
+            : target.processingGeneration,
+        })
+        effectiveReceipt = this.toAutomationSessionMessageReceipt(updated)
+      }
+
+      if (!effectiveReceipt) {
+        const deliveryState = queued.length > 0 ? 'pending-consumption' : 'delivered'
+        const record = await store.commit(scope, {
+          messageId,
+          sessionId: input.sessionId,
+          targetKind: input.targetKind,
+          targetId: input.targetId,
+          targetGeneration: input.targetGeneration,
+          deliveredAt: Date.now(),
+          deliveryState,
+          acceptedProcessingGeneration: target.processingGeneration,
+          contentRevision: incomingRevision,
+        })
+        await store.complete(scope)
+        const receipt = this.toAutomationSessionMessageReceipt(record)
+        if (!target.isProcessing && queued.length > 0) this.processNextQueuedMessage(target.id)
+        return { status: deliveryState, messageId, receipt: receipt ?? undefined }
+      }
+
+      if (!target.isProcessing && queued.length > 0) this.processNextQueuedMessage(target.id)
+      const status = queued.length > 0 ? 'pending-consumption' : effectiveReceipt.deliveryState
+      return { status, messageId, receipt: effectiveReceipt }
+    }
+
+    if (claim.status === 'duplicate') {
+      if (existingReceipt?.deliveryState === 'consumed') {
+        return { status: 'consumed', messageId, receipt: existingReceipt }
+      }
+      return { status: 'duplicate', messageId, receipt: existingReceipt ?? undefined }
+    }
+    if (claim.status === 'busy') return { status: 'busy', messageId }
+
+    const delivery = await store.beginDelivery(scope)
+    if (delivery.status === 'duplicate') {
+      return {
+        status: 'duplicate',
+        messageId,
+        receipt: this.toAutomationSessionMessageReceipt(delivery.record) ?? undefined,
+      }
+    }
+    if (delivery.status === 'busy') return { status: 'busy', messageId }
+    if (delivery.status === 'blocked') return { status: 'blocked', messageId, reason: delivery.reason }
+
+    const targetBusy = target.isProcessing
+    const acceptedProcessingGeneration = targetBusy
+      ? target.processingGeneration
+      : target.processingGeneration + 1
+    let acked = false
+    let committedReceipt: AutomationSessionMessageReceipt | undefined
+    const acknowledgement = new Promise<string>((resolve, reject) => {
+      void this.sendMessage(
+        input.sessionId,
+        input.message,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        async (persistedMessageId) => {
+          try {
+            const record = await store.commit(scope, {
+              messageId: persistedMessageId,
+              sessionId: input.sessionId,
+              targetKind: input.targetKind,
+              targetId: input.targetId,
+              targetGeneration: input.targetGeneration,
+              deliveredAt: Date.now(),
+              deliveryState: targetBusy ? 'pending-consumption' : 'delivered',
+              acceptedProcessingGeneration,
+              contentRevision: incomingRevision,
+            })
+            committedReceipt = this.toAutomationSessionMessageReceipt(record) ?? undefined
+            acked = true
+            resolve(persistedMessageId)
+          } catch (error) {
+            throw error
+          }
+        },
+        undefined,
+        messageId,
+        { forceQueue: true },
+      ).then(async () => {
+        if (acked) await store.complete(scope)
+      }).catch(async (error) => {
+        if (!acked) {
+          try {
+            await store.prepareRetry(scope)
+          } catch (prepareError) {
+            sessionLog.error('[Automations] Failed to prepare session-message retry', {
+              sessionId: input.sessionId,
+              messageId,
+              error: prepareError instanceof Error ? prepareError.message : String(prepareError),
+            })
+          }
+          reject(error)
+          return
+        }
+        sessionLog.error('[Automations] session-message failed after durable acknowledgement', {
+          sessionId: input.sessionId,
+          messageId,
+          error: error instanceof Error ? error.message : String(error),
+        })
+      })
+    })
+
+    try {
+      const persistedMessageId = await acknowledgement
+      return {
+        status: targetBusy ? 'pending-consumption' : 'delivered',
+        messageId: persistedMessageId,
+        receipt: committedReceipt,
+      }
+    } catch (error) {
+      return { status: 'blocked', messageId, reason: error instanceof Error ? error.message : String(error) }
+    }
+  }
+
+  async inspectAutomationSessionMessage(
+    input: AutomationSessionMessageInspectionInput,
+  ): Promise<AutomationSessionMessageInspectionResult> {
+    const reconciliation = await this.ensureAutomationAdmissionReconciliation(input.workspaceRootPath)
+    if (reconciliation?.error) throw new Error(`Admission reconciliation failed: ${reconciliation.error}`)
+    const targetError = this.validateAutomationSessionTarget(input)
+    if (targetError) throw new Error(targetError)
+    const target = this.sessions.get(input.sessionId)!
+    await this.ensureMessagesLoaded(target)
+    const record = await this.getAutomationAdmissionStore(input.workspaceRootPath).get(this.automationAdmissionScope(input))
+    const receipt = record ? this.toAutomationSessionMessageReceipt(record) : null
+
+    const finalId = this.getLastFinalAssistantMessageId(target.messages)
+    const finalMessage = finalId ? target.messages.find(message => message.id === finalId) : undefined
+    const errorMessage = [...target.messages].reverse().find(message => message.role === 'error')
+    const startedAt = target.isProcessing ? target.processingStartedAt ?? null : null
+    const session = {
+      isProcessing: target.isProcessing,
+      processingGeneration: target.processingGeneration,
+      processingStartedAt: startedAt,
+      processingAgeMs: startedAt === null ? null : Math.max(0, Date.now() - startedAt),
+      queueDepth: target.messageQueue.length,
+      lastFinalMessageId: finalId ?? null,
+      lastFinalMessageAt: finalMessage?.timestamp ?? null,
+      lastErrorMessageId: errorMessage?.id ?? null,
+      lastErrorMessageAt: errorMessage?.timestamp ?? null,
+    }
+
+    if (!record || !receipt) return { status: 'missing', receipt: null, session }
+    if (record.state === 'blocked' || receipt.deliveryState === 'blocked') {
+      return { status: 'blocked', receipt, session, reason: record.blockedReason ?? 'Delivery is blocked' }
+    }
+    return { status: receipt.deliveryState, receipt, session }
+  }
+
+  async recoverAutomationSessionMessage(
+    input: AutomationSessionMessageRecoveryInput,
+  ): Promise<AutomationSessionMessageRecoveryResult> {
+    const reconciliation = await this.ensureAutomationAdmissionReconciliation(input.workspaceRootPath)
+    if (reconciliation?.error) return { status: 'blocked', messageId: input.messageId, reason: `Admission reconciliation failed: ${reconciliation.error}` }
+    const runtimeVersion = process.env.CRAFT_VERSION
+    const runtimeCommit = process.env.CRAFT_BUILD_SHA
+    if (!runtimeVersion || !runtimeCommit || input.runtimeVersion !== runtimeVersion || input.runtimeCommit !== runtimeCommit) {
+      return { status: 'blocked', messageId: input.messageId, reason: 'Runtime identity does not match the pinned recovery request' }
+    }
+    if (!Number.isSafeInteger(input.processingGeneration) || input.processingGeneration < 0) {
+      return { status: 'blocked', messageId: input.messageId, reason: 'processingGeneration must be a non-negative integer' }
+    }
+    if (!Number.isFinite(input.minimumProcessingAgeMs) || input.minimumProcessingAgeMs < AUTOMATION_ADMISSION_MIN_RECOVERY_AGE_MS) {
+      return { status: 'blocked', messageId: input.messageId, reason: `minimumProcessingAgeMs must be at least ${AUTOMATION_ADMISSION_MIN_RECOVERY_AGE_MS}` }
+    }
+
+    const targetError = this.validateAutomationAdmissionTarget(input)
+    if (targetError) return { status: 'blocked', messageId: input.messageId, reason: targetError }
+    const target = this.sessions.get(input.sessionId)!
+    await this.ensureMessagesLoaded(target)
+    const scope = this.automationAdmissionScope(input)
+    const store = this.getAutomationAdmissionStore(input.workspaceRootPath)
+    const record = await store.get(scope)
+    const receipt = record ? this.toAutomationSessionMessageReceipt(record) : null
+    if (!record || !receipt) return { status: 'blocked', messageId: input.messageId, reason: 'Outstanding admission receipt was not found' }
+    if (!this.matchesAutomationAdmissionIdentity(receipt, input) || receipt.messageId !== input.messageId) {
+      return { status: 'blocked', messageId: input.messageId, reason: 'Outstanding admission identity does not match' }
+    }
+    if (receipt.deliveryState === 'consumed') {
+      return {
+        status: 'consumed',
+        messageId: input.messageId,
+        processingGeneration: target.processingGeneration,
+        receipt,
+      }
+    }
+    if (record.state === 'blocked' || receipt.deliveryState === 'blocked') {
+      return { status: 'blocked', messageId: input.messageId, reason: record.blockedReason ?? 'Delivery is blocked' }
+    }
+    if (!target.isProcessing || target.processingGeneration !== input.processingGeneration || target.processingStartedAt === undefined) {
+      return { status: 'blocked', messageId: input.messageId, reason: 'Processing generation CAS did not match an active turn' }
+    }
+    if (Date.now() - target.processingStartedAt < input.minimumProcessingAgeMs) {
+      return { status: 'blocked', messageId: input.messageId, reason: 'Processing generation has not reached the requested minimum age' }
+    }
+    if (!target.agent
+      || target.agent.constructor.name !== 'PiAgent'
+      || !target.agent.tryBeginRecoveryFence
+      || !target.agent.releaseRecoveryFence) {
+      return { status: 'blocked', messageId: input.messageId, reason: 'Active processing backend cannot prove an exact Pi recovery fence' }
+    }
+
+    const poisonedAgent = target.agent
+    const message = target.messages.find(candidate => candidate.id === input.messageId)
+    if (!message) return { status: 'blocked', messageId: input.messageId, reason: 'Outstanding admission message is not present in the target session' }
+    const receiptContent = [
+      message.content,
+      ...target.messageQueue
+        .filter(entry => entry.messageId === input.messageId)
+        .map(entry => entry.message),
+    ].find(content => automationMessageRevision(content) === receipt.contentRevision)
+    if (receiptContent === undefined) {
+      return { status: 'blocked', messageId: input.messageId, reason: 'Outstanding admission content revision does not match the target session or its preserved queue entry' }
+    }
+
+    // This durable CAS is the linearization point. No generation, agent, queue,
+    // or transcript mutation is permitted before one caller owns this token.
+    const recoveryClaim = await store.beginRecovery(
+      scope,
+      input.messageId,
+      input.processingGeneration,
+      receipt.contentRevision,
+    )
+    if (recoveryClaim.status === 'busy') {
+      return { status: 'busy', messageId: input.messageId, reason: 'Recovery CAS is already held' }
+    }
+    if (recoveryClaim.status === 'duplicate') {
+      const currentReceipt = this.toAutomationSessionMessageReceipt(recoveryClaim.record)
+      if (currentReceipt?.deliveryState === 'consumed') {
+        return {
+          status: 'consumed',
+          messageId: input.messageId,
+          processingGeneration: target.processingGeneration,
+          receipt: currentReceipt,
+        }
+      }
+      return { status: 'blocked', messageId: input.messageId, reason: 'The single bounded recovery attempt was already consumed' }
+    }
+    if (recoveryClaim.status === 'blocked') {
+      return { status: 'blocked', messageId: input.messageId, reason: recoveryClaim.reason }
+    }
+
+    const recoveryToken = recoveryClaim.token
+    let sessionMutated = false
+    let recoveryCommitted = false
+    let recoveryFenceHeld = false
+
+    try {
+      // The CAS await allowed other local work to run. Revalidate every local
+      // predicate before acquiring the atomic Pi dispatch fence.
+      const currentReceiptContent = [
+        message.content,
+        ...target.messageQueue
+          .filter(entry => entry.messageId === input.messageId)
+          .map(entry => entry.message),
+      ].find(content => automationMessageRevision(content) === receipt.contentRevision)
+      if (target.agent !== poisonedAgent
+        || !target.isProcessing
+        || target.processingGeneration !== input.processingGeneration
+        || target.processingStartedAt === undefined
+        || currentReceiptContent === undefined) {
+        await store.releaseRecovery(scope, recoveryToken)
+        return { status: 'busy', messageId: input.messageId, reason: 'Recovery target changed before fencing' }
+      }
+      if (!poisonedAgent.tryBeginRecoveryFence!()) {
+        await store.releaseRecovery(scope, recoveryToken)
+        return { status: 'busy', messageId: input.messageId, reason: 'A tool dispatch is still in flight' }
+      }
+      recoveryFenceHeld = true
+
+      // Fence all old iterators/callbacks before aborting or rewriting the
+      // preserved envelope. The Pi gate now rejects every new dispatch.
+      target.processingGeneration++
+      sessionMutated = true
+      target.authRetryInProgress = false
+      target.stopRequested = true
+      poisonedAgent.forceAbort(AbortReason.UserStop)
+      // Repair the transcript only after the durable recovery CAS and Pi fence.
+      // A coalesced queue entry can be newer than the active turn's stale
+      // transcript object; the receipt-bound revision is the only safe replay.
+      message.content = currentReceiptContent
+      message.isQueued = true
+      const matching = target.messageQueue.filter(entry => entry.messageId === input.messageId)
+      if (matching.length > 0) {
+        matching[0].message = currentReceiptContent
+        target.messageQueue = target.messageQueue.filter((entry, index, all) =>
+          entry.messageId !== input.messageId || index === all.findIndex(candidate => candidate.messageId === input.messageId)
+        )
+      } else {
+        target.messageQueue.unshift({
+          message: message.content,
+          messageId: message.id,
+          storedAttachments: message.attachments,
+          options: message.hidden || message.badges ? { hidden: message.hidden, badges: message.badges } : undefined,
+        })
+      }
+
+      // Checkpoint the fenced generation and preserved envelope before the
+      // attempt becomes durable. A crash either sees a stale claim (retryable)
+      // or the queued recovery checkpoint plus a consumed attempt.
+      this.persistSession(target)
+      await this.flushSession(target.id)
+      await store.commitRecovery(scope, recoveryToken)
+      recoveryCommitted = true
+
+      await new Promise(resolve => setTimeout(resolve, AUTOMATION_ADMISSION_ABORT_GRACE_MS))
+      if (target.agent !== poisonedAgent) throw new Error('Agent identity changed during guarded recovery')
+      await this.disposeManagedAgentRuntime(target, 'automation admission stuck-turn recovery')
+
+      this.setProcessing(target, false)
+      target.stopRequested = false
+      target.processingStartedAt = undefined
+      target.processingMessageId = undefined
+      target.processingMessageRevision = undefined
+      this.persistSession(target)
+      await this.flushSession(target.id)
+      await store.finishRecovery(scope, recoveryToken)
+      this.processNextQueuedMessage(target.id)
+      return {
+        status: 'recovered',
+        messageId: input.messageId,
+        previousProcessingGeneration: input.processingGeneration,
+        processingGeneration: target.processingGeneration,
+      }
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error)
+      if (!sessionMutated) {
+        if (recoveryFenceHeld) poisonedAgent.releaseRecoveryFence!()
+        await store.releaseRecovery(scope, recoveryToken).catch(() => {})
+        return { status: 'busy', messageId: input.messageId, reason }
+      }
+      try {
+        if (target.agent === poisonedAgent) {
+          await this.disposeManagedAgentRuntime(target, 'failed automation admission recovery')
+        }
+      } catch (disposeError) {
+        sessionLog.error('[Automations] Failed to dispose poisoned agent after recovery error', disposeError)
+      }
+      this.setProcessing(target, false)
+      target.stopRequested = false
+      target.processingStartedAt = undefined
+      target.processingMessageId = undefined
+      target.processingMessageRevision = undefined
+      this.persistSession(target)
+      try { await this.flushSession(target.id) } catch { /* original recovery error remains authoritative */ }
+      // block() atomically clears an uncommitted claim too. Never let a losing
+      // pre-mutation caller enter this terminal path and block the winner.
+      await store.block(scope, recoveryCommitted ? reason : `Recovery checkpoint failed: ${reason}`)
+      return { status: 'blocked', messageId: input.messageId, reason }
+    }
+  }
+
+  private automationAdmissionScope(input: {
+    workspaceId: string
+    matcherId: string
+    actionId: string
+    occurrenceId: string
+    idempotencyKey: string
+  }): AutomationAdmissionScope {
+    return {
+      workspaceId: input.workspaceId,
+      matcherId: input.matcherId,
+      actionId: input.actionId,
+      occurrenceId: input.occurrenceId,
+      idempotencyKey: input.idempotencyKey,
+    }
+  }
+
+  private validateAutomationSessionTarget(input: { workspaceId: string; sessionId: string }): string | null {
+    const target = this.sessions.get(input.sessionId)
+    if (!target) return `Target session ${input.sessionId} was not found`
+    if (target.workspace.id !== input.workspaceId) return 'Target session belongs to a different workspace'
+    if (target.isArchived) return 'Target session is archived'
+    return null
+  }
+
+  private validateAutomationAdmissionTarget(input: {
+    workspaceId: string
+    sessionId: string
+    targetKind: 'controller' | 'coordinator'
+    targetId: string
+    targetGeneration: string
+  }): string | null {
+    if (input.targetId !== input.sessionId) return 'Admission targetId must exactly match sessionId'
+    if (!input.targetGeneration.trim()) return 'Admission targetGeneration must be a non-empty string'
+    return this.validateAutomationSessionTarget(input)
+  }
+
+  private matchesAutomationAdmissionIdentity(
+    receipt: AutomationSessionMessageReceipt,
+    input: { sessionId: string; targetKind: 'controller' | 'coordinator'; targetId: string; targetGeneration: string },
+  ): boolean {
+    return receipt.sessionId === input.sessionId
+      && receipt.targetKind === input.targetKind
+      && receipt.targetId === input.targetId
+      && receipt.targetGeneration === input.targetGeneration
+  }
+
+  private toAutomationSessionMessageReceipt(record: AutomationAdmissionRecord): AutomationSessionMessageReceipt | null {
+    const receipt = record.receipt
+    if (!receipt
+      || typeof receipt.messageId !== 'string'
+      || typeof receipt.sessionId !== 'string'
+      || (receipt.targetKind !== 'controller' && receipt.targetKind !== 'coordinator')
+      || typeof receipt.targetId !== 'string'
+      || typeof receipt.targetGeneration !== 'string'
+      || typeof receipt.deliveredAt !== 'number'
+      || typeof receipt.contentRevision !== 'string'
+      || (receipt.deliveryState !== 'delivered'
+        && receipt.deliveryState !== 'pending-consumption'
+        && receipt.deliveryState !== 'consumed'
+        && receipt.deliveryState !== 'blocked')
+      || typeof receipt.acceptedProcessingGeneration !== 'number') return null
+    return {
+      workspaceId: record.workspaceId,
+      matcherId: record.matcherId,
+      actionId: record.actionId,
+      occurrenceId: record.occurrenceId,
+      idempotencyKey: record.idempotencyKey,
+      sessionId: receipt.sessionId,
+      targetKind: receipt.targetKind,
+      targetId: receipt.targetId,
+      targetGeneration: receipt.targetGeneration,
+      messageId: receipt.messageId,
+      deliveredAt: receipt.deliveredAt,
+      deliveryState: receipt.deliveryState,
+      acceptedProcessingGeneration: receipt.acceptedProcessingGeneration,
+      contentRevision: receipt.contentRevision,
+      completedContentRevision: typeof receipt.completedContentRevision === 'string' ? receipt.completedContentRevision : undefined,
+      recoveryAttemptedAt: typeof receipt.recoveryAttemptedAt === 'number' ? receipt.recoveryAttemptedAt : undefined,
+      recoveryProcessingGeneration: typeof receipt.recoveryProcessingGeneration === 'number' ? receipt.recoveryProcessingGeneration : undefined,
+      consumedAt: typeof receipt.consumedAt === 'number' ? receipt.consumedAt : undefined,
+      completedProcessingGeneration: typeof receipt.completedProcessingGeneration === 'number' ? receipt.completedProcessingGeneration : undefined,
+      completedMessageId: typeof receipt.completedMessageId === 'string' ? receipt.completedMessageId : undefined,
+      completedMessageAt: typeof receipt.completedMessageAt === 'number' ? receipt.completedMessageAt : undefined,
+    }
+  }
+
+  private ensureAutomationAdmissionReconciliation(workspaceRootPath: string): Promise<{ error?: string }> {
+    let reconciliation = this.automationAdmissionReconciliations.get(workspaceRootPath)
+    if (!reconciliation) {
+      reconciliation = this.getAutomationAdmissionStore(workspaceRootPath).reconcile().then(
+        () => ({}),
+        (error) => {
+          const message = error instanceof Error ? error.message : String(error)
+          sessionLog.error('[Automations] Failed to reconcile durable admissions', error)
+          return { error: message }
+        },
+      )
+      this.automationAdmissionReconciliations.set(workspaceRootPath, reconciliation)
+    }
+    return reconciliation
+  }
+
+  private getAutomationAdmissionStore(workspaceRootPath: string): AutomationAdmissionStore {
+    let store = this.automationAdmissionStores.get(workspaceRootPath)
+    if (!store) {
+      store = new AutomationAdmissionStore(workspaceRootPath)
+      this.automationAdmissionStores.set(workspaceRootPath, store)
+    }
+    return store
+  }
+
+  /**
    * Execute a prompt automation by creating a new session and sending the prompt.
-   *
-   * The options-object form replaced the previous positional-args signature
-   * once the param list outgrew readability — `thinkingLevel` was the trigger.
-   * When `thinkingLevel` is omitted, `createSession` falls back to the
-   * workspace default (then DEFAULT_THINKING_LEVEL).
+   * The options-object form keeps legacy prompt automations backward compatible.
    */
   async executePromptAutomation(
     input: ExecutePromptAutomationInput,

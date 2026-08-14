@@ -370,6 +370,20 @@ export interface AgentBackend {
   forceAbort(reason: AbortReason): void;
 
   /**
+   * Atomically fence new tool/pre-tool dispatches for guarded stuck-turn
+   * recovery. Returns false without mutation while any side effect is active.
+   * Backends that cannot prove this serialization leave it unimplemented and
+   * therefore fail closed at the admission recovery boundary.
+   */
+  tryBeginRecoveryFence?(): boolean;
+
+  /** Release a pre-abort fence when recovery did not proceed. */
+  releaseRecoveryFence?(): void;
+
+  /** Number of tool side effects already dispatched by this backend. */
+  getActiveToolDispatchCount?(): number;
+
+  /**
    * WS2: register a sink for background task events that arrive BETWEEN turns
    * (when no chat() generator is being consumed) under keep-alive mode. Backends
    * without a persistent cross-turn query may leave this unimplemented.

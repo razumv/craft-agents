@@ -767,6 +767,7 @@ export interface ClaudeOAuthResult {
 
 export type TestAutomationAction =
   | { type: 'prompt'; prompt: string; llmConnection?: string; model?: string; thinkingLevel?: ThinkingLevel }
+  | { type: 'session-message'; sessionId: string; message: string; idempotencyKey?: string }
   | { type: 'webhook'; url: string; method?: string; headers?: Record<string, string>; bodyFormat?: 'json' | 'form' | 'raw'; body?: unknown; captureResponse?: boolean; auth?: { type: 'basic'; username: string; password: string } | { type: 'bearer'; token: string } }
 
 export interface TestAutomationPayload {
@@ -782,6 +783,7 @@ export interface TestAutomationPayload {
 
 export type TestAutomationActionResult =
   | { type: 'prompt'; success: boolean; stderr?: string; sessionId?: string; duration: number }
+  | { type: 'session-message'; success: boolean; messageId?: string; delivery?: 'delivered' | 'queued' | 'pending-consumption' | 'consumed' | 'duplicate' | 'busy' | 'blocked'; stderr?: string; duration: number }
   | { type: 'webhook'; success: boolean; url: string; statusCode: number; error?: string; duration: number }
 
 export interface TestAutomationResult {

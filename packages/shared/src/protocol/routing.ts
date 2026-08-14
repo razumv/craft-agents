@@ -411,6 +411,11 @@ export const REMOTE_ELIGIBLE_CHANNELS = new Set<string>([
   RPC_CHANNELS.automations.GET_HISTORY,
   RPC_CHANNELS.automations.GET_LAST_EXECUTED,
   RPC_CHANNELS.automations.REPLAY,
+  RPC_CHANNELS.automations.ADMISSION_CAPABILITIES,
+  RPC_CHANNELS.automations.ADMISSION_CLAIM,
+  RPC_CHANNELS.automations.ADMISSION_DELIVER,
+  RPC_CHANNELS.automations.ADMISSION_INSPECT,
+  RPC_CHANNELS.automations.ADMISSION_RECOVER,
   RPC_CHANNELS.automations.CHANGED,
 
   // projects — workspace projects
