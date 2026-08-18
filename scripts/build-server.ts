@@ -172,12 +172,16 @@ function assembleResources(config: ServerBuildConfig): void {
     }
   }
 
-  // Also copy session-mcp-server from packages/ build output (dev path fallback)
-  const sessionServerDist = join(config.rootDir, 'packages', 'session-mcp-server', 'dist', 'index.js');
-  if (existsSync(sessionServerDist)) {
-    const destSessionServer = join(destResources, 'session-mcp-server');
-    mkdirSync(destSessionServer, { recursive: true });
-    copyFileSync(sessionServerDist, join(destSessionServer, 'index.js'));
+  // Also copy subprocess servers from packages/ build output (dev path fallback).
+  // pi-agent-server must be here too: with CRAFT_IS_PACKAGED=true the runtime
+  // resolver looks for resources/pi-agent-server/index.js.
+  for (const server of ['session-mcp-server', 'pi-agent-server']) {
+    const serverDist = join(config.rootDir, 'packages', server, 'dist', 'index.js');
+    if (existsSync(serverDist)) {
+      const destServer = join(destResources, server);
+      mkdirSync(destServer, { recursive: true });
+      copyFileSync(serverDist, join(destServer, 'index.js'));
+    }
   }
 }
 
@@ -359,7 +363,7 @@ function copyProductionDeps(config: ServerBuildConfig): void {
   // messaging-whatsapp-worker is intentionally OMITTED: Baileys and its transitive deps
   // are bundled directly into packages/messaging-whatsapp-worker/dist/worker.cjs by
   // scripts/build-wa-worker.ts — pulling them into node_modules would duplicate the tree.
-  const SERVER_PACKAGES = ['server', 'server-core', 'shared', 'core', 'session-tools-core', 'session-mcp-server', 'messaging-gateway'];
+  const SERVER_PACKAGES = ['server', 'server-core', 'shared', 'core', 'session-tools-core', 'session-mcp-server', 'messaging-gateway', 'pi-agent-server'];
 
   const allImports = new Set<string>();
   for (const pkg of SERVER_PACKAGES) {
@@ -472,6 +476,9 @@ function copyWorkspacePackages(config: ServerBuildConfig): void {
     'session-mcp-server',
     'messaging-gateway',
     'messaging-whatsapp-worker',
+    // pi-agent-server ships src + dist/index.js (built in step 4); the runtime
+    // resolver spawns packages/pi-agent-server/dist/index.js for Pi sessions.
+    'pi-agent-server',
   ];
 
   for (const pkg of packages) {

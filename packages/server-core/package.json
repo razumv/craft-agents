@@ -28,6 +28,7 @@
     "@craft-agent/core": "workspace:*",
     "@craft-agent/shared": "workspace:*",
     "jose": "^6.0.0",
+    "markitdown-js": "^0.0.14",
     "ws": "^8.19.0",
     "sharp": "0.34.5",
     "@earendil-works/pi-ai": "0.80.6"
