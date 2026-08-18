@@ -59,8 +59,16 @@ export { messageToStored, storedToMessage } from './message-mapper.ts';
 
 // Server types (headless operations)
 export type {
+  BuildIdentity,
   ServerStatus,
   ServerHealth,
+  SymphonyServicePhase,
+  SymphonyOperation,
+  SymphonyProjectServiceStatus,
+  SymphonyServiceStatus,
+  SymphonyOperationResult,
+  SymphonyStopResult,
+  SymphonyServiceControl,
   SessionProcessingStatus,
   ActiveSessionInfo,
 } from './server.ts';

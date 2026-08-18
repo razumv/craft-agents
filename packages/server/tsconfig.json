@@ -24,7 +24,9 @@
       "@craft-agent/server-core": ["../server-core/src/index.ts"],
       "@craft-agent/server-core/*": ["../server-core/src/*"],
       "@craft-agent/core": ["../core/src/index.ts"],
-      "@craft-agent/core/*": ["../core/src/*"]
+      "@craft-agent/core/*": ["../core/src/*"],
+      "@craft-agent/symphony": ["../symphony/src/index.ts"],
+      "@craft-agent/symphony/*": ["../symphony/src/*"]
     }
   },
   "include": ["src/**/*", "../shared/src/agent/bash-parser.d.ts"],

@@ -16,6 +16,7 @@
  *   --output         Output directory (default: dist/server)
  *   --compress       Create .tar.gz archive after assembly
  *   --skip-download  Skip Bun/uv downloads (use existing if present)
+ *   --allow-dirty    Development-only override; immutable candidates reject dirty sources
  *   --help           Show help
  */
 
@@ -32,6 +33,8 @@ process.on('unhandledRejection', (reason) => {
 import { parseArgs } from 'util';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
+import { createHash } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import {
   existsSync,
   mkdirSync,
@@ -73,6 +76,14 @@ interface ServerBuildConfig {
   compress: boolean;
   skipDownload: boolean;
   version: string;
+  buildIdentity: {
+    schemaVersion: 1;
+    buildId: string;
+    version: string;
+    sourceCommit: string;
+    platform: ServerPlatform;
+    arch: Arch;
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -94,6 +105,7 @@ Options:
   --output=<path>        Output directory (default: dist/server)
   --compress             Create .tar.gz after assembly
   --skip-download        Reuse existing Bun/uv binaries
+  --allow-dirty          Development-only override for non-release builds
   --help                 Show this help message
 
 Examples:
@@ -363,7 +375,7 @@ function copyProductionDeps(config: ServerBuildConfig): void {
   // messaging-whatsapp-worker is intentionally OMITTED: Baileys and its transitive deps
   // are bundled directly into packages/messaging-whatsapp-worker/dist/worker.cjs by
   // scripts/build-wa-worker.ts — pulling them into node_modules would duplicate the tree.
-  const SERVER_PACKAGES = ['server', 'server-core', 'shared', 'core', 'session-tools-core', 'session-mcp-server', 'messaging-gateway', 'pi-agent-server'];
+  const SERVER_PACKAGES = ['server', 'server-core', 'shared', 'core', 'symphony', 'session-tools-core', 'session-mcp-server', 'messaging-gateway', 'pi-agent-server'];
 
   const allImports = new Set<string>();
   for (const pkg of SERVER_PACKAGES) {
@@ -472,6 +484,7 @@ function copyWorkspacePackages(config: ServerBuildConfig): void {
     'server-core',
     'shared',
     'core',
+    'symphony',
     'session-tools-core',
     'session-mcp-server',
     'messaging-gateway',
@@ -519,6 +532,17 @@ function copyWorkspacePackages(config: ServerBuildConfig): void {
 // Root config files for workspace resolution
 // ---------------------------------------------------------------------------
 
+function copyCliApp(config: ServerBuildConfig): void {
+  const src = join(config.rootDir, 'apps', 'cli');
+  const dest = join(config.outputDir, 'apps', 'cli');
+  if (!existsSync(src)) throw new Error('apps/cli is required for a complete server release');
+  mkdirSync(dest, { recursive: true });
+  for (const file of ['package.json', 'tsconfig.json']) {
+    copyFileSync(join(src, file), join(dest, file));
+  }
+  cpSync(join(src, 'src'), join(dest, 'src'), { recursive: true });
+}
+
 function createRootConfig(config: ServerBuildConfig): void {
   const { outputDir, version } = config;
 
@@ -527,7 +551,7 @@ function createRootConfig(config: ServerBuildConfig): void {
     name: 'craft-server-dist',
     version,
     private: true,
-    workspaces: ['packages/*'],
+    workspaces: ['packages/*', 'apps/*'],
   };
   writeFileSync(join(outputDir, 'package.json'), JSON.stringify(rootPkg, null, 2) + '\n');
 
@@ -541,6 +565,7 @@ function createRootConfig(config: ServerBuildConfig): void {
         '@craft-agent/server-core/*': ['./packages/server-core/src/*'],
         '@craft-agent/shared/*': ['./packages/shared/src/*'],
         '@craft-agent/core/*': ['./packages/core/src/*'],
+        '@craft-agent/symphony/*': ['./packages/symphony/src/*'],
         '@craft-agent/session-tools-core/*': ['./packages/session-tools-core/src/*'],
       },
     },
@@ -594,8 +619,9 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(dirname "$SCRIPT_DIR")"
 
-# Set environment for resource resolution
+# Set environment for resource resolution and immutable release identity
 export CRAFT_BUNDLED_ASSETS_ROOT="$ROOT"
+export CRAFT_RELEASE_MANIFEST="$ROOT/release-manifest.json"
 export CRAFT_IS_PACKAGED=true
 export CRAFT_APP_ROOT="$ROOT"
 export CRAFT_RESOURCES_PATH="$ROOT/resources"
@@ -611,6 +637,17 @@ export PATH="$ROOT/resources/bin:$ROOT/vendor/bun:$PATH"
 exec "$ROOT/vendor/bun/bun" run "$ROOT/packages/server/src/index.ts" "$@"
 `;
   writeFileSync(join(binDir, 'craft-server'), craftServer);
+
+  // bin/craft-cli — same-release RPC client wrapper
+  const craftCli = `#!/bin/sh
+set -e
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+ROOT="$(dirname "$SCRIPT_DIR")"
+export CRAFT_RELEASE_MANIFEST="$ROOT/release-manifest.json"
+export PATH="$ROOT/vendor/bun:$PATH"
+exec "$ROOT/vendor/bun/bun" run "$ROOT/apps/cli/src/index.ts" "$@"
+`;
+  writeFileSync(join(binDir, 'craft-cli'), craftCli);
 
   // start.sh — convenience entry
   const startSh = `#!/bin/sh
@@ -630,7 +667,7 @@ echo "=== Craft Agent Server Setup ==="
 echo ""
 
 # Make binaries executable
-chmod +x "$DIR/bin/craft-server" "$DIR/start.sh"
+chmod +x "$DIR/bin/craft-server" "$DIR/bin/craft-cli" "$DIR/start.sh"
 [ -f "$DIR/vendor/bun/bun" ] && chmod +x "$DIR/vendor/bun/bun"
 [ -f "$DIR/resources/bin/uv" ] && chmod +x "$DIR/resources/bin/uv"
 
@@ -715,11 +752,99 @@ echo ""
   // Make scripts executable at build time
   for (const script of [
     join(binDir, 'craft-server'),
+    join(binDir, 'craft-cli'),
     join(outputDir, 'start.sh'),
     join(outputDir, 'install.sh'),
   ]) {
     chmodSync(script, 0o755);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Immutable release metadata + rollback layout
+// ---------------------------------------------------------------------------
+
+function sha256File(path: string): string {
+  return createHash('sha256').update(readFileSync(path)).digest('hex');
+}
+
+function createReleaseMetadata(config: ServerBuildConfig): void {
+  const { outputDir, buildIdentity } = config;
+
+  // Valid launchd candidate template. Installation deliberately remains a
+  // separate, owner-authorized action; the placeholder is never activated by
+  // this build.
+  const launchdDir = join(outputDir, 'launchd');
+  mkdirSync(launchdDir, { recursive: true });
+  const launchdTemplate = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.craft-agent.headless.candidate</string>
+  <key>ProgramArguments</key><array><string>__CRAFT_HEADLESS_RUNNER__</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>ProcessType</key><string>Background</string>
+</dict>
+</plist>
+`;
+  writeFileSync(join(launchdDir, 'com.craft-agent.headless.plist.template'), launchdTemplate);
+
+  writeFileSync(join(outputDir, '.source-commit'), `${buildIdentity.sourceCommit}\n`);
+  const rollbackLayout = {
+    schemaVersion: 1,
+    buildIdentity,
+    strategy: 'atomic-symlink-rename',
+    releasesDirectory: 'releases',
+    currentLink: 'current',
+    candidateDirectoryName: buildIdentity.sourceCommit,
+    receipt: 'rollback-receipt.json',
+    requiredCandidateFiles: [
+      'release-manifest.json',
+      '.source-commit',
+      'bin/craft-server',
+      'bin/craft-cli',
+      'resources/pi-agent-server/index.js',
+      'packages/pi-agent-server/dist/index.js',
+    ],
+  };
+  writeFileSync(join(outputDir, 'rollback-layout.json'), JSON.stringify(rollbackLayout, null, 2) + '\n');
+  writeFileSync(join(outputDir, 'rollback-receipt.json'), JSON.stringify({
+    schemaVersion: 1,
+    state: 'prepared',
+    candidateBuildId: buildIdentity.buildId,
+    candidateSourceCommit: buildIdentity.sourceCommit,
+    previousRelease: null,
+    restoredRelease: null,
+    activatedAt: null,
+    rolledBackAt: null,
+  }, null, 2) + '\n');
+
+  const artifactPaths = [
+    '.source-commit',
+    'bin/craft-server',
+    'bin/craft-cli',
+    'packages/server/src/index.ts',
+    'packages/server-core/src/services/symphony-service.ts',
+    'packages/symphony/src/index.ts',
+    'apps/cli/src/index.ts',
+    'resources/pi-agent-server/index.js',
+    'packages/pi-agent-server/dist/index.js',
+    'rollback-layout.json',
+    'launchd/com.craft-agent.headless.plist.template',
+  ];
+  const artifacts: Record<string, string> = {};
+  for (const relativePath of artifactPaths) {
+    const absolutePath = join(outputDir, relativePath);
+    if (!existsSync(absolutePath)) throw new Error(`release artifact is missing: ${relativePath}`);
+    artifacts[relativePath] = sha256File(absolutePath);
+  }
+  writeFileSync(join(outputDir, 'release-manifest.json'), JSON.stringify({
+    schemaVersion: 1,
+    buildIdentity,
+    artifacts,
+  }, null, 2) + '\n');
 }
 
 // ---------------------------------------------------------------------------
@@ -737,11 +862,12 @@ WORKDIR /app
 COPY . .
 
 # Make binaries executable
-RUN chmod +x bin/craft-server vendor/bun/bun resources/bin/uv && \\
+RUN chmod +x bin/craft-server bin/craft-cli vendor/bun/bun resources/bin/uv && \\
     for f in resources/bin/*; do [ -f "$f" ] && chmod +x "$f"; done
 
 ENV CRAFT_IS_PACKAGED=true
 ENV CRAFT_BUNDLED_ASSETS_ROOT=/app
+ENV CRAFT_RELEASE_MANIFEST=/app/release-manifest.json
 ENV CRAFT_APP_ROOT=/app
 ENV CRAFT_RESOURCES_PATH=/app/resources
 ENV CRAFT_UV=/app/resources/bin/uv
@@ -793,6 +919,7 @@ async function main(): Promise<void> {
       output: { type: 'string', default: 'dist/server' },
       compress: { type: 'boolean', default: false },
       'skip-download': { type: 'boolean', default: false },
+      'allow-dirty': { type: 'boolean', default: false },
       help: { type: 'boolean', default: false },
     },
     allowPositionals: true,
@@ -829,6 +956,28 @@ async function main(): Promise<void> {
   const version: string = electronPkg.version;
 
   const outputDir = join(rootDir, values.output!);
+  const dirty = execFileSync('git', ['status', '--porcelain=v1'], {
+    cwd: rootDir,
+    encoding: 'utf8',
+  }).trim();
+  if (dirty && !values['allow-dirty']) {
+    throw new Error('Immutable server candidates require a clean source tree (use --allow-dirty only for development)');
+  }
+  const sourceCommit = execFileSync('git', ['rev-parse', 'HEAD'], {
+    cwd: rootDir,
+    encoding: 'utf8',
+  }).trim();
+  if (!/^[0-9a-f]{40}$/.test(sourceCommit)) {
+    throw new Error(`Could not resolve an immutable source commit: ${sourceCommit}`);
+  }
+  const buildIdentity = {
+    schemaVersion: 1 as const,
+    buildId: `${version}+git.${sourceCommit.slice(0, 12)}.${platform}-${arch}`,
+    version,
+    sourceCommit,
+    platform,
+    arch,
+  };
 
   const config: ServerBuildConfig = {
     platform,
@@ -839,9 +988,10 @@ async function main(): Promise<void> {
     compress: values.compress ?? false,
     skipDownload: values['skip-download'] ?? false,
     version,
+    buildIdentity,
   };
 
-  console.log(`=== Building Craft Agent Server ${version} for ${platform}-${arch} ===`);
+  console.log(`=== Building Craft Agent Server ${buildIdentity.buildId} ===`);
   console.log(`  Output: ${outputDir}`);
 
   // Step 1: Clean
@@ -889,12 +1039,22 @@ async function main(): Promise<void> {
   // Step 7: Copy workspace packages
   console.log('\n[7/8] Copying workspace packages...');
   copyWorkspacePackages(config);
+  copyCliApp(config);
   createRootConfig(config);
 
-  // Step 8: Create entry scripts + Docker files
+  // Step 8: Create entry scripts + Docker files + immutable metadata
   console.log('\n[8/8] Creating entry scripts...');
   createEntryScripts(config);
   createDockerFiles(config);
+  createReleaseMetadata(config);
+
+  // Re-check after assembly: a concurrent edit or build step must never be
+  // published under the source identity captured before copying files.
+  const finalCommit = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: rootDir, encoding: 'utf8' }).trim();
+  const finalDirty = execFileSync('git', ['status', '--porcelain=v1'], { cwd: rootDir, encoding: 'utf8' }).trim();
+  if (!values['allow-dirty'] && (finalCommit !== sourceCommit || finalDirty)) {
+    throw new Error('Source tree changed while assembling the immutable server candidate');
+  }
 
   // Calculate total size
   const totalSize = getDirSize(outputDir);
@@ -902,7 +1062,7 @@ async function main(): Promise<void> {
 
   // Compress if requested
   if (config.compress) {
-    const archiveName = `craft-server-${version}-${platform}-${arch}.tar.gz`;
+    const archiveName = `craft-server-${config.buildIdentity.buildId}.tar.gz`;
     const archivePath = join(dirname(outputDir), archiveName);
     console.log(`\nCompressing to ${archiveName}...`);
     await $`tar -czf ${archivePath} -C ${outputDir} .`;

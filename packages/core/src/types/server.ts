@@ -10,9 +10,21 @@
 // Server Status & Health
 // ---------------------------------------------------------------------------
 
+/** Immutable identity shared by one packaged server, CLI, and release manifest. */
+export interface BuildIdentity {
+  schemaVersion: 1
+  buildId: string
+  version: string
+  sourceCommit: string
+  platform: 'darwin' | 'linux'
+  arch: 'x64' | 'arm64'
+}
+
 export interface ServerStatus {
   serverId: string
+  /** Immutable build ID for packaged releases; semantic version in development. */
   version: string
+  buildIdentity?: BuildIdentity
   uptime: number              // seconds since bootstrap
   connectedClients: number
   workspaces: {
@@ -37,6 +49,58 @@ export interface ServerHealth {
     status: 'pass' | 'fail'
     message?: string
   }[]
+}
+
+// ---------------------------------------------------------------------------
+// Symphony v4 service
+// ---------------------------------------------------------------------------
+
+export type SymphonyServicePhase = 'disabled' | 'reconstructing' | 'ready' | 'stopping' | 'stopped' | 'error'
+export type SymphonyOperation = 'validate' | 'shadow' | 'tick' | 'reconstruct'
+
+export interface SymphonyProjectServiceStatus {
+  projectId: string
+  phase: 'configured' | 'running' | 'ready' | 'error'
+  lastOperation: SymphonyOperation | null
+  reconstructedAt: number | null
+  updatedAt: number
+  lastError: string | null
+  /** Provider-neutral status from the native runner; never transcript content. */
+  snapshot: unknown | null
+}
+
+export interface SymphonyServiceStatus {
+  phase: SymphonyServicePhase
+  enabled: boolean
+  acceptingOperations: boolean
+  configPath: string | null
+  stopTimeoutMs: number
+  activeOperations: number
+  projects: SymphonyProjectServiceStatus[]
+}
+
+export interface SymphonyOperationResult {
+  projectId: string
+  operation: Exclude<SymphonyOperation, 'reconstruct'>
+  completedAt: number
+  result: unknown
+}
+
+export interface SymphonyStopResult {
+  drained: boolean
+  timeoutMs: number
+  activeOperations: number
+  phase: 'stopped' | 'stopping'
+}
+
+/** Narrow dependency injected into RPC handlers by the headless host. */
+export interface SymphonyServiceControl {
+  start(): Promise<SymphonyServiceStatus>
+  validate(projectId: string): Promise<SymphonyOperationResult>
+  shadow(projectId: string): Promise<SymphonyOperationResult>
+  tick(projectId: string): Promise<SymphonyOperationResult>
+  status(): SymphonyServiceStatus
+  stop(timeoutMs?: number): Promise<SymphonyStopResult>
 }
 
 // ---------------------------------------------------------------------------

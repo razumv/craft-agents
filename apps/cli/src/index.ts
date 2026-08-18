@@ -8,6 +8,7 @@
  */
 
 import { resolve } from 'path'
+import { readFileSync } from 'node:fs'
 import { CliRpcClient } from './client.ts'
 
 // ---------------------------------------------------------------------------
@@ -256,10 +257,73 @@ async function cmdPing(client: CliRpcClient, args: CliArgs): Promise<void> {
   )
 }
 
+interface CliBuildIdentity {
+  buildId: string
+  sourceCommit: string
+  version: string
+}
+
+function localBuildIdentity(): CliBuildIdentity | null {
+  const path = process.env.CRAFT_RELEASE_MANIFEST
+  if (!path) return null
+  const parsed = JSON.parse(readFileSync(path, 'utf8')) as { buildIdentity?: CliBuildIdentity }
+  const identity = parsed.buildIdentity
+  if (!identity?.buildId || !identity.sourceCommit || !identity.version) {
+    throw new Error('Packaged CLI release manifest has no valid buildIdentity')
+  }
+  return identity
+}
+
+function assertSameRelease(client: CliRpcClient, status: any): void {
+  const local = localBuildIdentity()
+  if (!local) return
+  if (client.serverVersion !== local.buildId) throw new Error('CLI/server handshake build identity mismatch')
+  if (status?.version !== local.buildId) throw new Error('CLI/server status build identity mismatch')
+  if (status?.buildIdentity?.buildId !== local.buildId) throw new Error('Server status buildIdentity mismatch')
+  if (status?.buildIdentity?.sourceCommit !== local.sourceCommit) throw new Error('CLI/server source commit mismatch')
+}
+
 async function cmdHealth(client: CliRpcClient, args: CliArgs): Promise<void> {
   await client.connect()
+  const status = await client.invoke('server:getStatus')
+  assertSameRelease(client, status)
   const result = await client.invoke('credentials:healthCheck')
   out(result, args.json)
+}
+
+async function cmdStatus(client: CliRpcClient, args: CliArgs): Promise<void> {
+  await client.connect()
+  const result = await client.invoke('server:getStatus')
+  assertSameRelease(client, result)
+  out(result, args.json)
+}
+
+async function cmdSymphony(client: CliRpcClient, args: CliArgs): Promise<void> {
+  const operation = args.rest.shift() ?? 'status'
+  const channels: Record<string, string> = {
+    validate: 'symphony:validate',
+    shadow: 'symphony:shadow',
+    tick: 'symphony:tick',
+    status: 'symphony:status',
+    stop: 'symphony:stop',
+  }
+  const channel = channels[operation]
+  if (!channel) throw new Error('Usage: symphony validate|shadow|tick <project-id> | status | stop [timeout-ms]')
+  await client.connect()
+  if (!client.hasCapability(channel)) throw new Error(`Server does not advertise ${channel}`)
+
+  if (operation === 'status') {
+    out(await client.invoke(channel), args.json)
+    return
+  }
+  if (operation === 'stop') {
+    const timeout = args.rest.shift()
+    out(await client.invoke(channel, ...(timeout ? [Number(timeout)] : [])), args.json)
+    return
+  }
+  const projectId = args.rest.shift()
+  if (!projectId) throw new Error(`Usage: symphony ${operation} <project-id>`)
+  out(await client.invoke(channel, projectId), args.json)
 }
 
 async function cmdVersions(client: CliRpcClient, args: CliArgs): Promise<void> {
@@ -1919,7 +1983,13 @@ Commands:
                          --no-cleanup        Keep session after completion
                          --server-entry      Path to server/index.ts
   ping                   Verify connectivity (clientId + latency)
-  health                 Check credential store health
+  health                 Check same-release identity and credential store health
+  status                 Show server status and immutable build identity
+  symphony status        Show default-off native Symphony service status
+  symphony validate <id> Validate one explicitly configured project
+  symphony shadow <id>   Read-only preflight/status reconstruction (zero writes)
+  symphony tick <id>     Run one tick (requires explicit enabled=true)
+  symphony stop [ms]     Stop accepting work and drain within a deadline
   versions               Show server runtime versions
   workspaces             List workspaces
   sessions               List sessions in workspace
@@ -1972,8 +2042,13 @@ export async function main(argv: string[] = process.argv): Promise<void> {
   }
 
   if (args.command === 'version') {
-    const pkg = await import('../package.json')
-    out(pkg.version ?? pkg.default?.version ?? 'unknown', false)
+    const identity = localBuildIdentity()
+    if (identity) {
+      out(identity.buildId, false)
+    } else {
+      const pkg = await import('../package.json')
+      out(pkg.version ?? pkg.default?.version ?? 'unknown', false)
+    }
     return
   }
 
@@ -2009,6 +2084,12 @@ export async function main(argv: string[] = process.argv): Promise<void> {
         break
       case 'health':
         await cmdHealth(client, args)
+        break
+      case 'status':
+        await cmdStatus(client, args)
+        break
+      case 'symphony':
+        await cmdSymphony(client, args)
         break
       case 'versions':
         await cmdVersions(client, args)

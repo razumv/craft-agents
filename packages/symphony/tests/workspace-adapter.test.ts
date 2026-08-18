@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import { GitWorktreeAdapter, IdentityFactory, claimBindingFile, type Claim, type CraftStartContext, type IssueContract, type NormalizedIssue } from "../src";
@@ -70,6 +70,15 @@ async function fixture() {
 }
 
 describe("v4 live git worktree adapter", () => {
+  test("preflights the exact executable, git top-level, and canonical worktree root read-only", async () => {
+    const { root, workspaceRoot, adapter } = await fixture();
+    await mkdir(workspaceRoot, { recursive: true });
+    const proof = await adapter.preflight();
+    expect(proof.gitExecutable).toBe("/usr/bin/git");
+    expect(proof.repositoryRoot).toBe(await realpath(root));
+    expect(proof.workspaceRoot).toBe(await realpath(workspaceRoot));
+  });
+
   test("creates one deterministic branch/worktree with atomic binding and resumes idempotently", async () => {
     const { root, identity, claim, context, adapter } = await fixture();
     const first = await adapter.ensure(identity, context);
