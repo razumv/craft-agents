@@ -15,7 +15,9 @@
  *   CRAFT_APP_ROOT             — app root path (default: cwd)
  *   CRAFT_RESOURCES_PATH       — resources path (default: cwd/resources)
  *   CRAFT_IS_PACKAGED          — 'true' for production (default: false)
- *   CRAFT_VERSION              — app version (default: 0.0.0-dev)
+ *   CRAFT_VERSION              — development app version fallback
+ *   CRAFT_RELEASE_MANIFEST     — absolute packaged release-manifest.json path
+ *   CRAFT_SYMPHONY_CONFIG      — absolute explicit Symphony server config (default: disabled)
  *   CRAFT_DEBUG                — 'true' for debug logging
  *   CRAFT_WEBUI_DIR            — path to built web UI assets (enables web UI on RPC port)
  *   CRAFT_WEBUI_PASSWORD       — optional shorter password for web login (falls back to CRAFT_SERVER_TOKEN)
@@ -46,7 +48,13 @@ import type { WsRpcTlsOptions } from '@craft-agent/server-core/transport'
 import { registerCoreRpcHandlers, cleanupSessionFileWatchForClient } from '@craft-agent/server-core/handlers/rpc'
 import { SessionManager, setSessionPlatform, setSessionRuntimeHooks } from '@craft-agent/server-core/sessions'
 import { initModelRefreshService, setFetcherPlatform } from '@craft-agent/server-core/model-fetchers'
-import { setSearchPlatform, setImageProcessor } from '@craft-agent/server-core/services'
+import {
+  createDisabledSymphonyService,
+  createSymphonyServiceFromConfig,
+  loadReleaseManifest,
+  setSearchPlatform,
+  setImageProcessor,
+} from '@craft-agent/server-core/services'
 import type { HandlerDeps } from '@craft-agent/server-core/handlers'
 
 process.env.CRAFT_IS_PACKAGED ??= 'false'
@@ -163,11 +171,20 @@ const waNodeBin = process.env.CRAFT_MESSAGING_NODE_BIN ?? 'node'
 // publisher after bootstrapServer resolves.
 let messagingHandle: MessagingBootstrapHandle | null = null
 
+const releaseManifest = process.env.CRAFT_RELEASE_MANIFEST
+  ? loadReleaseManifest(process.env.CRAFT_RELEASE_MANIFEST)
+  : null
+const symphonyService = process.env.CRAFT_SYMPHONY_CONFIG
+  ? await createSymphonyServiceFromConfig(process.env.CRAFT_SYMPHONY_CONFIG)
+  : createDisabledSymphonyService()
+const runtimeVersion = releaseManifest?.buildIdentity.buildId ?? process.env.CRAFT_VERSION ?? packageVersion
+
 const instance = await (async () => {
   try {
     return await bootstrapServer<SessionManager, HandlerDeps>({
       bundledAssetsRoot,
-      serverVersion: process.env.CRAFT_VERSION ?? packageVersion,
+      serverVersion: runtimeVersion,
+      buildIdentity: releaseManifest?.buildIdentity,
       tls,
       // When web UI is enabled, accept JWT session cookies on WebSocket upgrade
       validateSessionCookie: webuiEnabled && serverToken
@@ -224,6 +241,8 @@ const instance = await (async () => {
           platform,
           oauthFlowStore,
           messagingRegistry: messagingHandle.registry,
+          symphonyService,
+          buildIdentity: releaseManifest?.buildIdentity,
         }
       },
       registerAllRpcHandlers: registerCoreRpcHandlers,
@@ -254,6 +273,17 @@ const instance = await (async () => {
   }
 })()
 
+// Reconstruct configured Symphony projects from durable provider truth only.
+// With no explicit config this is an inert, default-off no-op. A live tick is
+// additionally rejected unless the config contains enabled=true.
+try {
+  await symphonyService.start()
+} catch (error) {
+  console.error('[symphony] Startup reconstruction failed:', error)
+  await instance.stop()
+  process.exit(1)
+}
+
 // ---------------------------------------------------------------------------
 // Messaging post-bootstrap: bind the WS publisher and initialize local
 // workspaces. Remote-owned workspaces are skipped because their messaging
@@ -280,7 +310,10 @@ if (messagingHandle !== null && !messagingDisabled) {
 // Wire up the lazy health check now that the session manager is ready
 if (webuiHandler) {
   const { getHealthCheck } = await import('@craft-agent/server-core/handlers/rpc/server')
-  const depsLike = { sessionManager: instance.sessionManager } as any
+  const depsLike = {
+    sessionManager: instance.sessionManager,
+    buildIdentity: releaseManifest?.buildIdentity,
+  } as any
   healthCheckFn = () => getHealthCheck(depsLike)
 
   // Wire up OAuth callback deps so /api/oauth/callback works
@@ -305,7 +338,10 @@ if (webuiHandler) {
 const healthPort = parseInt(process.env.CRAFT_HEALTH_PORT ?? '0', 10)
 const healthServer = await startHealthHttpServer({
   port: healthPort,
-  deps: { sessionManager: instance.sessionManager },
+  deps: {
+    sessionManager: instance.sessionManager,
+    buildIdentity: releaseManifest?.buildIdentity,
+  },
   wsServer: instance.wsServer,
   platform: instance.platform,
 })
@@ -343,6 +379,10 @@ if (!isLocalBind && instance.protocol === 'ws') {
 const shutdown = async () => {
   webuiHandler?.dispose()
   healthServer?.stop()
+  const symphonyStop = await symphonyService.stop()
+  if (!symphonyStop.drained) {
+    console.error(`[symphony] Stop deadline expired with ${symphonyStop.activeOperations} active operation(s)`)
+  }
   if (messagingHandle) {
     try {
       await messagingHandle.dispose()

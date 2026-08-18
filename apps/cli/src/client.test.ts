@@ -22,6 +22,8 @@ function createMockServer(opts?: {
   rejectAuth?: boolean
   noAck?: boolean
   tls?: { cert: string; key: string }
+  serverVersion?: string
+  registeredChannels?: string[]
 }): MockServer {
   let lastMsg: MessageEnvelope | null = null
   const clients = new Set<any>()
@@ -58,6 +60,8 @@ function createMockServer(opts?: {
             type: 'handshake_ack',
             clientId: 'test-client-001',
             protocolVersion: '1.0',
+            serverVersion: opts?.serverVersion,
+            registeredChannels: opts?.registeredChannels,
           }
           ws.send(serializeEnvelope(ack))
           return
@@ -176,6 +180,20 @@ describe('CliRpcClient', () => {
     expect(clientId).toBe('test-client-001')
     expect(client.isConnected).toBe(true)
     expect(client.clientId).toBe('test-client-001')
+    client.destroy()
+  })
+
+  it('captures immutable server identity and advertised capabilities', async () => {
+    server = createMockServer({
+      serverVersion: '0.11.4+git.0123456789ab.darwin-arm64',
+      registeredChannels: ['server:getStatus', 'symphony:status'],
+    })
+    const client = new CliRpcClient(server.url)
+    await client.connect()
+    expect(client.serverVersion).toBe('0.11.4+git.0123456789ab.darwin-arm64')
+    expect(client.hasCapability('symphony:status')).toBe(true)
+    expect(client.hasCapability('symphony:tick')).toBe(false)
+    expect(client.capabilities).toEqual(['server:getStatus', 'symphony:status'])
     client.destroy()
   })
 

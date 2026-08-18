@@ -9,6 +9,7 @@ import { CONFIG_DIR } from '@craft-agent/shared/config/paths'
 import { setBundledAssetsRoot } from '@craft-agent/shared/utils'
 import { WsRpcServer, type WsRpcTlsOptions } from '../transport/server'
 import type { EventSink, RpcServer } from '../transport/types'
+import type { BuildIdentity } from '@craft-agent/core/types'
 import { createHeadlessPlatform } from '../runtime/platform-headless'
 import type { PlatformServices } from '../runtime/platform'
 
@@ -44,8 +45,10 @@ export interface ServerBootstrapOptions<TSessionManager, THandlerDeps> {
   cleanupClientResources?: (clientId: string) => void
   onClientConnected?: (info: { clientId: string; webContentsId: number | null; workspaceId: string | null; capabilities: string[] }) => void
   serverId?: string
-  /** App version string, included in handshake_ack for client compatibility checks. */
+  /** App/build version string, included in handshake_ack for compatibility checks. */
   serverVersion?: string
+  /** Immutable packaged release identity, surfaced through status/health RPCs. */
+  buildIdentity?: BuildIdentity
   /** TLS configuration. When provided, the server listens on wss:// instead of ws://. */
   tls?: WsRpcTlsOptions
   /** Cookie-based session validator for web UI auth on WebSocket upgrade. */
@@ -61,6 +64,7 @@ export interface ServerHandlerContext {
   getConnectedClientCount: () => number
   serverId: string
   startedAt: number
+  buildIdentity?: BuildIdentity
 }
 
 export interface ServerInstance<TSessionManager> {
@@ -411,6 +415,7 @@ export async function bootstrapServer<TSessionManager, THandlerDeps>(
     getConnectedClientCount: () => wsServer.getConnectedClientCount(),
     serverId: options.serverId ?? 'headless',
     startedAt,
+    buildIdentity: options.buildIdentity,
   }
 
   options.registerAllRpcHandlers(wsServer, deps, serverHandlerContext)
@@ -490,7 +495,7 @@ export async function bootstrapServer<TSessionManager, THandlerDeps>(
 
 export interface HealthHttpServerOptions {
   port: number
-  deps: { sessionManager: { getWorkspaces(): unknown[] } }
+  deps: { sessionManager: { getWorkspaces(): unknown[] }; buildIdentity?: BuildIdentity }
   wsServer: WsRpcServer
   platform: PlatformServices
 }

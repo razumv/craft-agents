@@ -85,10 +85,19 @@ export class LiveV4Runner {
     readonly craft: CraftMobileControlPlaneAdapter,
     readonly craftTransport: CraftCliRpcTransport,
     readonly scheduler: DeterministicScheduler,
+    readonly workspaces?: GitWorktreeAdapter,
   ) {}
 
-  async preflight(): Promise<{ runtime: Awaited<ReturnType<CraftCliRpcTransport["identity"]>>; issue: TrackerIssueSnapshot; projectId: string }> {
-    const runtime = await this.craftTransport.identity(this.config.craft.cli.rpcDeadlineMs);
+  async preflight(): Promise<{
+    runtime: Awaited<ReturnType<CraftCliRpcTransport["identity"]>>;
+    issue: TrackerIssueSnapshot;
+    projectId: string;
+    workspace: Awaited<ReturnType<GitWorktreeAdapter["preflight"]>> | null;
+  }> {
+    const [runtime, workspace] = await Promise.all([
+      this.craftTransport.identity(this.config.craft.cli.rpcDeadlineMs),
+      this.workspaces?.preflight() ?? Promise.resolve(null),
+    ]);
     const project = await this.craftTransport.invoke<{ config?: { id?: string; workingDirectory?: string } } | null>(
       "projects:getOne",
       [this.config.craft.workspaceId, this.config.craft.projectId],
@@ -100,7 +109,7 @@ export class LiveV4Runner {
       || project.config?.workingDirectory !== this.config.craft.projectWorkingDirectory
     ) throw new Error("dedicated Craft Protocol project preflight failed exact readback");
     const issue = await this.tracker.get(this.config.issueId);
-    return { runtime, issue, projectId: project.config.id };
+    return { runtime, issue, projectId: project.config.id, workspace };
   }
 
   async tick(crashAfter?: CrashPoint): Promise<LiveRunnerStatus> {
@@ -258,7 +267,7 @@ export async function createLiveRunner(config: LiveRunnerConfig): Promise<LiveV4
     gitExecutable: config.git.executable,
   });
   const scheduler = new DeterministicScheduler(workflow, { github: tracker, craft, workspaces }, new SystemClock());
-  return new LiveV4Runner(config, workflow, tracker, craft, craftTransport, scheduler);
+  return new LiveV4Runner(config, workflow, tracker, craft, craftTransport, scheduler, workspaces);
 }
 
 /** Restricts a repository transport to one explicitly authorized work item. */

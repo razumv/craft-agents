@@ -42,6 +42,9 @@ export class CliRpcClient {
   private _clientId: string | null = null
   private _connected = false
   private _destroyed = false
+  private _serverVersion: string | null = null
+  /** Channels advertised by the authenticated server handshake. */
+  private serverChannels: Set<string> | null = null
 
   private readonly url: string
   private readonly token: string | undefined
@@ -92,6 +95,8 @@ export class CliRpcClient {
         if (envelope.type === 'handshake_ack') {
           clearTimeout(timer)
           this._clientId = envelope.clientId ?? null
+          this._serverVersion = envelope.serverVersion ?? null
+          this.serverChannels = envelope.registeredChannels ? new Set(envelope.registeredChannels) : null
           this._connected = true
           // Switch to normal message handler
           this.ws!.onmessage = (e) => {
@@ -187,6 +192,19 @@ export class CliRpcClient {
 
   get clientId(): string | null {
     return this._clientId
+  }
+
+  get serverVersion(): string | null {
+    return this._serverVersion
+  }
+
+  /** True when the authenticated server advertised this RPC channel. */
+  hasCapability(channel: string): boolean {
+    return this.serverChannels?.has(channel) ?? false
+  }
+
+  get capabilities(): readonly string[] {
+    return [...(this.serverChannels ?? [])]
   }
 
   // -------------------------------------------------------------------------

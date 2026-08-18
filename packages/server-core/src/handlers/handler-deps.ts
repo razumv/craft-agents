@@ -4,6 +4,7 @@ import type { IOAuthFlowStore } from './oauth-flow-store-interface'
 import type { IBrowserPaneManager } from './browser-pane-manager-interface'
 import type { IWindowManager } from './window-manager-interface'
 import type { IMessagingGatewayRegistry } from './messaging-registry-interface'
+import type { BuildIdentity, SymphonyServiceControl } from '@craft-agent/core/types'
 
 /**
  * Generic handler dependency bag.
@@ -27,4 +28,8 @@ export interface HandlerDeps<
   browserPaneManager?: TBrowserPaneManager
   oauthFlowStore: TOAuthFlowStore
   messagingRegistry?: IMessagingGatewayRegistry
+  /** Headless-only native Symphony service; omitted by Electron hosts. */
+  symphonyService?: SymphonyServiceControl
+  /** Present for immutable packaged releases; absent in development/Electron fallback. */
+  buildIdentity?: BuildIdentity
 }

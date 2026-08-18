@@ -84,7 +84,8 @@ export function registerServerHandlers(
     const mem = process.memoryUsage()
     const status: ServerStatus = {
       serverId: ctx.serverId,
-      version: deps.platform.appVersion,
+      version: ctx.buildIdentity?.buildId ?? deps.platform.appVersion,
+      buildIdentity: ctx.buildIdentity,
       uptime: Math.round((Date.now() - ctx.startedAt) / 1000),
       connectedClients: ctx.getConnectedClientCount(),
       workspaces: workspaceStatuses,
@@ -127,7 +128,7 @@ export function registerServerHandlers(
 // Health check logic (reusable by both RPC handler and HTTP endpoint)
 // ---------------------------------------------------------------------------
 
-export function getHealthCheck(deps: Pick<HandlerDeps, 'sessionManager'>): ServerHealth {
+export function getHealthCheck(deps: Pick<HandlerDeps, 'sessionManager' | 'buildIdentity'>): ServerHealth {
   const checks: ServerHealth['checks'] = []
 
   // Check 1: SessionManager is operational (has loaded workspaces)
@@ -146,7 +147,16 @@ export function getHealthCheck(deps: Pick<HandlerDeps, 'sessionManager'>): Serve
     })
   }
 
-  // Check 2: Memory usage (warn if heap exceeds 1.5GB)
+  // Check 2: Immutable packaged release identity (development may omit it).
+  if (deps.buildIdentity) {
+    checks.push({
+      name: 'release_identity',
+      status: 'pass',
+      message: `${deps.buildIdentity.buildId} (${deps.buildIdentity.sourceCommit})`,
+    })
+  }
+
+  // Check 3: Memory usage (warn if heap exceeds 1.5GB)
   const mem = process.memoryUsage()
   const heapGB = mem.heapUsed / (1024 * 1024 * 1024)
   checks.push({

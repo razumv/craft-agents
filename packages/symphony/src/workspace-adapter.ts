@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
-import { appendFile, lstat, mkdir, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
+import { constants } from "node:fs";
+import { access, appendFile, lstat, mkdir, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
 import type { CraftStartContext } from "./craft-adapter";
 import type { Claim, RunIdentity } from "./domain";
@@ -33,6 +34,42 @@ export class GitWorktreeAdapter {
     if (!inside(this.#repositoryRoot, this.#workspaceRoot)) {
       throw new Error("workspace root must be inside the repository root");
     }
+  }
+
+  /** Read-only proof that configured git/repository/worktree roots are exact. */
+  async preflight(): Promise<{ gitExecutable: string; repositoryRoot: string; workspaceRoot: string }> {
+    const gitExecutable = await realpath(this.config.gitExecutable).catch(() => {
+      throw new Error("configured git executable is missing");
+    });
+    const gitInfo = await lstat(gitExecutable);
+    if (!gitInfo.isFile()) throw new Error("configured git executable is not a file");
+    await access(gitExecutable, constants.X_OK).catch(() => {
+      throw new Error("configured git executable is not executable");
+    });
+
+    const [repositoryInfo, workspaceInfo] = await Promise.all([
+      lstat(this.#repositoryRoot).catch(() => null),
+      lstat(this.#workspaceRoot).catch(() => null),
+    ]);
+    if (!repositoryInfo?.isDirectory() || repositoryInfo.isSymbolicLink()) {
+      throw new Error("configured repository root must be a real directory");
+    }
+    if (!workspaceInfo?.isDirectory() || workspaceInfo.isSymbolicLink()) {
+      throw new Error("configured workspace root must be a real directory");
+    }
+
+    const [repositoryRoot, workspaceRoot, gitTop] = await Promise.all([
+      realpath(this.#repositoryRoot),
+      realpath(this.#workspaceRoot),
+      this.git(["rev-parse", "--show-toplevel"]),
+    ]);
+    if (await realpath(resolve(gitTop.trim())) !== repositoryRoot) {
+      throw new Error("configured repository root is not the exact git top-level");
+    }
+    if (!inside(repositoryRoot, workspaceRoot)) {
+      throw new Error("canonical workspace root must be inside the canonical repository root");
+    }
+    return { gitExecutable, repositoryRoot, workspaceRoot };
   }
 
   async ensure(identity: RunIdentity, context?: CraftStartContext): Promise<GitWorktree> {

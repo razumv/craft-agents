@@ -305,6 +305,7 @@
       "dependencies": {
         "@craft-agent/core": "workspace:*",
         "@craft-agent/shared": "workspace:*",
+        "@craft-agent/symphony": "workspace:*",
         "@earendil-works/pi-ai": "0.80.6",
         "jose": "^6.0.0",
         "markitdown-js": "^0.0.14",

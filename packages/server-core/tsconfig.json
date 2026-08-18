@@ -19,8 +19,12 @@
     "noUnusedParameters": false,
     "baseUrl": ".",
     "paths": {
+      "@craft-agent/core": ["../core/src/index.ts"],
+      "@craft-agent/core/*": ["../core/src/*"],
       "@craft-agent/shared": ["../shared/src/index.ts"],
-      "@craft-agent/shared/*": ["../shared/src/*"]
+      "@craft-agent/shared/*": ["../shared/src/*"],
+      "@craft-agent/symphony": ["../symphony/src/index.ts"],
+      "@craft-agent/symphony/*": ["../symphony/src/*"]
     }
   },
   "include": ["src/**/*", "../shared/src/agent/bash-parser.d.ts"],

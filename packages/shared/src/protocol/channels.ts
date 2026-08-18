@@ -17,6 +17,13 @@ export const RPC_CHANNELS = {
     STATUS_CHANGED: 'server:statusChanged',
     HOME_DIR: 'server:homeDir',
   },
+  symphony: {
+    VALIDATE: 'symphony:validate',
+    SHADOW: 'symphony:shadow',
+    TICK: 'symphony:tick',
+    STATUS: 'symphony:status',
+    STOP: 'symphony:stop',
+  },
   sessions: {
     GET: 'sessions:get',
     GET_UNREAD_SUMMARY: 'sessions:getUnreadSummary',

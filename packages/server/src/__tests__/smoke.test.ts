@@ -10,6 +10,8 @@
 
 import { describe, it, expect, afterEach } from 'bun:test'
 import { join } from 'node:path'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import type { Subprocess } from 'bun'
 import WebSocket from 'ws'
 
@@ -25,8 +27,12 @@ interface SpawnedServer {
   stop: () => Promise<void>
 }
 
+const tempConfigDirs: string[] = []
+
 async function spawnTestServer(extraEnv?: Record<string, string>): Promise<SpawnedServer> {
   const token = crypto.randomUUID() + crypto.randomUUID() // 72 chars, well above 16 minimum
+  const configDir = mkdtempSync(join(tmpdir(), 'craft-server-smoke-'))
+  tempConfigDirs.push(configDir)
   const { CLAUDECODE: _, ...parentEnv } = process.env
 
   const proc = Bun.spawn(['bun', 'run', SERVER_ENTRY], {
@@ -34,6 +40,8 @@ async function spawnTestServer(extraEnv?: Record<string, string>): Promise<Spawn
       ...parentEnv,
       ...extraEnv,
       CRAFT_SERVER_TOKEN: token,
+      CRAFT_CONFIG_DIR: configDir,
+      CRAFT_DISABLE_MESSAGING: 'true',
       CRAFT_RPC_PORT: '0',
       CRAFT_RPC_HOST: '127.0.0.1',
       CRAFT_HEALTH_PORT: '0', // random port
@@ -132,6 +140,7 @@ describe('headless server smoke test', () => {
       await server.stop().catch(() => {})
       server = null
     }
+    for (const dir of tempConfigDirs.splice(0)) rmSync(dir, { recursive: true, force: true })
   })
 
   it('accepts valid token handshake', async () => {
@@ -151,10 +160,14 @@ describe('headless server smoke test', () => {
   it('rejects short token at startup', async () => {
     const token = 'short'
     const { CLAUDECODE: _, ...parentEnv } = process.env
+    const configDir = mkdtempSync(join(tmpdir(), 'craft-server-smoke-short-token-'))
+    tempConfigDirs.push(configDir)
     const proc = Bun.spawn(['bun', 'run', SERVER_ENTRY], {
       env: {
         ...parentEnv,
         CRAFT_SERVER_TOKEN: token,
+        CRAFT_CONFIG_DIR: configDir,
+        CRAFT_DISABLE_MESSAGING: 'true',
         CRAFT_RPC_PORT: '0',
         CRAFT_RPC_HOST: '127.0.0.1',
       },
