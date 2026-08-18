@@ -49,7 +49,10 @@ import { handleListMessagingChannels, handleUnbindMessagingChannel } from './han
 // ============================================================
 
 export const SubmitPlanSchema = z.object({
-  planPath: z.string().describe('Absolute path to the plan markdown file you wrote'),
+  planPath: z
+    .string()
+    .optional()
+    .describe('Absolute path to the plan markdown file you wrote. Defaults to <plansFolderPath>/plan.md.'),
 });
 
 export const ConfigValidateSchema = z.object({
