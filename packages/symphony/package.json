@@ -1,0 +1,23 @@
+{
+  "name": "@craft-agent/symphony",
+  "version": "0.11.4",
+  "license": "Apache-2.0",
+  "description": "Deterministic Symphony v4 scheduler and provider boundaries for Craft Agents",
+  "type": "module",
+  "private": true,
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./workflow.schema.json": "./workflow.schema.json"
+  },
+  "scripts": {
+    "test": "bun test tests",
+    "typecheck": "tsc --noEmit",
+    "validate": "bun run typecheck && bun run test"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.8.2"
+  }
+}

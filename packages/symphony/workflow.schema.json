@@ -1,0 +1,90 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/razumv/craft-protocol/v4/workflow.schema.json",
+  "title": "Craft Protocol v4.1 Scheduler Workflow",
+  "type": "object",
+  "required": ["version", "project", "tracker", "polling", "scheduler", "workspace", "model", "verification"],
+  "properties": {
+    "version": { "const": "4.1" },
+    "project": {
+      "type": "object",
+      "required": ["id", "repository", "base_branch", "branch_prefix"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "repository": { "type": "string", "pattern": "^[^/]+/[^/]+$" },
+        "base_branch": { "type": "string", "minLength": 1 },
+        "branch_prefix": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    },
+    "tracker": {
+      "type": "object",
+      "required": ["kind", "active_states", "terminal_states"],
+      "properties": {
+        "kind": { "enum": ["fake-github", "github"] },
+        "active_states": { "type": "array", "items": { "type": "string", "minLength": 1 }, "minItems": 1 },
+        "terminal_states": { "type": "array", "items": { "type": "string", "minLength": 1 }, "minItems": 1 }
+      },
+      "additionalProperties": false
+    },
+    "polling": {
+      "type": "object",
+      "required": ["interval_ms"],
+      "properties": { "interval_ms": { "type": "integer", "minimum": 1 } },
+      "additionalProperties": false
+    },
+    "scheduler": {
+      "type": "object",
+      "required": ["wip_limit", "claim_ttl_ms", "stale_run_ms", "max_attempts", "retry_base_ms", "retry_max_ms"],
+      "properties": {
+        "wip_limit": { "const": 1 },
+        "claim_ttl_ms": { "type": "integer", "minimum": 1 },
+        "stale_run_ms": { "type": "integer", "minimum": 1 },
+        "max_attempts": { "type": "integer", "minimum": 1 },
+        "retry_base_ms": { "type": "integer", "minimum": 1 },
+        "retry_max_ms": { "type": "integer", "minimum": 1 }
+      },
+      "additionalProperties": false
+    },
+    "workspace": {
+      "type": "object",
+      "required": ["root"],
+      "properties": { "root": { "type": "string", "minLength": 1 } },
+      "additionalProperties": false
+    },
+    "model": {
+      "type": "object",
+      "required": ["connection", "default_profile", "allowed_profiles"],
+      "properties": {
+        "connection": { "const": "chatgpt-plus" },
+        "default_profile": { "type": "string", "pattern": "^pi/gpt-" },
+        "allowed_profiles": {
+          "type": "array",
+          "items": { "type": "string", "pattern": "^pi/gpt-" },
+          "minItems": 1,
+          "uniqueItems": true
+        }
+      },
+      "additionalProperties": false
+    },
+    "verification": {
+      "type": "object",
+      "required": ["low", "medium", "high"],
+      "additionalProperties": { "$ref": "#/$defs/verificationBudget" }
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "verificationBudget": {
+      "type": "object",
+      "required": ["budget", "independent_reviews", "correction_passes", "owner_gate"],
+      "properties": {
+        "budget": { "type": "string", "minLength": 1 },
+        "independent_reviews": { "type": "integer", "minimum": 0, "maximum": 1 },
+        "correction_passes": { "type": "integer", "minimum": 0, "maximum": 1 },
+        "owner_gate": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    }
+  }
+}
