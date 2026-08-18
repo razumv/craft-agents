@@ -386,6 +386,16 @@ function copyProductionDeps(config: ServerBuildConfig): void {
     } catch { /* skip */ }
   }
 
+  // Some Bun installs keep a dependency only under another package's nested
+  // node_modules. copyDependencyTree copies that nested tree verbatim but reads
+  // dependency metadata from the root package of the same name, so it cannot
+  // discover dependencies unique to the nested version. AJV 8 bundled under the
+  // MCP SDK is one such case: it requires fast-uri, while root AJV 6 does not.
+  // Keep this compatibility list intentionally small and copy through the same
+  // recursive path so future transitive requirements remain covered.
+  const NESTED_RUNTIME_DEPS = ['fast-uri'];
+  for (const dep of NESTED_RUNTIME_DEPS) allImports.add(dep);
+
   // Copy each discovered package and its full transitive dependency tree
   for (const dep of allImports) {
     copyDependencyTree(dep, srcModules, destModules, copied);
