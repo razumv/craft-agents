@@ -1,0 +1,67 @@
+{
+  "source": {
+    "repository": "razumv/craft-protocol",
+    "tag": "v4.0.0-alpha.1",
+    "commit": "0767d0f2565d7f10a9ab5d46d7986162f20ab694"
+  },
+  "lifecycle": {
+    "ready": ["claimed", "blocked", "cancelled"],
+    "claimed": ["running", "retry-wait", "blocked", "failed", "cancelled", "preservation-unknown"],
+    "running": ["pr-open", "retry-wait", "blocked", "failed", "cancelled", "preservation-unknown"],
+    "pr-open": ["review", "owner-gate", "merged", "blocked", "failed", "cancelled", "preservation-unknown"],
+    "review": ["owner-gate", "merged", "blocked", "failed", "cancelled", "preservation-unknown"],
+    "owner-gate": ["merged", "blocked", "failed", "cancelled", "preservation-unknown"],
+    "merged": ["deployed", "done", "preservation-unknown"],
+    "deployed": ["done", "preservation-unknown"],
+    "done": [],
+    "blocked": ["ready", "cancelled"],
+    "retry-wait": ["claimed", "failed", "cancelled"],
+    "failed": [],
+    "cancelled": [],
+    "preservation-unknown": []
+  },
+  "claimAndEvidence": {
+    "wipLimit": 1,
+    "claimSuccessesAfterConcurrentTicks": 1,
+    "staleFenceError": "claim fence mismatch",
+    "callerPrEvidenceError": "pr-open requires exact provider PR evidence"
+  },
+  "modelPolicy": {
+    "connection": "chatgpt-plus",
+    "allowed": ["pi/gpt-5.6-sol", "pi/gpt-5.6-terra"],
+    "rejected": ["claude-fable-5", "pi/claude-fable-5", "gpt-5.6-sol"]
+  },
+  "directivesAndGates": {
+    "acknowledgementDeadlineMs": 60000,
+    "gateId": "GATE-I_52-7",
+    "accepted": [
+      "APPROVE GATE-I_52-7",
+      "REJECT GATE-I_52-7: verification failed"
+    ],
+    "rejected": [
+      "approve GATE-I_52-7",
+      "APPROVE gate-i_52-7",
+      "APPROVE  GATE-I_52-7",
+      "REJECT GATE-I_52-7:",
+      "REJECT GATE-I_52-7:   "
+    ]
+  },
+  "craftSettlement": {
+    "agentEndWithoutFinalResponse": "ended-without-response",
+    "stoppedWithAuthoritativeFinalResponse": "settled"
+  },
+  "deadlines": {
+    "turnMs": 120000,
+    "cancelMs": 5000,
+    "maxContextTokens": 100000,
+    "turnStatus": "turn-deadline",
+    "contextStatus": "context-deadline",
+    "cancelStatus": "cancel-deadline"
+  },
+  "restart": {
+    "expectedClaimCount": 1,
+    "expectedSessionCount": 1,
+    "expectedWorkspaceCount": 1,
+    "expectedState": "running"
+  }
+}
