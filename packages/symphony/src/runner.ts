@@ -46,6 +46,11 @@ export interface LiveRunnerConfig {
     states: Record<LifecycleState, GitHubStateProjection>;
   };
   git: { executable: string };
+  model?: {
+    connection: string;
+    defaultProfile: string;
+    allowedProfiles: string[];
+  };
   craft: {
     workspaceId: string;
     projectId: string;
@@ -230,6 +235,15 @@ export async function loadLiveRunnerConfig(path: string): Promise<LiveRunnerConf
 
 export async function createLiveRunner(config: LiveRunnerConfig): Promise<LiveV4Runner> {
   const loaded = await loadWorkflow(resolve(config.workflowPath));
+  const model = config.model ?? {
+    connection: "chatgpt-plus",
+    defaultProfile: "pi/gpt-5.6-sol",
+    allowedProfiles: ["pi/gpt-5.6-sol"],
+  };
+  if (!model.connection.trim()) throw new Error("live runner model.connection must be configured");
+  if (!model.allowedProfiles.includes(model.defaultProfile)) {
+    throw new Error("live runner model.defaultProfile must be one of model.allowedProfiles");
+  }
   const workflow: WorkflowConfig = {
     ...loaded.config,
     project: {
@@ -241,9 +255,9 @@ export async function createLiveRunner(config: LiveRunnerConfig): Promise<LiveV4
     scheduler: { ...loaded.config.scheduler, maxAttempts: 1 },
     workspace: { root: resolve(config.workspaceRoot) },
     model: {
-      connection: "chatgpt-plus",
-      defaultProfile: "pi/gpt-5.6-sol",
-      allowedProfiles: ["pi/gpt-5.6-sol"],
+      connection: model.connection,
+      defaultProfile: model.defaultProfile,
+      allowedProfiles: [...model.allowedProfiles],
     },
     verification: {
       ...loaded.config.verification,
@@ -288,7 +302,7 @@ export async function createLiveRunner(config: LiveRunnerConfig): Promise<LiveV4
     issueLabelId: config.craft.issueLabelId,
     runLabelId: config.craft.runLabelId,
     promptLabelId: config.craft.promptLabelId,
-    model: { connection: "chatgpt-plus", allowedProfiles: ["pi/gpt-5.6-sol"] },
+    model: { connection: model.connection, allowedProfiles: [model.defaultProfile, ...model.allowedProfiles.filter((p) => p !== model.defaultProfile)] },
     expectedRuntime: config.craft.cli.expected,
     deadlines: config.craft.deadlines,
     maxHandoffChars: config.craft.maxHandoffChars,

@@ -28,7 +28,7 @@ The workflow schema is exported as `@craft-agent/symphony/workflow.schema.json`.
 - deterministic WIP=1 scheduling and bounded retries;
 - append-only atomic GitHub claim leases and stale-fence refusal;
 - provider-derived branch/PR/merge evidence, never caller-asserted completion;
-- `chatgpt-plus` with allowlisted `pi/gpt-*` profiles only;
+- configurable model policy: the workflow config declares the connection and the exact profile allowlist (defaults preserve the alpha `chatgpt-plus` + `pi/gpt-*` behavior);
 - exact immutable owner directives and gate commands;
 - Craft settlement only after a persisted prompt, stopped processing, and an authoritative final assistant response;
 - hard turn, context, RPC, and cancellation deadlines;
