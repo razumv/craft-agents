@@ -107,7 +107,7 @@ export interface CraftAdapterConfig {
   runLabelId: string;
   promptLabelId: string;
   model: {
-    connection: "chatgpt-plus";
+    connection: string;
     allowedProfiles: string[];
   };
   expectedRuntime: CraftRuntimeIdentity;
@@ -513,7 +513,7 @@ export class CraftMobileControlPlaneAdapter implements CraftControlAdapter {
 
   private assertRequest(identity: RunIdentity, context: CraftStartContext): void {
     this.#models.assertAllowed(context.claim.modelProfile);
-    if (context.claim.modelConnection !== this.config.model.connection) throw new Error("Craft connection is not chatgpt-plus");
+    if (context.claim.modelConnection !== this.config.model.connection) throw new Error(`Craft connection does not match model policy (expected ${this.config.model.connection})`);
     if (context.claim.sessionId !== identity.sessionId || context.claim.workspaceId !== identity.workspaceId) {
       throw new Error("Craft start context does not match deterministic run identity");
     }

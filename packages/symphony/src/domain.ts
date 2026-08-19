@@ -94,7 +94,7 @@ export interface WorkflowConfig {
   };
   workspace: { root: string };
   model: {
-    connection: "chatgpt-plus";
+    connection: string;
     defaultProfile: string;
     allowedProfiles: string[];
   };
@@ -126,7 +126,7 @@ export interface Claim {
   workspaceKey: string;
   workspacePath: string;
   baseSha: string;
-  modelConnection: "chatgpt-plus";
+  modelConnection: string;
   modelProfile: string;
   claimedAtMs: number;
   heartbeatAtMs: number;

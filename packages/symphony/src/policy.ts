@@ -6,7 +6,7 @@ export class ModelPolicy {
   constructor(private readonly config: WorkflowConfig["model"]) {}
 
   assertAllowed(profile: string): void {
-    if (this.config.connection !== "chatgpt-plus" || !/^pi\/gpt-/i.test(profile) || !this.config.allowedProfiles.includes(profile)) {
+    if (!this.config.connection.trim() || !this.config.allowedProfiles.includes(profile)) {
       throw new Error(`model policy rejected ${this.config.connection}/${profile}`);
     }
   }

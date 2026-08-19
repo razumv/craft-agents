@@ -75,7 +75,7 @@ describe("v4.0.0-alpha.1 behavior parity fixture", () => {
 
   test("enforces the fixture's Codex-only model policy", () => {
     const policy = new ModelPolicy({
-      connection: parity.modelPolicy.connection as "chatgpt-plus",
+      connection: parity.modelPolicy.connection,
       defaultProfile: parity.modelPolicy.allowed[0]!,
       allowedProfiles: parity.modelPolicy.allowed,
     });
@@ -83,7 +83,7 @@ describe("v4.0.0-alpha.1 behavior parity fixture", () => {
     for (const profile of parity.modelPolicy.rejected) expect(() => policy.assertAllowed(profile)).toThrow("model policy rejected");
 
     const wrongConnection = new ModelPolicy({
-      connection: "api-key" as "chatgpt-plus",
+      connection: " ",
       defaultProfile: parity.modelPolicy.allowed[0]!,
       allowedProfiles: parity.modelPolicy.allowed,
     });

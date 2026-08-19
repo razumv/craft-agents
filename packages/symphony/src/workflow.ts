@@ -97,11 +97,8 @@ export function parseWorkflow(content: string, workflowPath = resolve("WORKFLOW.
 
   const allowedProfiles = stringArray(model.allowed_profiles, "model.allowed_profiles");
   const defaultProfile = string(model.default_profile, "model.default_profile");
-  if (model.connection !== "chatgpt-plus") throw new Error("model.connection must be chatgpt-plus");
+  const modelConnection = string(model.connection, "model.connection");
   if (!allowedProfiles.includes(defaultProfile)) throw new Error("model.default_profile must be allowed");
-  for (const profile of allowedProfiles) {
-    if (!/^pi\/gpt-[a-z0-9.-]+$/i.test(profile)) throw new Error(`non-Codex model profile is forbidden: ${profile}`);
-  }
 
   const rootPath = string(workspace.root, "workspace.root");
   const workspaceRoot = isAbsolute(rootPath) ? resolve(rootPath) : resolve(dirname(workflowPath), rootPath);
@@ -133,7 +130,7 @@ export function parseWorkflow(content: string, workflowPath = resolve("WORKFLOW.
     },
     workspace: { root: workspaceRoot },
     model: {
-      connection: "chatgpt-plus",
+      connection: modelConnection,
       defaultProfile,
       allowedProfiles,
     },
