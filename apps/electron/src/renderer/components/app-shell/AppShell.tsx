@@ -2711,9 +2711,11 @@ function AppShellContent({
               ) : undefined}
               actions={
                 <>
-                  {/* List ⇄ Board view switch (sessions mode, desktop widths only).
+                  {/* List ⇄ Board view switch (sessions mode). Compact widths keep it too —
+                      the board pane is full-width there and scrolls horizontally, which is the
+                      only way the mobile PWA can reach the Kanban/Symphony boards.
                       In board view the navigator is collapsed, so the board hosts its own copy. */}
-                  {!isAutoCompact && isSessionsNavigation(navState) && (
+                  {isSessionsNavigation(navState) && (
                     <BoardListToggle
                       value="list"
                       onChange={view => {
