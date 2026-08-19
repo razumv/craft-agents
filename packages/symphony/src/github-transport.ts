@@ -206,6 +206,42 @@ export class GhCliTransport implements GitHubTransport {
     await this.graphql(`mutation ProjectText($project:ID!,$item:ID!,$field:ID!,$value:String!){updateProjectV2ItemFieldValue(input:{projectId:$project,itemId:$item,fieldId:$field,value:{text:$value}}){projectV2Item{id}}}`, { project: projectId, item: itemId, field: fieldId, value });
   }
 
+  /** Resolve a Project (v2) URL to node id + Status/Gate field ids (config generation). */
+  async resolveProject(projectUrl: string): Promise<{ projectId: string; statusFieldId: string | null; gateFieldId: string | null }> {
+    const match = /^https:\/\/github\.com\/(users|orgs)\/([\w.-]+)\/projects\/(\d+)/.exec(projectUrl);
+    if (!match) throw new Error(`unsupported GitHub Project URL: ${projectUrl}`);
+    const [, kind, login, numberRaw] = match;
+    const owner = kind === "orgs" ? "organization" : "user";
+    const data = await this.graphql<Record<string, { projectV2: {
+      id: string;
+      fields: { nodes: { id?: string; name?: string; dataType?: string }[] };
+    } | null } | null>>(
+      `query Project($login:String!,$number:Int!){${owner}(login:$login){projectV2(number:$number){id fields(first:50){nodes{... on ProjectV2FieldCommon{id name dataType}}}}}}`,
+      { login, number: Number(numberRaw) },
+    );
+    const project = data[owner]?.projectV2;
+    if (!project) throw new Error(`GitHub Project not found: ${projectUrl}`);
+    const field = (name: string, dataType: string) =>
+      project.fields.nodes.find((node) => node.name?.toLowerCase() === name && node.dataType === dataType)?.id ?? null;
+    return {
+      projectId: project.id,
+      statusFieldId: field("status", "SINGLE_SELECT"),
+      gateFieldId: field("gate", "TEXT"),
+    };
+  }
+
+  /** Find the open claim-fence issue (by label) in a repository; null when absent. */
+  async findFenceIssue(repository: string, label: string): Promise<{ id: string; number: number } | null> {
+    const data = await this.graphql<{ search: { nodes: { id?: string; number?: number }[] } }>(
+      `query Fence($query:String!){search(query:$query,type:ISSUE,first:2){nodes{... on Issue{id number}}}}`,
+      { query: `repo:${repository} is:issue is:open label:"${label}"` },
+    );
+    const issues = data.search.nodes.filter((node) => node.id && node.number !== undefined);
+    if (issues.length > 1) throw new Error(`repository ${repository} has more than one open "${label}" issue`);
+    const first = issues[0];
+    return first ? { id: first.id!, number: first.number! } : null;
+  }
+
   private async graphql<T = unknown>(query: string, variables: Record<string, unknown>): Promise<T> {
     const output = await this.run(
       ["api", "graphql", "--input", "-"],
