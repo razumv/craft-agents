@@ -361,6 +361,7 @@ export const CHANNEL_MAP = {
   'symphony.status': invoke(RPC_CHANNELS.symphony.STATUS),
   'symphony.projectDesk': invoke(RPC_CHANNELS.symphony.PROJECT_DESK),
   'symphony.generateConfig': invoke(RPC_CHANNELS.symphony.GENERATE_CONFIG),
+  'symphony.refresh': invoke(RPC_CHANNELS.symphony.REFRESH),
 
   // Browser pane management
   'browserPane.create': invoke(RPC_CHANNELS.browserPane.CREATE),

@@ -36,8 +36,12 @@ export const kanbanColumnColorsAtom = atomWithStorage<Partial<Record<KanbanColum
   {}
 )
 
-/** Which board the board pane shows: session tasks or the Symphony lifecycle projection. */
-export const kanbanBoardModeAtom = atomWithStorage<'tasks' | 'symphony'>('craft-kanban-board-mode', 'tasks')
+/**
+ * Which board the board pane shows. Symphony is the default whenever the
+ * workspace's server has Symphony projects configured (the container falls
+ * back to tasks when it doesn't); switching to Tasks persists.
+ */
+export const kanbanBoardModeAtom = atomWithStorage<'tasks' | 'symphony'>('craft-kanban-board-mode', 'symphony')
 
 /** Whether active (in-progress) tiles get the live-pulse treatment. Default on. */
 export const kanbanLivePulseAtom = atomWithStorage<boolean>('craft-kanban-live-pulse', true)
