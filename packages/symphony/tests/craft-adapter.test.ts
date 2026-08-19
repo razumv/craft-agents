@@ -396,6 +396,12 @@ describe("v4.3 Craft mobile control-plane adapter", () => {
 
     expect(result.directive.acknowledgedAtMs - result.directive.receivedAtMs).toBeLessThanOrEqual(60_000);
     expect(transport.notes).toContain(`ACK directive-47-1 ${result.directive.acknowledgementId}`);
+
+    const run = identity();
+    const execution = await adapter.ensure(run, startContext(run));
+    const prompt = transport.byId(execution.rpcSessionId).messages![0]!.content!;
+    expect(prompt).toContain("# Owner directives\n\n- directive-47-1: Do not touch production.");
+
     await expect(adapter.ingestOwnerDirective({
       id: "directive-47-1",
       issueId: issue.id,
@@ -432,6 +438,12 @@ describe("v4.3 Craft mobile control-plane adapter", () => {
       gateId: "gate-47",
     });
     expect(approved.gateDecision).toEqual({ kind: "approve", gateId: "gate-47" });
+    expect(parseOwnerGateDecision("REJECT gate-47: verification failed", "gate-47")).toEqual({
+      kind: "reject",
+      gateId: "gate-47",
+      reason: "verification failed",
+    });
+    expect(() => parseOwnerGateDecision("REJECT gate-47: ", "gate-47")).toThrow("exactly match");
     expect(() => parseOwnerGateDecision("APPROVE gate-047", "gate-47")).toThrow("exactly match");
     expect(() => parseOwnerGateDecision("approve gate-47", "gate-47")).toThrow("exactly match");
   });
@@ -477,13 +489,45 @@ describe("v4.3 Craft mobile control-plane adapter", () => {
     const settled = await adapter.get(run.sessionId);
     expect(settled?.status).toBe(craftSettlementParity.stoppedWithAuthoritativeFinalResponse);
 
+    const readCalls = transport.calls.filter((call) => call.channel === "sessions:setNotes").length;
+    const readback = await adapter.readProjectDesk({ status: deskStatus, activeRun: settled });
+    expect(readback.run).toMatchObject({
+      runId: run.sessionId,
+      sessionId: started.rpcSessionId,
+      attempt: 1,
+      contextTokens: 0,
+      truth: "stopped",
+    });
+    expect(transport.calls.filter((call) => call.channel === "sessions:setNotes")).toHaveLength(readCalls);
+
     const body = await adapter.projectToDesk({ status: deskStatus, activeRun: settled, latestAcknowledgement: null });
     expect(body).toBe(compactProjectDeskProjection({ status: deskStatus, activeRun: settled, latestAcknowledgement: null }));
     expect(body).toContain("## Run summary");
     expect(body).toContain("Last material event: —");
-    expect(body).toContain(`Run: ${run.sessionId} / ${started.rpcSessionId} / settled`);
+    expect(body).toContain(`Run: ${run.sessionId}`);
+    expect(body).toContain(`Session: ${started.rpcSessionId}`);
+    expect(body).toContain("Attempt: 1");
     expect(body).not.toContain("Worker transcript");
     expect(body).not.toContain("Tool: bash focused-tests");
     expect(transport.notes).toBe(body);
+  });
+
+  test("archived and not-processing is terminal truth despite a stale workflow badge", async () => {
+    const { adapter, transport } = adapterFixture();
+    const run = identity();
+    const started = await adapter.ensure(run, startContext(run));
+    transport.finish(started.rpcSessionId, "Durable final response.");
+    const session = transport.byId(started.rpcSessionId);
+    session.isArchived = true;
+    session.sessionStatus = "in-progress";
+
+    const execution = await adapter.get(run.sessionId);
+    const readback = await adapter.readProjectDesk({ status: deskStatus, activeRun: execution });
+    expect(readback.run).toMatchObject({
+      truth: "terminal",
+      workflowBadge: "in-progress",
+      adapterStatus: "settled",
+    });
+    expect(readback.compact).toContain("Execution: terminal (archived + not-processing; workflow badge in-progress ignored)");
   });
 });

@@ -79,6 +79,16 @@ describe('NativeSymphonyService', () => {
     const runner: SymphonyRunnerLike = {
       async preflight() { calls.push('preflight'); return { valid: true } },
       async readStatus() { calls.push('status'); return { durable: 'same' } },
+      async projectDesk() { calls.push('desk'); return { compact: 'Project Desk' } },
+      async shadow() {
+        calls.push('shadow')
+        return {
+          projectDesk: { compact: 'Project Desk' },
+          proposal: { action: 'claim' },
+          receiptHash: 'a'.repeat(64),
+          writes: 0,
+        }
+      },
       async tick() { calls.push('tick'); return { mutated: true } },
     }
     const service = new NativeSymphonyService(config(path), path, async () => runner)
@@ -93,12 +103,22 @@ describe('NativeSymphonyService', () => {
     expect(calls).toEqual(['status'])
 
     expect(await service.validate('alpha')).toMatchObject({ operation: 'validate', result: { valid: true } })
-    expect(await service.shadow('alpha')).toMatchObject({
-      operation: 'shadow',
-      result: { status: { durable: 'same' }, writes: 0 },
+    const shadow = await service.shadow('alpha')
+    expect(shadow).toMatchObject({ operation: 'shadow' })
+    expect(shadow.result).toEqual({
+      projectDesk: { compact: 'Project Desk' },
+      proposal: { action: 'claim' },
+      receiptHash: 'a'.repeat(64),
+      writes: 0,
+    })
+    expect(JSON.stringify(shadow.result)).not.toContain('durable')
+    expect(JSON.stringify(shadow.result)).not.toContain('preflight')
+    expect(await service.projectDesk('alpha')).toMatchObject({
+      operation: 'desk',
+      result: { compact: 'Project Desk' },
     })
     await expect(service.tick('alpha')).rejects.toThrow('enabled=true')
-    expect(calls).toEqual(['status', 'preflight', 'preflight', 'status'])
+    expect(calls).toEqual(['status', 'preflight', 'preflight', 'shadow', 'desk'])
   })
 
   it('reconstructs identical durable status after a server restart without ticking', async () => {
@@ -107,6 +127,8 @@ describe('NativeSymphonyService', () => {
     const factory = async (): Promise<SymphonyRunnerLike> => ({
       async preflight() { return { valid: true } },
       async readStatus() { return { claim: 'claim-immutable', sessionId: 'session-existing' } },
+      async projectDesk() { return { compact: 'same' } },
+      async shadow() { return { proposal: { action: 'resume' }, receiptHash: 'same', writes: 0 } },
       async tick() { ticks++; return {} },
     })
 
@@ -116,6 +138,14 @@ describe('NativeSymphonyService', () => {
     const secondStatus = await second.start()
 
     expect(firstStatus.projects[0]?.snapshot).toEqual(secondStatus.projects[0]?.snapshot)
+    const firstShadow = await first.shadow('alpha')
+    const secondShadow = await second.shadow('alpha')
+    expect(firstShadow.result).toEqual(secondShadow.result)
+    expect(firstShadow.result).toMatchObject({
+      proposal: { action: 'resume' },
+      receiptHash: 'same',
+      writes: 0,
+    })
     expect(ticks).toBe(0)
   })
 
@@ -126,6 +156,8 @@ describe('NativeSymphonyService', () => {
     const runner: SymphonyRunnerLike = {
       async preflight() { return {} },
       async readStatus() { return { state: 'ready' } },
+      async projectDesk() { return {} },
+      async shadow() { return { writes: 0 } },
       async tick() { await blocked; return { state: 'ticked' } },
     }
     const service = new NativeSymphonyService(config(path, true), path, async () => runner)

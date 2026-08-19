@@ -20,6 +20,7 @@ export const RPC_CHANNELS = {
   symphony: {
     VALIDATE: 'symphony:validate',
     SHADOW: 'symphony:shadow',
+    PROJECT_DESK: 'symphony:projectDesk',
     TICK: 'symphony:tick',
     STATUS: 'symphony:status',
     STOP: 'symphony:stop',

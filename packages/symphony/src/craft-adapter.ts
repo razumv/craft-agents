@@ -47,6 +47,8 @@ export interface CraftRpcSession {
   llmConnection?: string;
   projectId?: string;
   isArchived?: boolean;
+  archived?: boolean;
+  kanbanColumn?: string;
   createdAt?: number;
   tokenUsage?: { inputTokens?: number; contextTokens?: number; contextWindow?: number };
   lastFinalMessageId?: string;
@@ -75,6 +77,10 @@ export interface CraftExecutionSession {
   promptMessageId: string | null;
   finalResponse: string | null;
   contextTokens: number;
+  /** Authoritative persisted archive truth, independent of a user-controlled workflow badge. */
+  isArchived?: boolean;
+  isProcessing?: boolean;
+  workflowStatus?: string | null;
 }
 
 export interface CraftStartContext {
@@ -131,6 +137,45 @@ export interface ProjectDeskProjection {
   status: ProjectStatus;
   activeRun: CraftExecutionSession | null;
   latestAcknowledgement: Readonly<OwnerDirective> | null;
+}
+
+export interface ProjectDeskReadback {
+  issue: {
+    projectId: string;
+    id: string;
+    identifier: string;
+    objective: string;
+    state: ProjectStatus["state"];
+  };
+  links: {
+    branch: string | null;
+    pullRequest: string | null;
+    deployment: string | null;
+  };
+  latestMaterialEvent: ProjectStatus["lastMaterialEvent"];
+  blocker: string | null;
+  ownerGate: ProjectStatus["ownerGate"];
+  nextCompletionPoint: string;
+  run: null | {
+    runId: string;
+    sessionId: string;
+    attempt: number;
+    contextTokens: number;
+    adapterStatus: CraftSessionStatus;
+    /** Archived + not-processing wins over stale sessionStatus/kanban workflow badges. */
+    truth: "terminal" | "processing" | "stopped";
+    workflowBadge: string | null;
+  };
+  directive: null | {
+    id: string;
+    sourceSessionId: string | null;
+    sourceMessageId: string | null;
+    acknowledgementId: string | null;
+    receivedAtMs: number;
+    acknowledgedAtMs: number;
+  };
+  /** Compact markdown suitable for existing Craft session notes/mobile surfaces. */
+  compact: string;
 }
 
 function clone<T>(value: T): T {
@@ -418,11 +463,26 @@ export class CraftMobileControlPlaneAdapter implements CraftControlAdapter {
     };
   }
 
+  /** Read the same compact Project Desk projection used by notes, without mutating Craft. */
+  async readProjectDesk(projection: Omit<ProjectDeskProjection, "latestAcknowledgement">): Promise<ProjectDeskReadback> {
+    await this.verifyRuntime();
+    await this.verifyOwnerDesk();
+    await this.loadDirectiveLedger();
+    return projectDeskReadback({
+      ...projection,
+      latestAcknowledgement: this.directives.entries()
+        .filter((entry) => entry.issueId === projection.status.issueId)
+        .at(-1) ?? null,
+    });
+  }
+
   async projectToDesk(projection: ProjectDeskProjection): Promise<string> {
     await this.verifyRuntime();
     await this.verifyOwnerDesk();
     const durable = await this.loadDirectiveLedger();
-    const latest = projection.latestAcknowledgement ?? this.directives.entries().at(-1) ?? null;
+    const latest = projection.latestAcknowledgement ?? this.directives.entries()
+      .filter((entry) => entry.issueId === projection.status.issueId)
+      .at(-1) ?? null;
     const compact = compactProjectDeskProjection({ ...projection, latestAcknowledgement: latest });
     const body = [compact, ...durable.blocks].join("\n\n");
     await this.transport.invoke("sessions:setNotes", [this.config.ownerSessionId, body], this.config.deadlines.rpcMs);
@@ -614,6 +674,9 @@ export class CraftMobileControlPlaneAdapter implements CraftControlAdapter {
       promptMessageId: prompt?.id ?? null,
       finalResponse: final?.content?.trim() ?? null,
       contextTokens: usedContext,
+      isArchived: session.isArchived === true || session.archived === true || session.kanbanColumn === "archived",
+      isProcessing: session.isProcessing,
+      workflowStatus: session.sessionStatus ?? session.kanbanColumn ?? null,
     };
   }
 
@@ -691,16 +754,67 @@ export function buildExecutionPrompt(
   ].join("\n\n");
 }
 
-export function compactProjectDeskProjection(projection: ProjectDeskProjection): string {
+export function projectDeskReadback(projection: ProjectDeskProjection): ProjectDeskReadback {
   const { status, activeRun, latestAcknowledgement } = projection;
-  const lines = [
+  const terminal = activeRun?.isArchived === true && activeRun.isProcessing === false;
+  const run: ProjectDeskReadback["run"] = activeRun ? {
+    runId: activeRun.sessionId,
+    sessionId: activeRun.rpcSessionId,
+    attempt: activeRun.attempt,
+    contextTokens: activeRun.contextTokens,
+    adapterStatus: activeRun.status,
+    truth: terminal ? "terminal" : activeRun.isProcessing === true ? "processing" : "stopped",
+    workflowBadge: activeRun.workflowStatus ?? null,
+  } : null;
+  const directive: ProjectDeskReadback["directive"] = latestAcknowledgement ? {
+    id: latestAcknowledgement.id,
+    sourceSessionId: latestAcknowledgement.sourceSessionId ?? null,
+    sourceMessageId: latestAcknowledgement.sourceMessageId ?? null,
+    acknowledgementId: latestAcknowledgement.acknowledgementId ?? null,
+    receivedAtMs: latestAcknowledgement.receivedAtMs,
+    acknowledgedAtMs: latestAcknowledgement.acknowledgedAtMs,
+  } : null;
+  const execution = run
+    ? run.truth === "terminal"
+      ? `terminal (archived + not-processing; workflow badge ${run.workflowBadge ?? "—"} ignored)`
+      : `${run.truth} (${run.adapterStatus}; workflow badge ${run.workflowBadge ?? "—"})`
+    : "—";
+  const compact = [
     "# Project Desk — Craft Protocol v4",
     compactRunSummary(status),
     `Objective: ${status.objective}`,
     `Deploy: ${status.deploymentUrl ?? "—"}`,
-    `Run: ${activeRun ? `${activeRun.sessionId} / ${activeRun.rpcSessionId} / ${activeRun.status}` : "—"}`,
-    `Context: ${activeRun ? activeRun.contextTokens : 0}`,
-    `Acknowledgement: ${latestAcknowledgement?.acknowledgementId ?? "—"}`,
-  ];
-  return lines.join("\n");
+    `Run: ${run?.runId ?? "—"}`,
+    `Session: ${run?.sessionId ?? "—"}`,
+    `Attempt: ${run?.attempt ?? "—"}`,
+    `Execution: ${execution}`,
+    `Context: ${run?.contextTokens ?? 0}`,
+    `Directive: ${directive ? `${directive.id} / ${directive.sourceSessionId ?? "—"} / ${directive.sourceMessageId ?? "—"}` : "—"}`,
+    `Acknowledgement: ${directive?.acknowledgementId ?? "—"}`,
+  ].join("\n");
+  return {
+    issue: {
+      projectId: status.projectId,
+      id: status.issueId,
+      identifier: status.issueIdentifier,
+      objective: status.objective,
+      state: status.state,
+    },
+    links: {
+      branch: status.branchUrl,
+      pullRequest: status.prUrl,
+      deployment: status.deploymentUrl,
+    },
+    latestMaterialEvent: status.lastMaterialEvent ? { ...status.lastMaterialEvent } : null,
+    blocker: status.blocker,
+    ownerGate: status.ownerGate ? { ...status.ownerGate } : null,
+    nextCompletionPoint: status.nextCompletionPoint,
+    run,
+    directive,
+    compact,
+  };
+}
+
+export function compactProjectDeskProjection(projection: ProjectDeskProjection): string {
+  return projectDeskReadback(projection).compact;
 }

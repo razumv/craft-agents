@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
+import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
-import type { CraftExecutionSession, CraftRpcSession } from "./craft-adapter";
+import type { CraftExecutionSession, CraftRpcSession, ProjectDeskReadback } from "./craft-adapter";
 import { CraftMobileControlPlaneAdapter } from "./craft-adapter";
 import { CraftCliRpcTransport, type CraftCliTransportConfig } from "./craft-transport";
 import type { LifecycleState, ProjectStatus, TrackerIssueSnapshot, WorkflowConfig } from "./domain";
@@ -19,7 +20,7 @@ import {
   type GitHubTransport,
   type Page,
 } from "./github-transport";
-import { DeterministicScheduler, type Clock, type CrashPoint } from "./scheduler";
+import { DeterministicScheduler, type Clock, type CrashPoint, type ShadowProposal } from "./scheduler";
 import { projectStatus } from "./status";
 import { loadWorkflow } from "./workflow";
 import { GitWorktreeAdapter } from "./workspace-adapter";
@@ -72,6 +73,15 @@ export interface LiveRunnerStatus {
   execution: CraftExecutionSession | null;
 }
 
+export interface LiveShadowReceipt {
+  /** Explicit public projection: no issue body, messages, or final response. */
+  projectDesk: ProjectDeskReadback;
+  proposal: ShadowProposal;
+  writes: 0;
+  /** SHA-256 over every public receipt field except this hash itself. */
+  receiptHash: string;
+}
+
 class SystemClock implements Clock {
   nowMs(): number { return Date.now(); }
 }
@@ -121,6 +131,24 @@ export class LiveV4Runner {
     const snapshot = await this.tracker.get(this.config.issueId);
     const execution = snapshot.claim ? await this.craft.get(snapshot.claim.sessionId) : null;
     return { snapshot, status: projectStatus(snapshot), execution };
+  }
+
+  async projectDesk(): Promise<ProjectDeskReadback> {
+    const status = await this.readStatus();
+    return this.craft.readProjectDesk({ status: status.status, activeRun: status.execution });
+  }
+
+  async shadow(): Promise<LiveShadowReceipt> {
+    const status = await this.readStatus();
+    const [projectDesk, proposal] = await Promise.all([
+      this.craft.readProjectDesk({ status: status.status, activeRun: status.execution }),
+      this.scheduler.preview(this.config.issueId),
+    ]);
+    const payload = { projectDesk, proposal, writes: 0 as const };
+    return {
+      ...payload,
+      receiptHash: createHash("sha256").update(canonicalJson(payload)).digest("hex"),
+    };
   }
 
   async project(): Promise<{ notes: string; status: LiveRunnerStatus }> {
@@ -268,6 +296,15 @@ export async function createLiveRunner(config: LiveRunnerConfig): Promise<LiveV4
   });
   const scheduler = new DeterministicScheduler(workflow, { github: tracker, craft, workspaces }, new SystemClock());
   return new LiveV4Runner(config, workflow, tracker, craft, craftTransport, scheduler, workspaces);
+}
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(record[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
 }
 
 /** Restricts a repository transport to one explicitly authorized work item. */

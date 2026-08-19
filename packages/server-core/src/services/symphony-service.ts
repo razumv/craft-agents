@@ -31,6 +31,8 @@ export interface SymphonyServerConfig {
 export interface SymphonyRunnerLike {
   preflight(): Promise<unknown>
   readStatus(): Promise<LiveRunnerStatus | unknown>
+  projectDesk(): Promise<unknown>
+  shadow(): Promise<unknown>
   tick(): Promise<LiveRunnerStatus | unknown>
 }
 
@@ -173,10 +175,15 @@ export class NativeSymphonyService implements SymphonyServiceControl {
 
   shadow(projectId: string): Promise<SymphonyOperationResult> {
     return this.#operate(projectId, 'shadow', async (runner) => {
-      const preflight = await runner.preflight()
-      const status = await runner.readStatus()
-      return { preflight, status, writes: 0 }
+      // Validate every external binding, but keep the verbose internal preflight
+      // record out of the compact public shadow receipt.
+      await runner.preflight()
+      return runner.shadow()
     })
+  }
+
+  projectDesk(projectId: string): Promise<SymphonyOperationResult> {
+    return this.#operate(projectId, 'desk', async (runner) => runner.projectDesk())
   }
 
   async tick(projectId: string): Promise<SymphonyOperationResult> {

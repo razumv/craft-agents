@@ -19,8 +19,15 @@ const nextPoint: Record<LifecycleState, string> = {
   "preservation-unknown": "preservation proof",
 };
 
+function isHeartbeat(event: TrackerIssueSnapshot["events"][number]): boolean {
+  if (event.kind !== undefined) return event.kind === "heartbeat";
+  // Alpha.1 ledgers did not persist the operation on projected events. Keep their
+  // deterministic heartbeat message out of the material lifecycle projection.
+  return /^attempt \d+ heartbeat$/i.test(event.message.trim());
+}
+
 export function projectStatus(snapshot: TrackerIssueSnapshot): ProjectStatus {
-  const events = snapshot.events;
+  const lastMaterialEvent = [...snapshot.events].reverse().find((event) => !isHeartbeat(event)) ?? null;
   const ownerGateId = snapshot.evidence.ownerGateId ?? null;
   return {
     projectId: snapshot.contract.projectId,
@@ -31,11 +38,16 @@ export function projectStatus(snapshot: TrackerIssueSnapshot): ProjectStatus {
     branchUrl: snapshot.evidence.branchUrl ?? null,
     prUrl: snapshot.evidence.prUrl ?? null,
     deploymentUrl: snapshot.evidence.deploymentUrl ?? null,
-    lastMaterialEvent: events.length ? { ...events[events.length - 1] } : null,
+    lastMaterialEvent: lastMaterialEvent ? { ...lastMaterialEvent } : null,
     blocker: snapshot.evidence.blocker
       ?? (snapshot.issue.blockedBy.map((item) => item.identifier ?? item.id ?? "unknown blocker").join(", ") || null),
     nextCompletionPoint: nextPoint[snapshot.issue.state],
-    ownerGate: ownerGateId ? { id: ownerGateId, command: `APPROVE ${ownerGateId}` } : null,
+    ownerGate: ownerGateId ? {
+      id: ownerGateId,
+      command: `APPROVE ${ownerGateId}`,
+      approveCommand: `APPROVE ${ownerGateId}`,
+      rejectCommand: `REJECT ${ownerGateId}: <reason>`,
+    } : null,
   };
 }
 
@@ -49,7 +61,9 @@ export function compactRunSummary(status: ProjectStatus): string {
     `Branch / PR: ${status.branchUrl ?? "—"} / ${status.prUrl ?? "—"}`,
     `Last material event: ${event ? `#${event.sequence} @ ${event.atMs} [${event.state}] ${event.message}` : "—"}`,
     `Blocker: ${status.blocker ?? "—"}`,
-    `Owner gate: ${status.ownerGate?.command ?? "—"}`,
+    `Owner gate: ${status.ownerGate?.id ?? "—"}`,
+    `Approve: ${status.ownerGate?.approveCommand ?? "—"}`,
+    `Reject: ${status.ownerGate?.rejectCommand ?? "—"}`,
     `Next completion point: ${status.nextCompletionPoint}`,
   ].join("\n");
 }

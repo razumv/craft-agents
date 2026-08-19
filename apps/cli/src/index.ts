@@ -298,32 +298,40 @@ async function cmdStatus(client: CliRpcClient, args: CliArgs): Promise<void> {
   out(result, args.json)
 }
 
-async function cmdSymphony(client: CliRpcClient, args: CliArgs): Promise<void> {
-  const operation = args.rest.shift() ?? 'status'
+export interface SymphonyCliInvocation {
+  operation: string
+  channel: string
+  rpcArgs: unknown[]
+}
+
+export function resolveSymphonyInvocation(rest: readonly string[]): SymphonyCliInvocation {
+  const values = [...rest]
+  const operation = values.shift() ?? 'status'
   const channels: Record<string, string> = {
     validate: 'symphony:validate',
     shadow: 'symphony:shadow',
+    desk: 'symphony:projectDesk',
     tick: 'symphony:tick',
     status: 'symphony:status',
     stop: 'symphony:stop',
   }
   const channel = channels[operation]
-  if (!channel) throw new Error('Usage: symphony validate|shadow|tick <project-id> | status | stop [timeout-ms]')
-  await client.connect()
-  if (!client.hasCapability(channel)) throw new Error(`Server does not advertise ${channel}`)
-
-  if (operation === 'status') {
-    out(await client.invoke(channel), args.json)
-    return
-  }
+  if (!channel) throw new Error('Usage: symphony validate|shadow|desk|tick <project-id> | status | stop [timeout-ms]')
+  if (operation === 'status') return { operation, channel, rpcArgs: [] }
   if (operation === 'stop') {
-    const timeout = args.rest.shift()
-    out(await client.invoke(channel, ...(timeout ? [Number(timeout)] : [])), args.json)
-    return
+    const timeout = values.shift()
+    return { operation, channel, rpcArgs: timeout ? [Number(timeout)] : [] }
   }
-  const projectId = args.rest.shift()
+  const projectId = values.shift()
   if (!projectId) throw new Error(`Usage: symphony ${operation} <project-id>`)
-  out(await client.invoke(channel, projectId), args.json)
+  return { operation, channel, rpcArgs: [projectId] }
+}
+
+async function cmdSymphony(client: CliRpcClient, args: CliArgs): Promise<void> {
+  const invocation = resolveSymphonyInvocation(args.rest)
+  await client.connect()
+  if (!client.hasCapability(invocation.channel)) throw new Error(`Server does not advertise ${invocation.channel}`)
+  out(await client.invoke(invocation.channel, ...invocation.rpcArgs), args.json)
 }
 
 async function cmdVersions(client: CliRpcClient, args: CliArgs): Promise<void> {
@@ -1987,7 +1995,8 @@ Commands:
   status                 Show server status and immutable build identity
   symphony status        Show default-off native Symphony service status
   symphony validate <id> Validate one explicitly configured project
-  symphony shadow <id>   Read-only preflight/status reconstruction (zero writes)
+  symphony shadow <id>   Read-only decision/desk receipt with zero writes
+  symphony desk <id>     Show compact mobile-compatible Project Desk status
   symphony tick <id>     Run one tick (requires explicit enabled=true)
   symphony stop [ms]     Stop accepting work and drain within a deadline
   versions               Show server runtime versions

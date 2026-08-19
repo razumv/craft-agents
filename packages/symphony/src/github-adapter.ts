@@ -521,7 +521,7 @@ export class GitHubIssuesProjectsAdapter implements TrackerAdapter {
       claim: null,
       retry: null,
       evidence: branch ? { branchUrl: branch.url, branchSha: branch.oid } : {},
-      events: [{ sequence: 0, atMs: Date.parse(record.createdAt), state: baselineState, message: "GitHub baseline" }],
+      events: [{ sequence: 0, atMs: Date.parse(record.createdAt), state: baselineState, message: "GitHub baseline", kind: "baseline" }],
     };
     if (baselineState === "owner-gate") {
       if (!gate) throw new Error("owner-gate baseline lacks an exact Gate field value");
@@ -627,7 +627,15 @@ function reduceLedgerEvent(snapshot: TrackerIssueSnapshot, event: LedgerEvent, s
     claim: structuredClone(event.claim),
     retry: structuredClone(event.retry),
     evidence: structuredClone(event.evidence),
-    events: [...snapshot.events, { sequence, atMs: event.atMs, state: event.to, message: event.message }],
+    events: event.operation === "heartbeat"
+      ? snapshot.events
+      : [...snapshot.events, {
+          sequence,
+          atMs: event.atMs,
+          state: event.to,
+          message: event.message,
+          kind: event.operation,
+        }],
   };
 }
 
