@@ -256,3 +256,25 @@ describe("v4 live runner mutation scope", () => {
     expect(mutations).toBe(0);
   });
 });
+
+describe("contract issue body", () => {
+  test("YAML stays parseable even when items start with reserved characters", async () => {
+    const { contractIssueBody } = await import("../src/runner");
+    const body = contractIssueBody(
+      {
+        title: "t",
+        goal: "`--compact` flag: prints one line",
+        risk: "low",
+        acceptance: ["`craft-cli` prints one line", "- leading dash", "plain item"],
+        nonGoals: [],
+      },
+      { id: "CRAFT-TEST", model: "pi/gpt-5.6-sol", verificationBudget: "focused" },
+    );
+    const yaml = /```yaml\n([\s\S]*?)```/.exec(body)![1]!;
+    const parsed = Bun.YAML.parse(yaml) as Record<string, unknown>;
+    expect(parsed.goal).toBe("`--compact` flag: prints one line");
+    expect((parsed.acceptance as string[])[1]).toBe("- leading dash");
+    expect((parsed.nonGoals as string[]).length).toBeGreaterThan(0);
+    expect(parsed.deployAuthority).toBe("none");
+  });
+});

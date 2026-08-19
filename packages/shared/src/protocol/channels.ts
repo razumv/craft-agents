@@ -26,6 +26,8 @@ export const RPC_CHANNELS = {
     STOP: 'symphony:stop',
     GENERATE_CONFIG: 'symphony:generateConfig',
     REFRESH: 'symphony:refresh',
+    CREATE_ISSUE: 'symphony:createIssue',
+    CHANGED: 'symphony:changed',
   },
   sessions: {
     GET: 'sessions:get',

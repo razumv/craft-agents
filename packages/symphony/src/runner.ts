@@ -20,6 +20,7 @@ import {
   type GitHubTransport,
   type Page,
 } from "./github-transport";
+import { ModelPolicy } from "./policy";
 import { DeterministicScheduler, type Clock, type CrashPoint, type ShadowProposal } from "./scheduler";
 import { projectStatus } from "./status";
 import { loadWorkflow } from "./workflow";
@@ -115,6 +116,7 @@ export class LiveV4Runner {
     readonly craftTransport: CraftCliRpcTransport,
     readonly scheduler: DeterministicScheduler,
     readonly workspaces?: GitWorktreeAdapter,
+    readonly intake?: GhCliTransport,
   ) {}
 
   async preflight(): Promise<{
@@ -186,6 +188,35 @@ export class LiveV4Runner {
       execution,
       statuses,
     };
+  }
+
+  /**
+   * Work intake: create a machine-readable contract issue in the configured
+   * repository, labeled ready and placed on the configured Project. This is
+   * an explicit owner action, independent from scheduler mutation gating.
+   */
+  async createContractIssue(input: ContractIssueInput): Promise<{ id: string; number: number; url: string }> {
+    const intake = this.intake;
+    if (!intake) throw new Error("this runner has no GitHub intake transport configured");
+    if (!input.title.trim() || !input.goal.trim()) throw new Error("issue title and goal are required");
+    if (input.acceptance.filter((item) => item.trim()).length === 0) throw new Error("at least one acceptance criterion is required");
+    if (input.model) new ModelPolicy(this.workflow.model).assertAllowed(input.model);
+    const body = contractIssueBody(
+      { ...input, acceptance: input.acceptance.filter((i) => i.trim()), nonGoals: input.nonGoals.filter((i) => i.trim()) },
+      {
+        id: `CRAFT-${Date.now().toString(36).toUpperCase()}`,
+        model: this.workflow.model.defaultProfile,
+        verificationBudget: this.config.verificationBudget,
+      },
+    );
+    const labels = [...this.config.github.requiredLabels, this.config.github.states.ready.label];
+    const created = await intake.createIssue(this.config.github.repository, input.title.trim(), body, labels);
+    const itemId = await intake.addIssueToProject(this.config.github.projectId, created.id);
+    await intake.updateProjectSingleSelect(
+      this.config.github.projectId, itemId,
+      this.config.github.statusFieldId, this.config.github.states.ready.projectStatusOptionId,
+    );
+    return created;
   }
 
   async projectDesk(): Promise<ProjectDeskReadback> {
@@ -383,7 +414,49 @@ export async function createLiveRunner(config: LiveRunnerConfig): Promise<LiveV4
     gitExecutable: config.git.executable,
   });
   const scheduler = new DeterministicScheduler(workflow, { github: tracker, craft, workspaces }, new SystemClock());
-  return new LiveV4Runner(config, workflow, tracker, craft, craftTransport, scheduler, workspaces);
+  return new LiveV4Runner(config, workflow, tracker, craft, craftTransport, scheduler, workspaces, rawGitHub);
+}
+
+export interface ContractIssueInput {
+  title: string;
+  goal: string;
+  risk: "low" | "medium" | "high";
+  acceptance: string[];
+  nonGoals: string[];
+  model?: string;
+}
+
+/** Quote a scalar whenever plain YAML could misread it (reserved leading chars bit us live: a backtick-led scalar is a parse error). */
+function yamlScalar(value: string): string {
+  const trimmed = value.trim();
+  if (/^[A-Za-z0-9][^#]*$/.test(trimmed) && !/[:{}\[\],&*?|>'"%@`!-]/.test(trimmed[0]!) && !trimmed.includes(": ")) return trimmed;
+  return JSON.stringify(trimmed);
+}
+
+/** Deterministic machine-readable contract body for a new work-intake issue. */
+export function contractIssueBody(
+  input: ContractIssueInput,
+  defaults: { id: string; model: string; verificationBudget: string },
+): string {
+  const list = (items: string[]) => items.map((item) => `  - ${yamlScalar(item)}`).join("\n");
+  return [
+    "## Work contract",
+    "",
+    "```yaml",
+    `id: ${yamlScalar(defaults.id)}`,
+    `goal: ${yamlScalar(input.goal)}`,
+    `risk: ${input.risk}`,
+    "deployAuthority: none",
+    `model: ${yamlScalar(input.model ?? defaults.model)}`,
+    `verificationBudget: ${yamlScalar(defaults.verificationBudget)}`,
+    "acceptance:",
+    list(input.acceptance),
+    "nonGoals:",
+    list(input.nonGoals.length ? input.nonGoals : ["scheduler/service architecture changes", "live Fleet or product changes", "independent audit"]),
+    "```",
+    "",
+    "Created from the Craft Symphony board.",
+  ].join("\n");
 }
 
 function canonicalJson(value: unknown): string {
