@@ -77,6 +77,15 @@ export interface SymphonyServiceStatus {
   stopTimeoutMs: number
   activeOperations: number
   projects: SymphonyProjectServiceStatus[]
+  /** Autonomous polling loop state; null when no loop is configured. */
+  loop: {
+    enabled: boolean
+    mode: 'shadow' | 'tick'
+    intervalMs: number
+    cycles: number
+    lastCycleAt: number | null
+    droppedProjects: string[]
+  } | null
 }
 
 export interface SymphonyOperationResult {

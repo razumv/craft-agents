@@ -176,3 +176,83 @@ describe('NativeSymphonyService', () => {
     expect(service.status().phase).toBe('stopped')
   })
 })
+
+describe('NativeSymphonyService autonomous loop', () => {
+  const loopConfig = (configPath: string, overrides: Partial<import('./symphony-service').SymphonyLoopConfig> = {}, enabled = false) => ({
+    version: 1 as const,
+    enabled,
+    stopTimeoutMs: 25,
+    projects: [{ id: 'alpha', configPath }],
+    loop: { enabled: true, mode: 'shadow' as const, intervalMs: 5, maxConsecutiveErrors: 3, ...overrides },
+  })
+
+  const shadowReceipt = {
+    projectDesk: { compact: 'Project Desk' },
+    proposal: { action: 'hold' },
+    receiptHash: 'b'.repeat(64),
+    writes: 0,
+  }
+
+  it('rejects a tick loop unless the service itself is enabled', () => {
+    expect(() => parseSymphonyServerConfig({
+      version: 1,
+      enabled: false,
+      stopTimeoutMs: 100,
+      projects: [],
+      loop: { enabled: true, mode: 'tick', intervalMs: 1000, maxConsecutiveErrors: 3 },
+    })).toThrow('enabled=true')
+    expect(parseSymphonyServerConfig({
+      version: 1,
+      enabled: false,
+      stopTimeoutMs: 100,
+      projects: [],
+      loop: { enabled: true, mode: 'shadow', intervalMs: 1000, maxConsecutiveErrors: 3 },
+    }).loop).toMatchObject({ mode: 'shadow' })
+  })
+
+  it('runs read-only shadow cycles, reports them, and never ticks', async () => {
+    const path = await runnerConfigPath()
+    const calls: string[] = []
+    const runner: SymphonyRunnerLike = {
+      async preflight() { calls.push('preflight'); return { valid: true } },
+      async readStatus() { calls.push('status'); return { durable: 'same' } },
+      async projectDesk() { calls.push('desk'); return { compact: 'Project Desk' } },
+      async shadow() { calls.push('shadow'); return shadowReceipt },
+      async tick() { calls.push('tick'); return { mutated: true } },
+    }
+    const service = new NativeSymphonyService(loopConfig(path), path, async () => runner)
+    await service.start()
+    await new Promise((resolve) => setTimeout(resolve, 60))
+    const status = service.status()
+    expect(status.loop).toMatchObject({ enabled: true, mode: 'shadow', droppedProjects: [] })
+    expect(status.loop!.cycles).toBeGreaterThan(0)
+    expect(status.loop!.lastCycleAt).not.toBeNull()
+    expect(calls.filter((c) => c === 'shadow').length).toBeGreaterThan(0)
+    expect(calls).not.toContain('tick')
+    await service.stop()
+  })
+
+  it('drops a project after maxConsecutiveErrors and stop cancels the loop', async () => {
+    const path = await runnerConfigPath()
+    let shadows = 0
+    const runner: SymphonyRunnerLike = {
+      async preflight() { return { valid: true } },
+      async readStatus() { return { durable: 'same' } },
+      async projectDesk() { return { compact: 'Project Desk' } },
+      async shadow() { shadows += 1; throw new Error('provider offline') },
+      async tick() { return { mutated: true } },
+    }
+    const service = new NativeSymphonyService(loopConfig(path, { maxConsecutiveErrors: 2 }), path, async () => runner)
+    await service.start()
+    await new Promise((resolve) => setTimeout(resolve, 60))
+    const status = service.status()
+    expect(status.loop!.droppedProjects).toEqual(['alpha'])
+    expect(shadows).toBe(2)
+    expect(status.projects[0]).toMatchObject({ phase: 'error', lastError: 'provider offline' })
+
+    await service.stop()
+    const cyclesAtStop = service.status().loop!.cycles
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    expect(service.status().loop!.cycles).toBe(cyclesAtStop)
+  })
+})
