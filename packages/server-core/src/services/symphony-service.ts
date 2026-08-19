@@ -335,12 +335,18 @@ export class NativeSymphonyService implements SymphonyServiceControl {
       try {
         const result = await action(runtime.runner!)
         const completedAt = Date.now()
+        // The cached snapshot is what UI surfaces (the board) render between
+        // operations, so it must ALWAYS be a full LiveRunnerStatus. Ops whose
+        // result is a different shape (shadow receipt, desk readback,
+        // validate report, issue intake) must not clobber it — a loop shadow
+        // cycle used to wipe the board until a manual refresh.
+        const updatesSnapshot = operation === 'tick' || operation === 'refresh'
         runtime.status = {
           ...runtime.status,
           phase: 'ready',
           updatedAt: completedAt,
           lastError: null,
-          snapshot: result,
+          ...(updatesSnapshot ? { snapshot: result } : {}),
         }
         this.#notify(projectId, operation)
         return { projectId, operation, completedAt, result }
