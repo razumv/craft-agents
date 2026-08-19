@@ -20,12 +20,28 @@ export interface SymphonyProjectConfig {
   configPath: string
 }
 
+export interface SymphonyLoopConfig {
+  /** The loop never starts unless this is explicitly true. */
+  enabled: boolean
+  /**
+   * What each cycle runs per project. `shadow` is read-only (zero-write receipts)
+   * and proves the loop machinery without mutating anything; `tick` is the live
+   * scheduler step and additionally requires the top-level `enabled: true`.
+   */
+  mode: 'shadow' | 'tick'
+  intervalMs: number
+  /** After this many consecutive failed cycles a project is dropped from the loop. */
+  maxConsecutiveErrors: number
+}
+
 export interface SymphonyServerConfig {
   version: 1
   /** Live scheduler mutation is impossible unless this is explicitly true. */
   enabled: boolean
   stopTimeoutMs: number
   projects: SymphonyProjectConfig[]
+  /** Optional autonomous polling loop. Absent → manual operations only. */
+  loop?: SymphonyLoopConfig
 }
 
 export interface SymphonyRunnerLike {
@@ -77,11 +93,31 @@ export function parseSymphonyServerConfig(value: unknown): SymphonyServerConfig 
     return { id, configPath: resolve(configPath) }
   })
 
+  let loop: SymphonyLoopConfig | undefined
+  if (raw.loop !== undefined) {
+    if (!raw.loop || typeof raw.loop !== 'object' || Array.isArray(raw.loop)) {
+      throw new Error('Symphony server config loop must be an object')
+    }
+    const rawLoop = raw.loop as Record<string, unknown>
+    if (typeof rawLoop.enabled !== 'boolean') throw new Error('Symphony loop enabled must be explicit boolean')
+    if (rawLoop.mode !== 'shadow' && rawLoop.mode !== 'tick') throw new Error('Symphony loop mode must be shadow or tick')
+    if (rawLoop.mode === 'tick' && raw.enabled !== true) {
+      throw new Error('Symphony loop mode tick requires enabled=true in the explicit server config')
+    }
+    loop = {
+      enabled: rawLoop.enabled,
+      mode: rawLoop.mode,
+      intervalMs: positiveInteger(rawLoop.intervalMs, 'Symphony loop intervalMs'),
+      maxConsecutiveErrors: positiveInteger(rawLoop.maxConsecutiveErrors, 'Symphony loop maxConsecutiveErrors'),
+    }
+  }
+
   return {
     version: 1,
     enabled: raw.enabled,
     stopTimeoutMs: positiveInteger(raw.stopTimeoutMs, 'Symphony server config stopTimeoutMs'),
     projects,
+    ...(loop ? { loop } : {}),
   }
 }
 
@@ -96,6 +132,12 @@ export class NativeSymphonyService implements SymphonyServiceControl {
   #phase: SymphonyServiceStatus['phase']
   #accepting = false
   #startPromise: Promise<SymphonyServiceStatus> | null = null
+  #loopTimer: ReturnType<typeof setTimeout> | null = null
+  #loopCycles = 0
+  #loopLastCycleAt: number | null = null
+  #loopCycleActive = false
+  readonly #loopErrors = new Map<string, number>()
+  readonly #loopDropped = new Set<string>()
 
   constructor(
     readonly config: SymphonyServerConfig,
@@ -166,7 +208,53 @@ export class NativeSymphonyService implements SymphonyServiceControl {
 
     if (this.#phase !== 'error') this.#phase = 'ready'
     this.#accepting = this.#phase === 'ready'
+    if (this.#accepting && this.config.loop?.enabled) this.#scheduleLoop()
     return this.status()
+  }
+
+  /**
+   * Autonomous polling loop. One timer chain (never overlapping cycles):
+   * each cycle serially runs the configured operation for every project that
+   * is reconstructed, idle, and under its consecutive-error budget. A project
+   * that fails maxConsecutiveErrors cycles in a row is dropped from the loop
+   * (its lastError stays visible in status); manual operations stay available.
+   */
+  #scheduleLoop(): void {
+    const loop = this.config.loop
+    if (!loop?.enabled || !this.#accepting) return
+    this.#loopTimer = setTimeout(() => {
+      void this.#runLoopCycle()
+    }, loop.intervalMs)
+    // Never hold the process open just for the loop.
+    this.#loopTimer.unref?.()
+  }
+
+  async #runLoopCycle(): Promise<void> {
+    const loop = this.config.loop
+    if (!loop?.enabled || !this.#accepting || this.#loopCycleActive) return
+    this.#loopCycleActive = true
+    try {
+      for (const runtime of this.#projects.values()) {
+        if (!this.#accepting) break
+        const projectId = runtime.config.id
+        if (this.#loopDropped.has(projectId)) continue
+        if (!runtime.runner || runtime.status.phase === 'running') continue
+        try {
+          if (loop.mode === 'tick') await this.tick(projectId)
+          else await this.shadow(projectId)
+          this.#loopErrors.delete(projectId)
+        } catch {
+          const errors = (this.#loopErrors.get(projectId) ?? 0) + 1
+          this.#loopErrors.set(projectId, errors)
+          if (errors >= loop.maxConsecutiveErrors) this.#loopDropped.add(projectId)
+        }
+      }
+      this.#loopCycles += 1
+      this.#loopLastCycleAt = Date.now()
+    } finally {
+      this.#loopCycleActive = false
+      this.#scheduleLoop()
+    }
   }
 
   validate(projectId: string): Promise<SymphonyOperationResult> {
@@ -251,12 +339,26 @@ export class NativeSymphonyService implements SymphonyServiceControl {
       stopTimeoutMs: this.config.stopTimeoutMs,
       activeOperations: this.#active.size,
       projects: [...this.#projects.values()].map(({ status }) => ({ ...status })),
+      loop: this.config.loop
+        ? {
+            enabled: this.config.loop.enabled,
+            mode: this.config.loop.mode,
+            intervalMs: this.config.loop.intervalMs,
+            cycles: this.#loopCycles,
+            lastCycleAt: this.#loopLastCycleAt,
+            droppedProjects: [...this.#loopDropped],
+          }
+        : null,
     }
   }
 
   async stop(timeoutMs = this.config.stopTimeoutMs): Promise<SymphonyStopResult> {
     positiveInteger(timeoutMs, 'Symphony stop timeout')
     this.#accepting = false
+    if (this.#loopTimer) {
+      clearTimeout(this.#loopTimer)
+      this.#loopTimer = null
+    }
     if (this.#phase === 'disabled' || this.#phase === 'stopped') {
       this.#phase = this.#phase === 'disabled' ? 'disabled' : 'stopped'
       return { drained: true, timeoutMs, activeOperations: this.#active.size, phase: 'stopped' }

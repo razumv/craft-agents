@@ -24,6 +24,22 @@ The Project Desk projection uses the existing Craft session-notes/mobile surface
 
 A live `tick` is rejected unless `enabled` is explicitly set to `true`. Enabling is an activation decision and is outside Alpha 2 Increment 2.
 
+## Autonomous polling loop
+
+An optional `loop` block turns on a service-owned polling loop:
+
+```json
+{
+  "loop": { "enabled": true, "mode": "shadow", "intervalMs": 60000, "maxConsecutiveErrors": 3 }
+}
+```
+
+- `mode: "shadow"` runs read-only zero-write shadow cycles — it proves the loop machinery (scheduling, serialization, error budget, stop) without mutating anything and works with `enabled: false`.
+- `mode: "tick"` runs the live scheduler step and is rejected at config parse unless the top-level `enabled` is `true`.
+- Cycles never overlap; each cycle serially visits every reconstructed idle project. A project failing `maxConsecutiveErrors` consecutive cycles is dropped from the loop (manual operations stay available; its `lastError` stays in `status`).
+- `symphony status` reports `loop`: mode, interval, completed cycles, last cycle time, dropped projects.
+- `stop` cancels the loop timer before draining in-flight work.
+
 RPC/CLI operations:
 
 - `symphony validate <project-id>`

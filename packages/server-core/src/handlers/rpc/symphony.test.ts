@@ -30,7 +30,7 @@ describe('Symphony RPC handlers', () => {
       async shadow(id) { calls.push(['shadow', id]); return { projectId: id, operation: 'shadow', completedAt: 2, result: {} } },
       async projectDesk(id) { calls.push(['desk', id]); return { projectId: id, operation: 'desk', completedAt: 3, result: {} } },
       async tick(id) { calls.push(['tick', id]); return { projectId: id, operation: 'tick', completedAt: 4, result: {} } },
-      status() { calls.push(['status']); return { phase: 'ready', enabled: false, acceptingOperations: true, configPath: '/tmp/config.json', stopTimeoutMs: 100, activeOperations: 0, projects: [] } },
+      status() { calls.push(['status']); return { phase: 'ready', enabled: false, acceptingOperations: true, configPath: '/tmp/config.json', stopTimeoutMs: 100, activeOperations: 0, projects: [], loop: null } },
       async stop(timeoutMs) { calls.push(['stop', timeoutMs]); return { drained: true, timeoutMs: timeoutMs ?? 100, activeOperations: 0, phase: 'stopped' } },
     }
     const rpc = rpcHarness()
