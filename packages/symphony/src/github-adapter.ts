@@ -432,7 +432,15 @@ export class GitHubIssuesProjectsAdapter implements TrackerAdapter {
       try {
         cores.set(record.id, await this.hydrateCore(record));
       } catch (error) {
-        if (strict && (requested.size === 0 || requested.has(record.id))) throw error;
+        if (strict && (requested.size === 0 || requested.has(record.id))) {
+          // Strict loads protect WIP reconciliation: silently omitting a
+          // malformed issue that actually holds an active claim could release
+          // WIP and duplicate a run. But repository-wide discovery inevitably
+          // sees contract-less issues (trackers, plain bugs). An issue with NO
+          // managed lifecycle label cannot be holding a claim, so omitting it
+          // is safe; anything carrying a lifecycle label still fails closed.
+          if (!(await this.hasNoLifecycleLabel(record))) throw error;
+        }
         this.config.onDiagnostic?.(`omitting malformed GitHub issue ${record.id}: ${errorMessage(error)}`);
       }
     }
@@ -460,6 +468,17 @@ export class GitHubIssuesProjectsAdapter implements TrackerAdapter {
       }
     }
     return output;
+  }
+
+  /** True only when the issue verifiably carries zero managed lifecycle labels. */
+  private async hasNoLifecycleLabel(record: GitHubIssueRecord): Promise<boolean> {
+    try {
+      const labels = await collectPages((cursor) => this.transport.listLabels(record.id, cursor));
+      return !labels.map(normalizeLabel).some((label) => this.#managedLabels.has(label));
+    } catch {
+      // Cannot verify — keep the strict failure.
+      return false;
+    }
   }
 
   private async hydrateCore(record: GitHubIssueRecord): Promise<CoreHydrated> {
