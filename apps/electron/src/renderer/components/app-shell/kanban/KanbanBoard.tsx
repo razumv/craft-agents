@@ -151,7 +151,8 @@ export function KanbanBoard({
       onDragEnd={handleDragEnd}
       onDragCancel={() => setActiveId(null)}
     >
-      <div className="flex h-full gap-3 p-3">
+      <div className="h-full overflow-x-auto">
+      <div className="flex h-full min-w-max gap-3 p-3 snap-x snap-mandatory md:snap-none">
         {columns.map((column, index) => (
           <KanbanColumn
             key={column.id}
@@ -194,6 +195,7 @@ export function KanbanBoard({
             <Plus className="h-4 w-4" strokeWidth={2.5} />
           </button>
         )}
+      </div>
       </div>
 
       {/* position:fixed overlay clone — escapes the column's overflow clipping.

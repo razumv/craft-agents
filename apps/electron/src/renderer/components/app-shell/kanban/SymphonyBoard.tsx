@@ -290,12 +290,12 @@ export function SymphonyBoard() {
           {t('kanban.symphony.refresh')}
         </button>
       </div>
-      <div className="min-h-0 flex-1 overflow-x-auto">
+      <div className="min-h-0 flex-1 overflow-x-auto snap-x snap-mandatory md:snap-none">
         <div className="flex h-full min-w-max gap-3 p-4">
           {SYMPHONY_COLUMNS.map(column => {
             const columnTiles = (tiles ?? []).filter(tile => columnFor(tile.state).id === column.id)
             return (
-              <div key={column.id} className="flex w-64 shrink-0 flex-col rounded-xl bg-foreground/[0.02] p-2">
+              <div key={column.id} className="flex w-64 shrink-0 snap-start flex-col rounded-xl bg-foreground/[0.02] p-2">
                 <div className="flex items-center gap-2 px-1 pb-2">
                   <span className="h-2 w-2 rounded-full" style={{ backgroundColor: column.accent }} />
                   <span className="text-[12px] font-semibold text-foreground/80">{t(column.labelKey)}</span>
