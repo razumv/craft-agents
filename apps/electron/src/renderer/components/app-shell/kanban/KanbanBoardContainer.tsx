@@ -6,7 +6,7 @@ import { useTranslation } from 'react-i18next'
 import { useAppShellContext } from '@/context/AppShellContext'
 import { sessionMetaMapAtom, updateSessionMetaAtom, type SessionMeta } from '@/atoms/sessions'
 import { projectsAtom } from '@/atoms/projects'
-import { kanbanProjectFilterAtom, kanbanColumnStatusAtom, kanbanEditorTargetAtom } from '@/atoms/kanban'
+import { kanbanProjectFilterAtom, kanbanColumnStatusAtom, kanbanEditorTargetAtom, kanbanBoardModeAtom } from '@/atoms/kanban'
 import { useNavigation } from '@/contexts/NavigationContext'
 import { useProjectColorTreatment } from '@/hooks/useProjectColorTreatment'
 import { useLabels } from '@/hooks/useLabels'
@@ -20,6 +20,7 @@ import type { KanbanColumnDef } from '@craft-agent/shared/projects/types'
 import { KanbanBoard } from './KanbanBoard'
 import { KANBAN_COLUMNS, statusToColumn } from './status-column'
 import { BoardListToggle } from './BoardListToggle'
+import { SymphonyBoard } from './SymphonyBoard'
 import { KanbanProjectFilter, type KanbanProjectFilterOption } from './KanbanProjectFilter'
 import { TaskEditor } from './TaskEditor'
 import { mergeSubtaskRows, type SpecNodeSummary, type SubtaskChildRow } from './subtask-merge'
@@ -133,6 +134,27 @@ export function KanbanBoardContainer() {
   // navigate here — the overlay is already open when the board mounts. Declared before the
   // spec fetch below, which refetches when the editor closes (a save may have changed specs).
   const [editorTarget, setEditorTarget] = useAtom(kanbanEditorTargetAtom)
+
+  // Symphony board mode. The toggle appears only when the workspace's server
+  // reports at least one configured Symphony (v4) project; polling once per
+  // mount is enough — configuration changes require a server restart anyway.
+  const [boardMode, setBoardMode] = useAtom(kanbanBoardModeAtom)
+  const [symphonyAvailable, setSymphonyAvailable] = React.useState(false)
+  React.useEffect(() => {
+    let cancelled = false
+    window.electronAPI.symphony
+      .status()
+      .then(status => {
+        if (!cancelled) setSymphonyAvailable((status.projects?.length ?? 0) > 0)
+      })
+      .catch(() => {
+        if (!cancelled) setSymphonyAvailable(false)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [activeWorkspaceId])
+  const showSymphony = symphonyAvailable && boardMode === 'symphony'
 
   const statusesById = React.useMemo(() => {
     const map = new Map<string, SessionStatus>()
@@ -560,11 +582,29 @@ export function KanbanBoardContainer() {
     <div className="flex h-full flex-col bg-background">
       <div className="flex items-center justify-between gap-2 border-b border-border/50 px-4 py-2.5">
         <div className="flex min-w-0 items-center gap-2.5">
-          <span className="text-sm font-medium">{t('kanban.allTasks')}</span>
-          {projectOptions.length > 0 && (
+          <span className="text-sm font-medium">
+            {showSymphony ? t('kanban.symphony.title') : t('kanban.allTasks')}
+          </span>
+          {symphonyAvailable && (
+            <div className="flex items-center rounded-lg border border-border bg-card p-0.5">
+              {(['tasks', 'symphony'] as const).map(mode => (
+                <button
+                  key={mode}
+                  type="button"
+                  onClick={() => setBoardMode(mode)}
+                  className={`rounded-md px-2 py-0.5 text-[11.5px] font-medium transition-colors ${
+                    boardMode === mode ? 'bg-foreground/[0.08] text-foreground' : 'text-foreground/50 hover:text-foreground'
+                  }`}
+                >
+                  {t(mode === 'tasks' ? 'kanban.symphony.tasksMode' : 'kanban.symphony.symphonyMode')}
+                </button>
+              ))}
+            </div>
+          )}
+          {!showSymphony && projectOptions.length > 0 && (
             <KanbanProjectFilter projects={projectOptions} value={projectFilter} onChange={setProjectFilter} />
           )}
-          {usingProjectColumns && editingProject && (
+          {!showSymphony && usingProjectColumns && editingProject && (
             <span className="truncate text-[11px] text-foreground/45">
               {t('kanban.column.columnsFrom', { project: editingProject.config.name })}
             </span>
@@ -588,6 +628,9 @@ export function KanbanBoardContainer() {
         </div>
       </div>
       <div className="min-h-0 flex-1">
+        {showSymphony ? (
+          <SymphonyBoard />
+        ) : (
         <KanbanBoard
           columns={activeColumns}
           tasks={visibleTasks}
@@ -617,6 +660,7 @@ export function KanbanBoardContainer() {
               }
             : {})}
         />
+        )}
       </div>
     </div>
   )

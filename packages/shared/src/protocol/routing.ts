@@ -215,6 +215,14 @@ export const LOCAL_ONLY_CHANNELS = new Set<string>([
 // ---------------------------------------------------------------------------
 
 export const REMOTE_ELIGIBLE_CHANNELS = new Set<string>([
+  // symphony — native v4 service on whichever server owns the workspace
+  RPC_CHANNELS.symphony.VALIDATE,
+  RPC_CHANNELS.symphony.SHADOW,
+  RPC_CHANNELS.symphony.PROJECT_DESK,
+  RPC_CHANNELS.symphony.TICK,
+  RPC_CHANNELS.symphony.STATUS,
+  RPC_CHANNELS.symphony.STOP,
+
   // server — server-level operations (no workspace context needed)
   RPC_CHANNELS.server.GET_WORKSPACES,
   RPC_CHANNELS.server.CREATE_WORKSPACE,
