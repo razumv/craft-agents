@@ -51,6 +51,9 @@ export default function ProjectInfoPage({ projectSlug }: ProjectInfoPageProps) {
   const [editWorkingDir, setEditWorkingDir] = useState('')
   const [editDetails, setEditDetails] = useState('')
   const [editColor, setEditColor] = useState<string>('')
+  const [editGithubRepos, setEditGithubRepos] = useState('')
+  const [editGithubProjectUrl, setEditGithubProjectUrl] = useState('')
+  const [editGithubView, setEditGithubView] = useState('')
   const [saving, setSaving] = useState(false)
 
   // Load project (and re-load on broadcast)
@@ -72,6 +75,9 @@ export default function ProjectInfoPage({ projectSlug }: ProjectInfoPageProps) {
       setEditWorkingDir(loaded.config.workingDirectory ?? '')
       setEditDetails(loaded.config.details ?? '')
       setEditColor(loaded.config.color ?? '')
+      setEditGithubRepos((loaded.config.github?.repositories ?? []).join('\n'))
+      setEditGithubProjectUrl(loaded.config.github?.projectUrl ?? '')
+      setEditGithubView(loaded.config.github?.projectView ?? '')
     } catch (err) {
       console.error('[ProjectInfoPage] Failed to load project:', err)
       setError(err instanceof Error ? err.message : String(err))
@@ -146,6 +152,15 @@ export default function ProjectInfoPage({ projectSlug }: ProjectInfoPageProps) {
 
   const handleSaveSettings = useCallback(async () => {
     if (!workspaceId || !project) return
+    const repositories = editGithubRepos
+      .split(/[\n,]/)
+      .map((line) => line.trim())
+      .filter(Boolean)
+    const invalidRepo = repositories.find((repo) => !/^[\w.-]+\/[\w.-]+$/.test(repo))
+    if (invalidRepo) {
+      toast.error(t('projectInfo.githubRepoInvalid', { repo: invalidRepo }))
+      return
+    }
     setSaving(true)
     try {
       await window.electronAPI.updateProject(workspaceId, project.config.slug, {
@@ -154,6 +169,13 @@ export default function ProjectInfoPage({ projectSlug }: ProjectInfoPageProps) {
         workingDirectory: editWorkingDir.trim() || undefined,
         details: editDetails.trim() || undefined,
         color: editColor.trim() || undefined,
+        github: repositories.length || editGithubProjectUrl.trim() || editGithubView.trim()
+          ? {
+              repositories,
+              projectUrl: editGithubProjectUrl.trim() || undefined,
+              projectView: editGithubView.trim() || undefined,
+            }
+          : undefined,
       })
       toast.success(t('projectInfo.saved'))
     } catch (err) {
@@ -162,7 +184,7 @@ export default function ProjectInfoPage({ projectSlug }: ProjectInfoPageProps) {
     } finally {
       setSaving(false)
     }
-  }, [workspaceId, project, editName, editDescription, editWorkingDir, editDetails, editColor, t])
+  }, [workspaceId, project, editName, editDescription, editWorkingDir, editDetails, editColor, editGithubRepos, editGithubProjectUrl, editGithubView, t])
 
   const handleDeleteProject = useCallback(async () => {
     if (!workspaceId || !project) return
@@ -361,6 +383,34 @@ export default function ProjectInfoPage({ projectSlug }: ProjectInfoPageProps) {
                     onClear={() => setEditColor('')}
                     clearLabel={t('projectInfo.colorClear')}
                     customAriaLabel={t('projectInfo.colorCustom')}
+                  />
+                </Field>
+                <Field
+                  label={t('projectInfo.githubRepositories')}
+                  hint={t('projectInfo.githubRepositoriesHint')}
+                >
+                  <Textarea
+                    value={editGithubRepos}
+                    onChange={(e) => setEditGithubRepos(e.target.value)}
+                    rows={3}
+                    placeholder={'owner/repo\nowner/other-repo'}
+                  />
+                </Field>
+                <Field
+                  label={t('projectInfo.githubProjectUrl')}
+                  hint={t('projectInfo.githubProjectUrlHint')}
+                >
+                  <Input
+                    value={editGithubProjectUrl}
+                    onChange={(e) => setEditGithubProjectUrl(e.target.value)}
+                    placeholder="https://github.com/users/razumv/projects/1"
+                  />
+                </Field>
+                <Field label={t('projectInfo.githubProjectView')} hint={t('projectInfo.githubProjectViewHint')}>
+                  <Input
+                    value={editGithubView}
+                    onChange={(e) => setEditGithubView(e.target.value)}
+                    placeholder={t('projectInfo.githubProjectViewPlaceholder')}
                   />
                 </Field>
                 <Field

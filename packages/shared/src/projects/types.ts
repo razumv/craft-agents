@@ -30,6 +30,21 @@ export interface KanbanColumnDef {
 }
 
 /**
+ * GitHub binding: where this project's work lives. One Craft project usually
+ * maps to one repository + one GitHub Project, but several repositories may
+ * share one Project (e.g. Lineage: gve/client/server track work on a single
+ * shared Project, distinguished by view).
+ */
+export interface ProjectGitHubBinding {
+  /** owner/name repositories this project works in. */
+  repositories: string[];
+  /** GitHub Project (v2) URL its issues are tracked on. */
+  projectUrl?: string;
+  /** Optional Project view (name or number) selecting this project's slice of a shared Project. */
+  projectView?: string;
+}
+
+/**
  * Main project configuration (stored in config.json)
  */
 export interface ProjectConfig {
@@ -52,6 +67,8 @@ export interface ProjectConfig {
   archivedAt?: number;
   /** Per-project Kanban columns. Absent → the board uses the default 3 columns. */
   kanbanColumns?: KanbanColumnDef[];
+  /** GitHub repositories/Project this project's work lives in. */
+  github?: ProjectGitHubBinding;
 }
 
 /**
