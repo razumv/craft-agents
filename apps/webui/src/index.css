@@ -76,6 +76,18 @@ html, body {
   html, body { background: #FFFFFF; }
 }
 
+/* #root already pads the safe-area top for everything in normal flow, but:
+ * - the shared renderer's navigator adds its own env() top padding → the
+ *   inset applied twice produced a huge gap; neutralize it here (webui only).
+ * - the TopBar is position:fixed (viewport coordinates), so #root padding
+ *   can't move it; shift it below the status bar / Dynamic Island itself. */
+[data-panel-role="navigator"] {
+  padding-top: 0 !important;
+}
+.titlebar-drag-region {
+  top: env(safe-area-inset-top, 0px);
+}
+
 /* ~115% readability bump on phones via rem scaling (NOT zoom — see above). */
 @media (max-width: 768px) {
   html {
