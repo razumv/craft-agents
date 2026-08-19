@@ -218,13 +218,31 @@ async function sendGateCommand(
   toast.success(t('kanban.symphony.gateSent'), { description: command })
 }
 
+/** GitHub issue URL derived from the identifier (owner/repo#N) — keeps the tile clickable without server round-trips. */
+function issueUrlFor(tile: SymphonyTile): string | null {
+  const match = /^([\w.-]+\/[\w.-]+)#(\d+)$/.exec(tile.issueIdentifier)
+  return match ? `https://github.com/${match[1]}/issues/${match[2]}` : null
+}
+
 function SymphonyTileCard({ tile, onSendMessage }: { tile: SymphonyTile; onSendMessage?: (sessionId: string, message: string) => void }) {
   const { t } = useTranslation()
   const canSend = !!(tile.ownerSessionId && onSendMessage)
+  const issueUrl = issueUrlFor(tile)
   return (
     <div className="rounded-lg border border-border bg-card p-2.5 text-[12px] leading-snug shadow-sm">
       <div className="flex items-center justify-between gap-2">
-        <span className="font-semibold text-foreground">{tile.issueIdentifier}</span>
+        {issueUrl ? (
+          <button
+            type="button"
+            onClick={() => window.electronAPI.openUrl(issueUrl)}
+            className="truncate text-left font-semibold text-foreground hover:underline"
+            title={issueUrl}
+          >
+            {tile.issueIdentifier}
+          </button>
+        ) : (
+          <span className="font-semibold text-foreground">{tile.issueIdentifier}</span>
+        )}
         <span className="shrink-0 rounded-md bg-foreground/[0.06] px-1.5 py-0.5 text-[10.5px] font-medium text-foreground/70">
           {tile.state}
         </span>
