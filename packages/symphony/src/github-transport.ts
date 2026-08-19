@@ -206,6 +206,27 @@ export class GhCliTransport implements GitHubTransport {
     await this.graphql(`mutation ProjectText($project:ID!,$item:ID!,$field:ID!,$value:String!){updateProjectV2ItemFieldValue(input:{projectId:$project,itemId:$item,fieldId:$field,value:{text:$value}}){projectV2Item{id}}}`, { project: projectId, item: itemId, field: fieldId, value });
   }
 
+  /** Create a repository issue with labels (work intake; not part of GitHubTransport). */
+  async createIssue(repository: string, title: string, body: string, labels: readonly string[]): Promise<{ id: string; number: number; url: string }> {
+    const [owner, name] = splitRepository(repository);
+    const output = await this.run([
+      "api", `repos/${owner}/${name}/issues`, "--method", "POST",
+      "-f", `title=${title}`, "-f", `body=${body}`,
+      ...labels.flatMap((label) => ["-f", `labels[]=${label}`]),
+    ]);
+    const parsed = JSON.parse(output) as { node_id: string; number: number; html_url: string };
+    return { id: parsed.node_id, number: parsed.number, url: parsed.html_url };
+  }
+
+  /** Add an issue to a Project (v2); returns the item id (work intake helper). */
+  async addIssueToProject(projectId: string, contentId: string): Promise<string> {
+    const data = await this.graphql<{ addProjectV2ItemById: { item: { id: string } } }>(
+      `mutation AddItem($project:ID!,$content:ID!){addProjectV2ItemById(input:{projectId:$project,contentId:$content}){item{id}}}`,
+      { project: projectId, content: contentId },
+    );
+    return data.addProjectV2ItemById.item.id;
+  }
+
   /** Resolve a Project (v2) URL to node id + Status/Gate field ids (config generation). */
   async resolveProject(projectUrl: string): Promise<{ projectId: string; statusFieldId: string | null; gateFieldId: string | null }> {
     const match = /^https:\/\/github\.com\/(users|orgs)\/([\w.-]+)\/projects\/(\d+)/.exec(projectUrl);

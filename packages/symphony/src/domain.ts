@@ -179,6 +179,12 @@ export interface ProjectStatus {
   issueIdentifier: string;
   objective: string;
   state: LifecycleState;
+  /** Current attempt (from durable claim or retry metadata); null before the first claim. */
+  attempt: number | null;
+  /** When the next bounded retry becomes due; only set in retry-wait. */
+  retryDueAtMs: number | null;
+  /** Most recent material (non-heartbeat) ledger events, oldest first, capped. */
+  recentEvents: MaterialEvent[];
   branchUrl: string | null;
   prUrl: string | null;
   deploymentUrl: string | null;

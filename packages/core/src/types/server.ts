@@ -56,7 +56,7 @@ export interface ServerHealth {
 // ---------------------------------------------------------------------------
 
 export type SymphonyServicePhase = 'disabled' | 'reconstructing' | 'ready' | 'stopping' | 'stopped' | 'error'
-export type SymphonyOperation = 'validate' | 'shadow' | 'desk' | 'tick' | 'refresh' | 'reconstruct'
+export type SymphonyOperation = 'validate' | 'shadow' | 'desk' | 'tick' | 'refresh' | 'create-issue' | 'reconstruct'
 
 export interface SymphonyProjectServiceStatus {
   projectId: string
@@ -114,6 +114,10 @@ export interface SymphonyServiceControl {
   projectDesk(projectId: string): Promise<SymphonyOperationResult>
   /** Read-only re-read of the runner's full durable status (updates the cached snapshot). */
   refresh(projectId: string): Promise<SymphonyOperationResult>
+  /** Owner work intake: create a machine-readable contract issue in the project's repository. */
+  createIssue(projectId: string, input: unknown): Promise<SymphonyOperationResult>
+  /** Subscribe to operation-completion events (for live board updates). Returns unsubscribe. */
+  subscribe?(listener: (projectId: string, operation: SymphonyOperation) => void): () => void
   tick(projectId: string): Promise<SymphonyOperationResult>
   status(): SymphonyServiceStatus
   stop(timeoutMs?: number): Promise<SymphonyStopResult>

@@ -642,6 +642,10 @@ export interface ElectronAPI {
     status(): Promise<import('@craft-agent/core/types').SymphonyServiceStatus>
     projectDesk(projectId: string): Promise<import('@craft-agent/core/types').SymphonyOperationResult>
     refresh(projectId: string): Promise<import('@craft-agent/core/types').SymphonyOperationResult>
+    createIssue(projectId: string, input: {
+      title: string; goal: string; risk: 'low' | 'medium' | 'high'; acceptance: string[]; nonGoals: string[]
+    }): Promise<import('@craft-agent/core/types').SymphonyOperationResult>
+    onChanged(callback: (event: { projectId: string; operation: string }) => void): () => void
     generateConfig(workspaceId: string, projectSlug: string): Promise<{
       projectSlug: string
       drafts: { repository: string; path: string; warnings: string[] }[]

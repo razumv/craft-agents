@@ -3,7 +3,7 @@ import { join } from 'node:path'
 import { mkdir, writeFile } from 'node:fs/promises'
 import { RPC_CHANNELS } from '@craft-agent/shared/protocol'
 import { getWorkspaceByNameOrId } from '@craft-agent/shared/config'
-import type { RpcServer } from '@craft-agent/server-core/transport'
+import { pushTyped, type RpcServer } from '@craft-agent/server-core/transport'
 import type { HandlerDeps } from '../handler-deps'
 
 export const HANDLED_CHANNELS = [
@@ -15,6 +15,7 @@ export const HANDLED_CHANNELS = [
   RPC_CHANNELS.symphony.STOP,
   RPC_CHANNELS.symphony.GENERATE_CONFIG,
   RPC_CHANNELS.symphony.REFRESH,
+  RPC_CHANNELS.symphony.CREATE_ISSUE,
 ] as const
 
 function projectId(value: unknown): string {
@@ -30,6 +31,13 @@ export function registerSymphonyHandlers(server: RpcServer, deps: HandlerDeps): 
   server.handle(RPC_CHANNELS.symphony.SHADOW, async (_ctx, id: unknown) => service.shadow(projectId(id)))
   server.handle(RPC_CHANNELS.symphony.PROJECT_DESK, async (_ctx, id: unknown) => service.projectDesk(projectId(id)))
   server.handle(RPC_CHANNELS.symphony.REFRESH, async (_ctx, id: unknown) => service.refresh(projectId(id)))
+  server.handle(RPC_CHANNELS.symphony.CREATE_ISSUE, async (_ctx, id: unknown, input: unknown) => service.createIssue(projectId(id), input))
+
+  // Live board updates: broadcast after every completed operation (tick, loop
+  // shadow cycles, refresh, intake) so open boards re-read status themselves.
+  service.subscribe?.((changedProjectId, operation) => {
+    pushTyped(server, RPC_CHANNELS.symphony.CHANGED, { to: 'all' }, { projectId: changedProjectId, operation })
+  })
   server.handle(RPC_CHANNELS.symphony.TICK, async (_ctx, id: unknown) => service.tick(projectId(id)))
   server.handle(RPC_CHANNELS.symphony.STATUS, async () => service.status())
   // Generate discovery runner-config DRAFTS from a Craft project's GitHub

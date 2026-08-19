@@ -1,5 +1,5 @@
 import * as React from 'react'
-import { Check, Copy, ExternalLink, RefreshCw, X } from 'lucide-react'
+import { Check, Copy, ExternalLink, Plus, RefreshCw, X } from 'lucide-react'
 import { toast } from 'sonner'
 import { useTranslation } from 'react-i18next'
 
@@ -14,6 +14,14 @@ import { useTranslation } from 'react-i18next'
  */
 
 /** Mirrors @craft-agent/symphony ProjectStatus, defensively (snapshot is `unknown` over RPC). */
+interface SymphonyLoopInfo {
+  enabled: boolean
+  mode: string
+  cycles: number
+  lastCycleAt: number | null
+  droppedProjects: string[]
+}
+
 interface SymphonyTile {
   projectId: string
   /** Craft project the Symphony project is bound to (for the board's project filter). */
@@ -29,6 +37,9 @@ interface SymphonyTile {
   nextCompletionPoint: string | null
   ownerGate: { id: string; approveCommand: string; rejectCommand: string } | null
   lastEvent: string | null
+  attempt: number | null
+  retryDueAtMs: number | null
+  recentEvents: { sequence: number; atMs: number; state: string; message: string }[]
   error: string | null
 }
 
@@ -85,6 +96,11 @@ function tileFromStatus(projectId: string, status: Record<string, unknown>, owne
         }
       : null,
     lastEvent: event ? (asString(event.message) ?? null) : null,
+    attempt: typeof status.attempt === 'number' ? status.attempt : null,
+    retryDueAtMs: typeof status.retryDueAtMs === 'number' ? status.retryDueAtMs : null,
+    recentEvents: Array.isArray(status.recentEvents)
+      ? (status.recentEvents as SymphonyTile['recentEvents']).slice(-5)
+      : [],
     error: null,
   }
 }
@@ -114,6 +130,9 @@ function tileFromDesk(projectId: string, desk: Record<string, unknown>, ownerSes
         }
       : null,
     lastEvent: event ? (asString(event.message) ?? null) : null,
+    attempt: null,
+    retryDueAtMs: null,
+    recentEvents: [],
     error: null,
   }
 }
@@ -132,6 +151,9 @@ function errorTile(projectId: string, error: string): SymphonyTile {
     nextCompletionPoint: null,
     ownerGate: null,
     lastEvent: null,
+    attempt: null,
+    retryDueAtMs: null,
+    recentEvents: [],
     error,
   }
 }
@@ -215,6 +237,30 @@ function SymphonyTileCard({ tile, onSendMessage }: { tile: SymphonyTile; onSendM
         </p>
       )}
       {tile.lastEvent && <p className="mt-1 truncate text-[11px] text-foreground/50">{tile.lastEvent}</p>}
+      {tile.state === 'retry-wait' && tile.attempt !== null && (
+        <p className="mt-1 text-[11px] font-medium text-amber-600">
+          {t('kanban.symphony.retryAttempt', {
+            attempt: tile.attempt,
+            time: tile.retryDueAtMs ? new Date(tile.retryDueAtMs).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '—',
+          })}
+        </p>
+      )}
+      {tile.recentEvents.length > 0 && (
+        <details className="mt-1">
+          <summary className="cursor-pointer text-[10.5px] text-foreground/40">
+            {t('kanban.symphony.history', { count: tile.recentEvents.length })}
+          </summary>
+          <ul className="mt-1 space-y-0.5">
+            {tile.recentEvents.map(event => (
+              <li key={event.sequence} className="text-[10.5px] text-foreground/55">
+                <span className="font-mono">#{event.sequence}</span>{' '}
+                {new Date(event.atMs).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}{' '}
+                [{event.state}] {event.message}
+              </li>
+            ))}
+          </ul>
+        </details>
+      )}
       {tile.ownerGate?.id && (
         <div className="mt-1.5 rounded-md bg-foreground/[0.04] px-1.5 py-1">
           <div className="truncate font-mono text-[10.5px] text-foreground/70">{tile.ownerGate.id}</div>
@@ -278,18 +324,54 @@ function SymphonyTileCard({ tile, onSendMessage }: { tile: SymphonyTile; onSendM
 export function SymphonyBoard({ onSendMessage, projectFilter = [] }: { onSendMessage?: (sessionId: string, message: string) => void; projectFilter?: string[] } = {}) {
   const { t } = useTranslation()
   const [tiles, setTiles] = React.useState<SymphonyTile[] | null>(null)
+  const [loopInfo, setLoopInfo] = React.useState<SymphonyLoopInfo | null>(null)
   const [error, setError] = React.useState<string | null>(null)
   const [refreshing, setRefreshing] = React.useState(false)
+  const [composerOpen, setComposerOpen] = React.useState(false)
+  const [creating, setCreating] = React.useState(false)
+  const [draft, setDraft] = React.useState({ projectId: '', title: '', goal: '', risk: 'low' as 'low' | 'medium' | 'high', acceptance: '', nonGoals: '' })
 
   const loadFromStatus = React.useCallback(async () => {
     try {
       const status = await window.electronAPI.symphony.status()
       setTiles(tilesFromServiceStatus(status as unknown as { projects: Array<Record<string, unknown>> }))
+      setLoopInfo((status as unknown as { loop: SymphonyLoopInfo | null }).loop ?? null)
       setError(null)
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
     }
   }, [])
+
+  // Live updates: the server broadcasts after every completed operation
+  // (tick, loop shadow cycle, refresh, issue intake) — re-read status then.
+  React.useEffect(() => {
+    const off = window.electronAPI.symphony.onChanged?.(() => { void loadFromStatus() })
+    return () => { if (typeof off === 'function') off() }
+  }, [loadFromStatus])
+
+  const handleCreateIssue = React.useCallback(async () => {
+    if (creating) return
+    const projectId = draft.projectId || (tiles?.[0]?.projectId ?? '')
+    if (!projectId || !draft.title.trim() || !draft.goal.trim() || !draft.acceptance.trim()) return
+    setCreating(true)
+    try {
+      await window.electronAPI.symphony.createIssue(projectId, {
+        title: draft.title.trim(),
+        goal: draft.goal.trim(),
+        risk: draft.risk,
+        acceptance: draft.acceptance.split('\n').map(l => l.trim()).filter(Boolean),
+        nonGoals: draft.nonGoals.split('\n').map(l => l.trim()).filter(Boolean),
+      })
+      toast.success(t('kanban.symphony.issueCreated'))
+      setComposerOpen(false)
+      setDraft(d => ({ ...d, title: '', goal: '', acceptance: '', nonGoals: '' }))
+      await loadFromStatus()
+    } catch (err) {
+      toast.error(t('kanban.symphony.issueCreateFailed'), { description: err instanceof Error ? err.message : String(err) })
+    } finally {
+      setCreating(false)
+    }
+  }, [creating, draft, tiles, loadFromStatus, t])
 
   React.useEffect(() => {
     void loadFromStatus()
@@ -330,7 +412,33 @@ export function SymphonyBoard({ onSendMessage, projectFilter = [] }: { onSendMes
 
   return (
     <div className="flex h-full flex-col">
-      <div className="flex items-center justify-end border-b border-border/50 px-4 py-1.5">
+      <div className="flex items-center justify-between border-b border-border/50 px-4 py-1.5">
+        <div className="flex items-center gap-2">
+          {loopInfo && (
+            <span
+              className={`inline-flex items-center gap-1.5 rounded-md px-2 py-0.5 text-[10.5px] font-medium ${loopInfo.enabled ? 'bg-emerald-500/10 text-emerald-600' : 'bg-foreground/[0.05] text-foreground/50'}`}
+              title={loopInfo.droppedProjects.length ? `dropped: ${loopInfo.droppedProjects.join(', ')}` : undefined}
+            >
+              <span className={`h-1.5 w-1.5 rounded-full ${loopInfo.enabled ? 'bg-emerald-500 animate-pulse' : 'bg-foreground/30'}`} />
+              {t('kanban.symphony.loopChip', {
+                mode: loopInfo.mode,
+                cycles: loopInfo.cycles,
+                last: loopInfo.lastCycleAt ? new Date(loopInfo.lastCycleAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '—',
+              })}
+              {loopInfo.droppedProjects.length > 0 && (
+                <span className="text-red-500">⚠ {loopInfo.droppedProjects.length}</span>
+              )}
+            </span>
+          )}
+        </div>
+        <div className="flex items-center gap-2">
+        <button
+          type="button"
+          onClick={() => setComposerOpen(open => !open)}
+          className="inline-flex h-7 items-center gap-1.5 rounded-lg border border-border bg-card px-2 text-[11.5px] font-medium text-foreground transition-colors hover:bg-foreground/[0.03]"
+        >
+          <Plus className="h-3 w-3" /> {t('kanban.symphony.newIssue')}
+        </button>
         <button
           type="button"
           onClick={() => void handleRefresh()}
@@ -340,7 +448,59 @@ export function SymphonyBoard({ onSendMessage, projectFilter = [] }: { onSendMes
           <RefreshCw className={`h-3 w-3 ${refreshing ? 'animate-spin' : ''}`} />
           {t('kanban.symphony.refresh')}
         </button>
+        </div>
       </div>
+      {composerOpen && (
+        <div className="space-y-2 border-b border-border/50 bg-foreground/[0.02] px-4 py-3 text-[12px]">
+          <div className="flex gap-2">
+            <input
+              className="h-8 flex-1 rounded-lg border border-border bg-card px-2"
+              placeholder={t('kanban.symphony.issueTitle')}
+              value={draft.title}
+              onChange={e => setDraft(d => ({ ...d, title: e.target.value }))}
+            />
+            <select
+              className="h-8 rounded-lg border border-border bg-card px-2"
+              value={draft.risk}
+              onChange={e => setDraft(d => ({ ...d, risk: e.target.value as typeof d.risk }))}
+            >
+              <option value="low">low</option>
+              <option value="medium">medium</option>
+              <option value="high">high</option>
+            </select>
+          </div>
+          <input
+            className="h-8 w-full rounded-lg border border-border bg-card px-2"
+            placeholder={t('kanban.symphony.issueGoal')}
+            value={draft.goal}
+            onChange={e => setDraft(d => ({ ...d, goal: e.target.value }))}
+          />
+          <textarea
+            className="w-full rounded-lg border border-border bg-card px-2 py-1.5"
+            rows={3}
+            placeholder={t('kanban.symphony.issueAcceptance')}
+            value={draft.acceptance}
+            onChange={e => setDraft(d => ({ ...d, acceptance: e.target.value }))}
+          />
+          <textarea
+            className="w-full rounded-lg border border-border bg-card px-2 py-1.5"
+            rows={2}
+            placeholder={t('kanban.symphony.issueNonGoals')}
+            value={draft.nonGoals}
+            onChange={e => setDraft(d => ({ ...d, nonGoals: e.target.value }))}
+          />
+          <div className="flex justify-end">
+            <button
+              type="button"
+              disabled={creating || !draft.title.trim() || !draft.goal.trim() || !draft.acceptance.trim()}
+              onClick={() => void handleCreateIssue()}
+              className="inline-flex h-7 items-center rounded-lg bg-foreground px-3 text-[11.5px] font-semibold text-background disabled:opacity-40"
+            >
+              {creating ? '…' : t('kanban.symphony.issueCreate')}
+            </button>
+          </div>
+        </div>
+      )}
       <div className="min-h-0 flex-1 overflow-x-auto snap-x snap-mandatory md:snap-none">
         <div className="flex h-full min-w-max gap-3 p-4">
           {SYMPHONY_COLUMNS.map(column => {

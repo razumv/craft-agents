@@ -26,8 +26,11 @@ function isHeartbeat(event: TrackerIssueSnapshot["events"][number]): boolean {
   return /^attempt \d+ heartbeat$/i.test(event.message.trim());
 }
 
+const RECENT_EVENT_LIMIT = 5;
+
 export function projectStatus(snapshot: TrackerIssueSnapshot): ProjectStatus {
-  const lastMaterialEvent = [...snapshot.events].reverse().find((event) => !isHeartbeat(event)) ?? null;
+  const material = snapshot.events.filter((event) => !isHeartbeat(event));
+  const lastMaterialEvent = material[material.length - 1] ?? null;
   const ownerGateId = snapshot.evidence.ownerGateId ?? null;
   return {
     projectId: snapshot.contract.projectId,
@@ -35,6 +38,9 @@ export function projectStatus(snapshot: TrackerIssueSnapshot): ProjectStatus {
     issueIdentifier: snapshot.issue.identifier,
     objective: snapshot.contract.goal,
     state: snapshot.issue.state,
+    attempt: snapshot.claim?.attempt ?? snapshot.retry?.attempt ?? null,
+    retryDueAtMs: snapshot.issue.state === "retry-wait" ? snapshot.retry?.dueAtMs ?? null : null,
+    recentEvents: material.slice(-RECENT_EVENT_LIMIT).map((event) => ({ ...event })),
     branchUrl: snapshot.evidence.branchUrl ?? null,
     prUrl: snapshot.evidence.prUrl ?? null,
     deploymentUrl: snapshot.evidence.deploymentUrl ?? null,

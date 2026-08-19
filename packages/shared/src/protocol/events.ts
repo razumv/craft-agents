@@ -24,6 +24,7 @@ export interface BroadcastEventMap {
   [RPC_CHANNELS.sessions.FILES_CHANGED]: [sessionId: string]
 
   // Domain change broadcasts (global via broadcastToAll)
+  [RPC_CHANNELS.symphony.CHANGED]: [event: { projectId: string; operation: string }]
   [RPC_CHANNELS.sources.CHANGED]: [workspaceId: string, sources: LoadedSource[]]
   [RPC_CHANNELS.labels.CHANGED]: [workspaceId: string]
   [RPC_CHANNELS.statuses.CHANGED]: [workspaceId: string]

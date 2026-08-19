@@ -30,6 +30,7 @@ describe('Symphony RPC handlers', () => {
       async shadow(id) { calls.push(['shadow', id]); return { projectId: id, operation: 'shadow', completedAt: 2, result: {} } },
       async projectDesk(id) { calls.push(['desk', id]); return { projectId: id, operation: 'desk', completedAt: 3, result: {} } },
       async refresh(id) { calls.push(['refresh', id]); return { projectId: id, operation: 'refresh', completedAt: 5, result: {} } },
+      async createIssue(id, input) { calls.push(['create-issue', id, input]); return { projectId: id, operation: 'create-issue', completedAt: 6, result: {} } },
       async tick(id) { calls.push(['tick', id]); return { projectId: id, operation: 'tick', completedAt: 4, result: {} } },
       status() { calls.push(['status']); return { phase: 'ready', enabled: false, acceptingOperations: true, configPath: '/tmp/config.json', stopTimeoutMs: 100, activeOperations: 0, projects: [], loop: null } },
       async stop(timeoutMs) { calls.push(['stop', timeoutMs]); return { drained: true, timeoutMs: timeoutMs ?? 100, activeOperations: 0, phase: 'stopped' } },
@@ -40,6 +41,7 @@ describe('Symphony RPC handlers', () => {
     expect([...rpc.handlers.keys()].sort()).toEqual([
       RPC_CHANNELS.symphony.SHADOW,
       RPC_CHANNELS.symphony.PROJECT_DESK,
+      RPC_CHANNELS.symphony.CREATE_ISSUE,
       RPC_CHANNELS.symphony.GENERATE_CONFIG,
       RPC_CHANNELS.symphony.REFRESH,
       RPC_CHANNELS.symphony.STATUS,

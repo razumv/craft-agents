@@ -46,6 +46,7 @@ export interface SymphonyServerConfig {
 
 export interface SymphonyRunnerLike {
   preflight(): Promise<unknown>
+  createContractIssue?(input: unknown): Promise<unknown>
   readStatus(): Promise<LiveRunnerStatus | unknown>
   projectDesk(): Promise<unknown>
   shadow(): Promise<unknown>
@@ -138,6 +139,7 @@ export class NativeSymphonyService implements SymphonyServiceControl {
   #loopCycleActive = false
   readonly #loopErrors = new Map<string, number>()
   readonly #loopDropped = new Set<string>()
+  readonly #listeners = new Set<(projectId: string, operation: SymphonyOperationResult['operation']) => void>()
 
   constructor(
     readonly config: SymphonyServerConfig,
@@ -283,6 +285,27 @@ export class NativeSymphonyService implements SymphonyServiceControl {
     return this.#operate(projectId, 'refresh', async (runner) => runner.readStatus())
   }
 
+  /** Owner work intake: create a contract issue, then re-read status so the board updates. */
+  createIssue(projectId: string, input: unknown): Promise<SymphonyOperationResult> {
+    return this.#operate(projectId, 'create-issue', async (runner) => {
+      if (!runner.createContractIssue) throw new Error('this Symphony runner does not support issue intake')
+      const created = await runner.createContractIssue(input)
+      const status = await runner.readStatus()
+      return { created, ...(status as Record<string, unknown>) }
+    })
+  }
+
+  subscribe(listener: (projectId: string, operation: SymphonyOperationResult['operation']) => void): () => void {
+    this.#listeners.add(listener)
+    return () => this.#listeners.delete(listener)
+  }
+
+  #notify(projectId: string, operation: SymphonyOperationResult['operation']): void {
+    for (const listener of this.#listeners) {
+      try { listener(projectId, operation) } catch { /* listeners must not break operations */ }
+    }
+  }
+
   async tick(projectId: string): Promise<SymphonyOperationResult> {
     if (!this.config.enabled) {
       throw new Error('Symphony live tick is disabled; set enabled=true in the explicit server config')
@@ -319,6 +342,7 @@ export class NativeSymphonyService implements SymphonyServiceControl {
           lastError: null,
           snapshot: result,
         }
+        this.#notify(projectId, operation)
         return { projectId, operation, completedAt, result }
       } catch (error) {
         runtime.status = {
