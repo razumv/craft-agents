@@ -256,3 +256,30 @@ describe('NativeSymphonyService autonomous loop', () => {
     expect(service.status().loop!.cycles).toBe(cyclesAtStop)
   })
 })
+
+
+describe("snapshot integrity", () => {
+  it("shadow/desk/validate never clobber the board snapshot; refresh/tick do", async () => {
+    const path = await runnerConfigPath()
+    const runner: SymphonyRunnerLike = {
+      async preflight() { return { valid: true } },
+      async readStatus() { return { statuses: [{ issueIdentifier: "r/x#1" }] } },
+      async projectDesk() { return { compact: "desk" } },
+      async shadow() { return { writes: 0, receiptHash: "c".repeat(64) } },
+      async tick() { return { statuses: [{ issueIdentifier: "r/x#1" }], ticked: true } },
+    }
+    const service = new NativeSymphonyService(config(path), path, async () => runner)
+    await service.start()
+    const initial = service.status().projects[0]!.snapshot
+    expect(initial).toMatchObject({ statuses: [{ issueIdentifier: "r/x#1" }] })
+
+    await service.shadow("alpha")
+    await service.projectDesk("alpha")
+    await service.validate("alpha")
+    expect(service.status().projects[0]!.snapshot).toEqual(initial)
+
+    await service.refresh("alpha")
+    expect(service.status().projects[0]!.snapshot).toMatchObject({ statuses: [{ issueIdentifier: "r/x#1" }] })
+    await service.stop()
+  })
+})
