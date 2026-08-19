@@ -460,3 +460,49 @@ describe("v4.2 GitHub Issues and Projects adapter", () => {
     expect(transport.comments.get("I_1")).toHaveLength(6);
   });
 });
+
+describe("strict load tolerance for contract-less issues", () => {
+  test("a labeled tracker issue without a contract no longer breaks strict repo-wide loads", async () => {
+    const { transport, adapter } = setup();
+    transport.addIssue(1);
+    // A tracking/plain issue: matching repo, no YAML contract, NO lifecycle label.
+    transport.issues.push({
+      id: "I_TRACKER",
+      number: 99,
+      title: "Tracking issue",
+      body: "```yaml\nid: TRACKER\ngoal: track things\n```",
+      url: "https://github.test/acme/repo/issues/99",
+      state: "OPEN",
+      createdAt: "2026-08-19T10:00:00Z",
+      updatedAt: "2026-08-19T10:00:00Z",
+      assigneeId: null,
+    });
+    transport.labels.set("I_TRACKER", ["v4"]);
+    transport.comments.set("I_TRACKER", []);
+
+    // Strict paths (activeClaims drives shadow/tick) skip the tracker instead of failing.
+    await expect(adapter.activeClaims()).resolves.toEqual([]);
+    const ready = await adapter.fetchIssuesByStates(["ready"]);
+    expect(ready.map((entry) => entry.issue.id)).toEqual(["I_1"]);
+  });
+
+  test("a malformed issue that carries a lifecycle label still fails closed", async () => {
+    const { transport, adapter } = setup();
+    transport.addIssue(1);
+    transport.issues.push({
+      id: "I_BAD",
+      number: 98,
+      title: "Broken contract on a lifecycle-labeled issue",
+      body: "no contract at all",
+      url: "https://github.test/acme/repo/issues/98",
+      state: "OPEN",
+      createdAt: "2026-08-19T10:00:00Z",
+      updatedAt: "2026-08-19T10:00:00Z",
+      assigneeId: null,
+    });
+    transport.labels.set("I_BAD", ["v4", "state:running"]);
+    transport.comments.set("I_BAD", []);
+
+    await expect(adapter.activeClaims()).rejects.toThrow();
+  });
+});
