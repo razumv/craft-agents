@@ -264,6 +264,14 @@ export interface ElectronAPI {
   setServerConfig(config: import('@craft-agent/shared/config/server-config').ServerConfig): Promise<void>
   getServerStatus(): Promise<import('@craft-agent/shared/config/server-config').ServerStatus>
 
+  // Persisted thin-client connection settings (direct IPC to main; applied on relaunch)
+  getRemoteClientConfig(): Promise<{
+    config: { enabled: boolean; url: string; token: string }
+    envOverride: boolean
+    activeUrl: string | null
+  }>
+  setRemoteClientConfig(config: { enabled: boolean; url: string; token: string }): Promise<{ enabled: boolean; url: string; token: string }>
+
   // App lifecycle
   relaunchApp(): Promise<void>
   removeWorkspace(workspaceId: string): Promise<boolean>
