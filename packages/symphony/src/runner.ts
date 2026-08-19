@@ -30,9 +30,17 @@ export interface LiveRunnerConfig {
   workflowPath: string;
   repositoryRoot: string;
   workspaceRoot: string;
-  issueId: string;
-  issueNumber: number;
-  projectItemId: string;
+  /**
+   * `issue` (default) pins the runner to one explicitly authorized issue via
+   * ScopedGitHubTransport. `discovery` lets the scheduler discover eligible
+   * issues across the configured repository/Project (labels + contract decide
+   * dispatchability); mutations stay fenced to the repository, the configured
+   * Project fields, and issues actually observed through the tracker.
+   */
+  mode?: "issue" | "discovery";
+  issueId?: string;
+  issueNumber?: number;
+  projectItemId?: string;
   claimFenceIssueId: string;
   verificationBudget: string;
   github: {
@@ -73,9 +81,11 @@ export interface LiveRunnerConfig {
 }
 
 export interface LiveRunnerStatus {
-  snapshot: TrackerIssueSnapshot;
-  status: ProjectStatus;
+  snapshot: TrackerIssueSnapshot | null;
+  status: ProjectStatus | null;
   execution: CraftExecutionSession | null;
+  /** Discovery mode only: one status per issue discovered in the repository. */
+  statuses?: ProjectStatus[];
 }
 
 export const SHADOW_RECEIPT_SCHEMA = "craft-agent/symphony-shadow@1" as const;
@@ -84,8 +94,8 @@ export interface LiveShadowReceipt {
   /** Explicit schema identifier for the public receipt shape. */
   schema: typeof SHADOW_RECEIPT_SCHEMA;
   /** Explicit public projection: no issue body, messages, or final response. */
-  projectDesk: ProjectDeskReadback;
-  proposal: ShadowProposal;
+  projectDesk: ProjectDeskReadback | null;
+  proposal: ShadowProposal | null;
   writes: 0;
   /** SHA-256 over every public receipt field except this hash itself. */
   receiptHash: string;
@@ -127,7 +137,13 @@ export class LiveV4Runner {
       || project.config?.id !== this.config.craft.projectId
       || project.config?.workingDirectory !== this.config.craft.projectWorkingDirectory
     ) throw new Error("dedicated Craft Protocol project preflight failed exact readback");
-    const issue = await this.tracker.get(this.config.issueId);
+    const issue = this.config.mode === "discovery"
+      ? await (async () => {
+          const status = await this.readDiscoveryStatus();
+          if (!status.snapshot) throw new Error("discovery preflight found no issues in the configured repository");
+          return status.snapshot;
+        })()
+      : await this.tracker.get(this.#pinnedIssueId());
     return { runtime, issue, projectId: project.config.id, workspace };
   }
 
@@ -136,22 +152,57 @@ export class LiveV4Runner {
     return this.readStatus();
   }
 
+  /** The one explicitly pinned issue id; only meaningful in issue mode. */
+  #pinnedIssueId(): string {
+    const issueId = this.config.issueId;
+    if (this.config.mode === "discovery" || !issueId) {
+      throw new Error("operation requires single-issue mode with a pinned issueId");
+    }
+    return issueId;
+  }
+
   async readStatus(): Promise<LiveRunnerStatus> {
-    const snapshot = await this.tracker.get(this.config.issueId);
+    if (this.config.mode === "discovery") return this.readDiscoveryStatus();
+    const snapshot = await this.tracker.get(this.#pinnedIssueId());
     const execution = snapshot.claim ? await this.craft.get(snapshot.claim.sessionId) : null;
     return { snapshot, status: projectStatus(snapshot), execution };
   }
 
+  /**
+   * Discovery projection: every issue the tracker can see in the configured
+   * repository, with the primary status being the active claim when one
+   * occupies WIP, else the first discovered issue, else null (empty repo).
+   */
+  private async readDiscoveryStatus(): Promise<LiveRunnerStatus> {
+    const allStates = Object.keys(this.config.github.states) as (keyof typeof this.config.github.states)[];
+    const snapshots = await this.tracker.fetchIssuesByStates(allStates);
+    const statuses = snapshots.map((snapshot) => projectStatus(snapshot));
+    const active = snapshots.find((snapshot) => snapshot.claim !== null && snapshot.claim !== undefined);
+    const primary = active ?? snapshots[0] ?? null;
+    const execution = active?.claim ? await this.craft.get(active.claim.sessionId) : null;
+    return {
+      snapshot: primary,
+      status: primary ? projectStatus(primary) : null,
+      execution,
+      statuses,
+    };
+  }
+
   async projectDesk(): Promise<ProjectDeskReadback> {
     const status = await this.readStatus();
+    if (!status.status) throw new Error("no discovered issue to project to the desk");
     return this.craft.readProjectDesk({ status: status.status, activeRun: status.execution });
   }
 
   async shadow(): Promise<LiveShadowReceipt> {
     const status = await this.readStatus();
     const [projectDesk, proposal] = await Promise.all([
-      this.craft.readProjectDesk({ status: status.status, activeRun: status.execution }),
-      this.scheduler.preview(this.config.issueId),
+      status.status
+        ? this.craft.readProjectDesk({ status: status.status, activeRun: status.execution })
+        : Promise.resolve(null),
+      this.config.mode === "discovery"
+        ? this.scheduler.previewNext()
+        : this.scheduler.preview(this.#pinnedIssueId()),
     ]);
     const payload = { schema: SHADOW_RECEIPT_SCHEMA, projectDesk, proposal, writes: 0 as const };
     return {
@@ -162,6 +213,7 @@ export class LiveV4Runner {
 
   async project(): Promise<{ notes: string; status: LiveRunnerStatus }> {
     const status = await this.readStatus();
+    if (!status.status) throw new Error("no discovered issue to project to the desk");
     const notes = await this.craft.projectToDesk({
       status: status.status,
       activeRun: status.execution,
@@ -171,7 +223,7 @@ export class LiveV4Runner {
   }
 
   async transitionToPrOpen(): Promise<LiveRunnerStatus> {
-    const before = await this.tracker.get(this.config.issueId);
+    const before = await this.tracker.get(this.#pinnedIssueId());
     if (!before.claim) throw new Error("Issue has no active claim for PR transition");
     if (before.issue.state !== "running" && before.issue.state !== "pr-open") {
       throw new Error(`Issue cannot enter pr-open from ${before.issue.state}`);
@@ -220,14 +272,17 @@ export class LiveV4Runner {
 
 export async function loadLiveRunnerConfig(path: string): Promise<LiveRunnerConfig> {
   const parsed = JSON.parse(await readFile(path, "utf8")) as LiveRunnerConfig;
-  for (const [field, value] of Object.entries({
+  const mode = parsed.mode ?? "issue";
+  if (mode !== "issue" && mode !== "discovery") throw new Error("live runner mode must be issue or discovery");
+  const required: Record<string, unknown> = {
     workflowPath: parsed.workflowPath,
     repositoryRoot: parsed.repositoryRoot,
     workspaceRoot: parsed.workspaceRoot,
-    issueId: parsed.issueId,
     claimFenceIssueId: parsed.claimFenceIssueId,
     verificationBudget: parsed.verificationBudget,
-  })) {
+  };
+  if (mode === "issue") required.issueId = parsed.issueId;
+  for (const [field, value] of Object.entries(required)) {
     if (typeof value !== "string" || !value.trim()) throw new Error(`live runner ${field} must be configured`);
   }
   return parsed;
@@ -270,16 +325,31 @@ export async function createLiveRunner(config: LiveRunnerConfig): Promise<LiveV4
     },
   };
   const rawGitHub = new GhCliTransport(config.github.executable);
-  const github = new ScopedGitHubTransport(rawGitHub, {
-    repository: config.github.repository,
-    issueId: config.issueId,
-    issueNumber: config.issueNumber,
-    fenceIssueId: config.claimFenceIssueId,
-    projectId: config.github.projectId,
-    projectItemId: config.projectItemId,
-    statusFieldId: config.github.statusFieldId,
-    gateFieldId: config.github.gateFieldId,
-  });
+  const mode = config.mode ?? "issue";
+  let github: GitHubTransport;
+  if (mode === "discovery") {
+    github = new DiscoveryGitHubTransport(rawGitHub, {
+      repository: config.github.repository,
+      fenceIssueId: config.claimFenceIssueId,
+      projectId: config.github.projectId,
+      statusFieldId: config.github.statusFieldId,
+      gateFieldId: config.github.gateFieldId,
+    });
+  } else {
+    if (!config.issueId || !config.issueNumber || !config.projectItemId) {
+      throw new Error("single-issue mode requires issueId, issueNumber, and projectItemId");
+    }
+    github = new ScopedGitHubTransport(rawGitHub, {
+      repository: config.github.repository,
+      issueId: config.issueId,
+      issueNumber: config.issueNumber,
+      fenceIssueId: config.claimFenceIssueId,
+      projectId: config.github.projectId,
+      projectItemId: config.projectItemId,
+      statusFieldId: config.github.statusFieldId,
+      gateFieldId: config.github.gateFieldId,
+    });
+  }
   const truth = new FilesystemWorkspaceTruthReader(workflow.workspace.root);
   const tracker = new GitHubIssuesProjectsAdapter({
     repository: config.github.repository,
@@ -323,6 +393,106 @@ function canonicalJson(value: unknown): string {
     return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(record[key])}`).join(",")}}`;
   }
   return JSON.stringify(value) ?? "null";
+}
+
+/**
+ * Restricts a repository transport to one configured repository and Project.
+ *
+ * Unlike ScopedGitHubTransport it does not pin one issue: reads flow for the
+ * whole repository, and mutations are permitted only for the claim fence and
+ * for issues/Project items actually observed through prior reads of this
+ * transport. Nothing can be mutated that discovery did not surface first, and
+ * Project mutations stay pinned to the configured project and status/gate
+ * fields.
+ */
+export interface GitHubDiscoveryScope {
+  repository: string;
+  fenceIssueId: string;
+  projectId: string;
+  statusFieldId: string;
+  gateFieldId: string;
+}
+
+export class DiscoveryGitHubTransport implements GitHubTransport {
+  readonly #issueIds = new Set<string>();
+  readonly #issueNumbers = new Set<number>();
+  readonly #projectItemIds = new Set<string>();
+
+  constructor(readonly delegate: GitHubTransport, readonly scope: GitHubDiscoveryScope) {}
+
+  async listIssues(repository: string, cursor: string | null): Promise<Page<GitHubIssueRecord>> {
+    if (repository !== this.scope.repository) throw new Error("GitHub request escaped configured repository scope");
+    const page = await this.delegate.listIssues(repository, cursor);
+    for (const record of page.nodes) {
+      this.#issueIds.add(record.id);
+      this.#issueNumbers.add(record.number);
+    }
+    return page;
+  }
+
+  async getIssuesByNodeIds(ids: readonly string[]): Promise<(GitHubIssueRecord | null)[]> {
+    const records = await this.delegate.getIssuesByNodeIds(ids);
+    for (const record of records) {
+      if (record) {
+        this.#issueIds.add(record.id);
+        this.#issueNumbers.add(record.number);
+      }
+    }
+    return records;
+  }
+
+  async listLabels(issueId: string, cursor: string | null): Promise<Page<string>> { return this.delegate.listLabels(this.assertRead(issueId), cursor); }
+  async listBlockedBy(issueId: string, cursor: string | null): Promise<Page<GitHubIssueLink>> { return this.delegate.listBlockedBy(this.assertRead(issueId), cursor); }
+  async listProjectItems(issueId: string, cursor: string | null): Promise<Page<GitHubProjectItem>> {
+    const page = await this.delegate.listProjectItems(this.assertRead(issueId), cursor);
+    for (const item of page.nodes) {
+      if (item.projectId === this.scope.projectId) this.#projectItemIds.add(item.id);
+    }
+    return page;
+  }
+  listProjectFieldValues(itemId: string, cursor: string | null): Promise<Page<GitHubProjectFieldValue>> { return this.delegate.listProjectFieldValues(itemId, cursor); }
+  async listComments(issueId: string, cursor: string | null): Promise<Page<GitHubComment>> { return this.delegate.listComments(this.assertRead(issueId), cursor); }
+  async listClosingPullRequests(issueId: string, cursor: string | null): Promise<Page<GitHubPullRequestEvidence>> { return this.delegate.listClosingPullRequests(this.assertRead(issueId), cursor); }
+  async getBranch(repository: string, branchName: string): Promise<GitHubBranchEvidence | null> {
+    if (repository !== this.scope.repository) throw new Error("GitHub request escaped configured repository scope");
+    return this.delegate.getBranch(repository, branchName);
+  }
+  async getBaseSha(repository: string, branchName: string): Promise<string> {
+    if (repository !== this.scope.repository) throw new Error("GitHub request escaped configured repository scope");
+    return this.delegate.getBaseSha(repository, branchName);
+  }
+
+  async appendComment(issueId: string, body: string): Promise<GitHubComment> {
+    if (issueId !== this.scope.fenceIssueId && !this.#issueIds.has(issueId)) {
+      throw new Error("GitHub comment mutation escaped discovered issue/fence scope");
+    }
+    return this.delegate.appendComment(issueId, body);
+  }
+  async replaceLabels(repository: string, issueNumber: number, labels: readonly string[]): Promise<void> {
+    if (repository !== this.scope.repository || !this.#issueNumbers.has(issueNumber)) {
+      throw new Error("GitHub label mutation escaped discovered repository/issue scope");
+    }
+    return this.delegate.replaceLabels(repository, issueNumber, labels);
+  }
+  async updateProjectSingleSelect(projectId: string, itemId: string, fieldId: string, optionId: string): Promise<void> {
+    if (projectId !== this.scope.projectId || fieldId !== this.scope.statusFieldId || !this.#projectItemIds.has(itemId)) {
+      throw new Error("GitHub Project status mutation escaped discovered item scope");
+    }
+    return this.delegate.updateProjectSingleSelect(projectId, itemId, fieldId, optionId);
+  }
+  async updateProjectText(projectId: string, itemId: string, fieldId: string, value: string): Promise<void> {
+    if (projectId !== this.scope.projectId || fieldId !== this.scope.gateFieldId || !this.#projectItemIds.has(itemId)) {
+      throw new Error("GitHub Project gate mutation escaped discovered item scope");
+    }
+    return this.delegate.updateProjectText(projectId, itemId, fieldId, value);
+  }
+
+  private assertRead(issueId: string): string {
+    if (issueId !== this.scope.fenceIssueId && !this.#issueIds.has(issueId)) {
+      throw new Error("GitHub read escaped discovered issue/fence scope");
+    }
+    return issueId;
+  }
 }
 
 /** Restricts a repository transport to one explicitly authorized work item. */

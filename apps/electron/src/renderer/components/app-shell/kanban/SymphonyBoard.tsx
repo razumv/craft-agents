@@ -133,9 +133,14 @@ function tilesFromServiceStatus(status: { projects: Array<Record<string, unknown
     const projectId = asString(project.projectId) ?? 'unknown'
     const lastError = asString(project.lastError)
     // Reconstruction snapshot is a LiveRunnerStatus: { snapshot, status, execution }.
+    // Discovery-mode runners additionally carry `statuses` — one per issue the
+    // scheduler can see in the repository; prefer that full projection.
     const snapshot = project.snapshot as Record<string, unknown> | null | undefined
+    const many = snapshot?.statuses as Array<Record<string, unknown>> | null | undefined
     const inner = snapshot?.status as Record<string, unknown> | null | undefined
-    if (inner) tiles.push(tileFromStatus(projectId, inner))
+    if (Array.isArray(many) && many.length > 0) {
+      for (const status of many) tiles.push(tileFromStatus(projectId, status))
+    } else if (inner) tiles.push(tileFromStatus(projectId, inner))
     else tiles.push(errorTile(projectId, lastError ?? 'no snapshot'))
   }
   return tiles
