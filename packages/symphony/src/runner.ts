@@ -74,11 +74,11 @@ export interface LiveRunnerStatus {
 }
 
 export interface LiveShadowReceipt {
-  status: LiveRunnerStatus;
+  /** Explicit public projection: no issue body, messages, or final response. */
   projectDesk: ProjectDeskReadback;
   proposal: ShadowProposal;
   writes: 0;
-  /** SHA-256 over canonical proposal + Project Desk readback + writes. */
+  /** SHA-256 over every public receipt field except this hash itself. */
   receiptHash: string;
 }
 
@@ -144,14 +144,10 @@ export class LiveV4Runner {
       this.craft.readProjectDesk({ status: status.status, activeRun: status.execution }),
       this.scheduler.preview(this.config.issueId),
     ]);
-    const payload = { status, projectDesk, proposal, writes: 0 as const };
+    const payload = { projectDesk, proposal, writes: 0 as const };
     return {
       ...payload,
-      receiptHash: createHash("sha256").update(canonicalJson({
-        projectDesk,
-        proposal,
-        writes: payload.writes,
-      })).digest("hex"),
+      receiptHash: createHash("sha256").update(canonicalJson(payload)).digest("hex"),
     };
   }
 

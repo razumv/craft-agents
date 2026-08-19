@@ -174,12 +174,13 @@ describe("v4 live runner mutation scope", () => {
     const base = transitionFixture("settled").runner;
     const snapshot = await base.readStatus();
     let mutations = 0;
+    let transcript = "SECRET FINAL RESPONSE BEFORE RESTART";
     const tracker = {
       get: async () => structuredClone(snapshot.snapshot),
       tryClaim: async () => { mutations += 1; throw new Error("must not claim"); },
     } as unknown as GitHubIssuesProjectsAdapter;
     const craft = {
-      get: async () => structuredClone(snapshot.execution),
+      get: async () => ({ ...structuredClone(snapshot.execution!), finalResponse: transcript }),
       readProjectDesk: async () => ({
         issue: {
           projectId: snapshot.status.projectId,
@@ -229,10 +230,16 @@ describe("v4 live runner mutation scope", () => {
     );
 
     const first = await makeRunner().shadow();
+    transcript = "DIFFERENT SECRET FINAL RESPONSE AFTER RESTART";
     const restarted = await makeRunner().shadow();
+    const serialized = JSON.stringify(first);
+
     expect(first).toEqual(restarted);
+    expect(Object.keys(first).sort()).toEqual(["projectDesk", "proposal", "receiptHash", "writes"]);
     expect(first).toMatchObject({ writes: 0, proposal: { action: "resume" } });
     expect(first.receiptHash).toMatch(/^[0-9a-f]{64}$/);
+    expect(serialized).not.toContain("finalResponse");
+    expect(serialized).not.toContain("SECRET FINAL RESPONSE");
     expect(mutations).toBe(0);
   });
 });

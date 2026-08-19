@@ -82,7 +82,12 @@ describe('NativeSymphonyService', () => {
       async projectDesk() { calls.push('desk'); return { compact: 'Project Desk' } },
       async shadow() {
         calls.push('shadow')
-        return { status: { durable: 'same' }, proposal: { action: 'claim' }, receiptHash: 'a'.repeat(64), writes: 0 }
+        return {
+          projectDesk: { compact: 'Project Desk' },
+          proposal: { action: 'claim' },
+          receiptHash: 'a'.repeat(64),
+          writes: 0,
+        }
       },
       async tick() { calls.push('tick'); return { mutated: true } },
     }
@@ -98,15 +103,16 @@ describe('NativeSymphonyService', () => {
     expect(calls).toEqual(['status'])
 
     expect(await service.validate('alpha')).toMatchObject({ operation: 'validate', result: { valid: true } })
-    expect(await service.shadow('alpha')).toMatchObject({
-      operation: 'shadow',
-      result: {
-        status: { durable: 'same' },
-        proposal: { action: 'claim' },
-        receiptHash: 'a'.repeat(64),
-        writes: 0,
-      },
+    const shadow = await service.shadow('alpha')
+    expect(shadow).toMatchObject({ operation: 'shadow' })
+    expect(shadow.result).toEqual({
+      projectDesk: { compact: 'Project Desk' },
+      proposal: { action: 'claim' },
+      receiptHash: 'a'.repeat(64),
+      writes: 0,
     })
+    expect(JSON.stringify(shadow.result)).not.toContain('durable')
+    expect(JSON.stringify(shadow.result)).not.toContain('preflight')
     expect(await service.projectDesk('alpha')).toMatchObject({
       operation: 'desk',
       result: { compact: 'Project Desk' },

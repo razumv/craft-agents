@@ -175,9 +175,10 @@ export class NativeSymphonyService implements SymphonyServiceControl {
 
   shadow(projectId: string): Promise<SymphonyOperationResult> {
     return this.#operate(projectId, 'shadow', async (runner) => {
-      const preflight = await runner.preflight()
-      const receipt = await runner.shadow()
-      return { preflight, ...(receipt as Record<string, unknown>), writes: 0 }
+      // Validate every external binding, but keep the verbose internal preflight
+      // record out of the compact public shadow receipt.
+      await runner.preflight()
+      return runner.shadow()
     })
   }
 
