@@ -23,6 +23,7 @@ import {
   SettingsRow,
   SettingsToggle,
   SettingsInputRow,
+  SettingsSecretInput,
 } from '@/components/settings'
 
 export const meta: DetailsPageMeta = {
@@ -97,6 +98,44 @@ export default function ServerSettingsPage() {
   useEffect(() => {
     loadSettings()
   }, [loadSettings])
+
+  // ---------------------------------------------------------------------------
+  // Thin-client connection (this app → a remote Craft server). Persisted in
+  // ~/.craft-agent/remote-client.json and applied on relaunch; explicit
+  // CRAFT_SERVER_URL env vars still win over the file.
+  // ---------------------------------------------------------------------------
+  const [remoteForm, setRemoteForm] = useState({ enabled: false, url: '', token: '' })
+  const [remoteSaved, setRemoteSaved] = useState({ enabled: false, url: '', token: '' })
+  const [remoteEnvOverride, setRemoteEnvOverride] = useState(false)
+  const [remoteActiveUrl, setRemoteActiveUrl] = useState<string | null>(null)
+  const [remoteError, setRemoteError] = useState<string>()
+  const [remoteSaving, setRemoteSaving] = useState(false)
+  const [remoteNeedsRelaunch, setRemoteNeedsRelaunch] = useState(false)
+  const remoteDirty = JSON.stringify(remoteForm) !== JSON.stringify(remoteSaved)
+
+  useEffect(() => {
+    window.electronAPI.getRemoteClientConfig().then((result) => {
+      setRemoteForm(result.config)
+      setRemoteSaved(result.config)
+      setRemoteEnvOverride(result.envOverride)
+      setRemoteActiveUrl(result.activeUrl)
+    }).catch((err) => console.error('Failed to load remote client config:', err))
+  }, [])
+
+  const handleRemoteSave = useCallback(async () => {
+    setRemoteSaving(true)
+    setRemoteError(undefined)
+    try {
+      const saved = await window.electronAPI.setRemoteClientConfig(remoteForm)
+      setRemoteForm(saved)
+      setRemoteSaved(saved)
+      setRemoteNeedsRelaunch(true)
+    } catch (err) {
+      setRemoteError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setRemoteSaving(false)
+    }
+  }, [remoteForm])
 
   const handleSave = async () => {
     setError(undefined)
@@ -274,6 +313,68 @@ export default function ServerSettingsPage() {
               )}
             </SettingsSection>
           )}
+
+          {/* Thin-client connection to a remote Craft server */}
+          <SettingsSection title={t("settings.server.remoteClientSection")}>
+            <SettingsCard>
+              <SettingsToggle
+                label={t("settings.server.remoteClientEnable")}
+                description={t("settings.server.remoteClientDescription")}
+                checked={remoteForm.enabled}
+                onCheckedChange={(enabled) => setRemoteForm(f => ({ ...f, enabled }))}
+              />
+              {(remoteForm.enabled || remoteSaved.enabled) && (
+                <>
+                  <SettingsInputRow
+                    label={t("settings.server.remoteClientUrl")}
+                    value={remoteForm.url}
+                    onChange={(url) => setRemoteForm(f => ({ ...f, url }))}
+                    placeholder="wss://my-server.example.ts.net:9100"
+                  />
+                  <SettingsSecretInput
+                    label={t("settings.server.remoteClientToken")}
+                    value={remoteForm.token}
+                    onChange={(token) => setRemoteForm(f => ({ ...f, token }))}
+                    placeholder={t("settings.server.remoteClientTokenPlaceholder")}
+                    inCard
+                  />
+                </>
+              )}
+            </SettingsCard>
+
+            {remoteEnvOverride && (
+              <div className="flex items-center gap-2 px-3 py-2 rounded-lg bg-warning/10 border border-warning/20 text-xs text-warning">
+                <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+                <span>{t("settings.server.remoteClientEnvOverride", { url: remoteActiveUrl ?? '' })}</span>
+              </div>
+            )}
+
+            {remoteError && <p className="text-xs text-destructive px-1">{remoteError}</p>}
+
+            {remoteNeedsRelaunch && !remoteDirty && (
+              <div className="flex items-center gap-2 px-3 py-2 rounded-lg bg-warning/10 border border-warning/20 text-xs text-warning">
+                <RotateCw className="h-3.5 w-3.5 shrink-0" />
+                <span className="flex-1">{t("settings.server.remoteClientRelaunch")}</span>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-6 text-[11px] px-2"
+                  onClick={() => window.electronAPI.relaunchApp()}
+                >
+                  {t("settings.server.restartNow")}
+                </Button>
+              </div>
+            )}
+
+            {remoteDirty && (
+              <SettingsCardFooter>
+                <Button size="sm" onClick={handleRemoteSave} disabled={remoteSaving}>
+                  {remoteSaving ? <Spinner className="mr-1.5" /> : null}
+                  Save
+                </Button>
+              </SettingsCardFooter>
+            )}
+          </SettingsSection>
 
           {/* Save/Reset */}
           {error && (

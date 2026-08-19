@@ -244,6 +244,10 @@ if (process.defaultApp) {
 import { applyConfiguredProxySettings } from './network-proxy'
 void applyConfiguredProxySettings()
 
+// Persisted thin-client settings — must run before any CRAFT_SERVER_URL consumer below.
+import { applyRemoteClientConfigToEnv, loadRemoteClientConfig, saveRemoteClientConfig } from './remote-client-config'
+applyRemoteClientConfigToEnv()
+
 // Accept self-signed / untrusted certificates when connecting to a user-configured remote server.
 // Only bypasses cert validation for the exact CRAFT_SERVER_URL origin — all other connections
 // use standard certificate verification. Without this, wss:// to self-signed servers fails with
@@ -903,6 +907,28 @@ app.whenReady().then(async () => {
         } finally {
           client.destroy()
         }
+      })
+
+      // Persisted thin-client connection settings (read/write ~/.craft-agent/remote-client.json).
+      // Takes effect on relaunch; explicit CRAFT_SERVER_URL env still wins.
+      ipcMain.handle('remoteClient:get', () => {
+        const config = loadRemoteClientConfig()
+        return {
+          config: config ?? { enabled: false, url: '', token: '' },
+          // Whether this running instance was launched via explicit env vars
+          // (the file is then ignored) so the UI can say so.
+          envOverride: !!process.env.CRAFT_SERVER_URL && !loadRemoteClientConfig()?.enabled,
+          activeUrl: process.env.CRAFT_SERVER_URL ?? null,
+        }
+      })
+      ipcMain.handle('remoteClient:set', (_event, config: unknown) => {
+        if (!config || typeof config !== 'object') throw new Error('remote client config must be an object')
+        const input = config as { enabled?: unknown; url?: unknown; token?: unknown }
+        return saveRemoteClientConfig({
+          enabled: input.enabled === true,
+          url: typeof input.url === 'string' ? input.url : '',
+          token: typeof input.token === 'string' ? input.token : '',
+        })
       })
 
       // App relaunch (for server config changes — NOT an update install)
