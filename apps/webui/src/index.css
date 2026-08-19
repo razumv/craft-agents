@@ -65,7 +65,9 @@ html, body {
   height: 100vh;
   height: 100dvh;
   padding-top: env(safe-area-inset-top, 0px);
-  padding-bottom: env(safe-area-inset-bottom, 0px);
+  /* NO bottom padding here: the shared renderer already insets the bottom
+   * per surface ([data-list-role] rules add env(safe-area-inset-bottom) and
+   * the FAB buffer) — a root-level copy stacked with it into an empty band. */
   padding-left: env(safe-area-inset-left, 0px);
   padding-right: env(safe-area-inset-right, 0px);
   box-sizing: border-box;
