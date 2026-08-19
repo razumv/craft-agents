@@ -357,6 +357,10 @@ export const CHANNEL_MAP = {
   menuPaste: invoke(RPC_CHANNELS.menu.PASTE),
   menuSelectAll: invoke(RPC_CHANNELS.menu.SELECT_ALL),
 
+  // Symphony (native v4 service) — read-only board projections + status
+  'symphony.status': invoke(RPC_CHANNELS.symphony.STATUS),
+  'symphony.projectDesk': invoke(RPC_CHANNELS.symphony.PROJECT_DESK),
+
   // Browser pane management
   'browserPane.create': invoke(RPC_CHANNELS.browserPane.CREATE),
   'browserPane.destroy': invoke(RPC_CHANNELS.browserPane.DESTROY),

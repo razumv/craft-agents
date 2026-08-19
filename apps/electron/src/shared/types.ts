@@ -630,6 +630,11 @@ export interface ElectronAPI {
   menuSelectAll(): Promise<void>
 
   // Browser pane management
+  symphony: {
+    status(): Promise<import('@craft-agent/core/types').SymphonyServiceStatus>
+    projectDesk(projectId: string): Promise<import('@craft-agent/core/types').SymphonyOperationResult>
+  }
+
   browserPane: {
     create(input?: string | BrowserPaneCreateOptions): Promise<string>
     destroy(id: string): Promise<void>
