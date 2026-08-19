@@ -56,7 +56,7 @@ export interface ServerHealth {
 // ---------------------------------------------------------------------------
 
 export type SymphonyServicePhase = 'disabled' | 'reconstructing' | 'ready' | 'stopping' | 'stopped' | 'error'
-export type SymphonyOperation = 'validate' | 'shadow' | 'desk' | 'tick' | 'reconstruct'
+export type SymphonyOperation = 'validate' | 'shadow' | 'desk' | 'tick' | 'refresh' | 'reconstruct'
 
 export interface SymphonyProjectServiceStatus {
   projectId: string
@@ -69,6 +69,8 @@ export interface SymphonyProjectServiceStatus {
   snapshot: unknown | null
   /** Owner desk session id from the runner config — the ONLY valid target for owner-gate directives. */
   ownerSessionId: string | null
+  /** Craft project id from the runner config — lets UI surfaces filter Symphony work by Craft project. */
+  craftProjectId: string | null
 }
 
 export interface SymphonyServiceStatus {
@@ -110,6 +112,8 @@ export interface SymphonyServiceControl {
   validate(projectId: string): Promise<SymphonyOperationResult>
   shadow(projectId: string): Promise<SymphonyOperationResult>
   projectDesk(projectId: string): Promise<SymphonyOperationResult>
+  /** Read-only re-read of the runner's full durable status (updates the cached snapshot). */
+  refresh(projectId: string): Promise<SymphonyOperationResult>
   tick(projectId: string): Promise<SymphonyOperationResult>
   status(): SymphonyServiceStatus
   stop(timeoutMs?: number): Promise<SymphonyStopResult>

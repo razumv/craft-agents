@@ -14,6 +14,7 @@ export const HANDLED_CHANNELS = [
   RPC_CHANNELS.symphony.STATUS,
   RPC_CHANNELS.symphony.STOP,
   RPC_CHANNELS.symphony.GENERATE_CONFIG,
+  RPC_CHANNELS.symphony.REFRESH,
 ] as const
 
 function projectId(value: unknown): string {
@@ -28,6 +29,7 @@ export function registerSymphonyHandlers(server: RpcServer, deps: HandlerDeps): 
   server.handle(RPC_CHANNELS.symphony.VALIDATE, async (_ctx, id: unknown) => service.validate(projectId(id)))
   server.handle(RPC_CHANNELS.symphony.SHADOW, async (_ctx, id: unknown) => service.shadow(projectId(id)))
   server.handle(RPC_CHANNELS.symphony.PROJECT_DESK, async (_ctx, id: unknown) => service.projectDesk(projectId(id)))
+  server.handle(RPC_CHANNELS.symphony.REFRESH, async (_ctx, id: unknown) => service.refresh(projectId(id)))
   server.handle(RPC_CHANNELS.symphony.TICK, async (_ctx, id: unknown) => service.tick(projectId(id)))
   server.handle(RPC_CHANNELS.symphony.STATUS, async () => service.status())
   // Generate discovery runner-config DRAFTS from a Craft project's GitHub

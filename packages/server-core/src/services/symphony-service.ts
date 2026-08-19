@@ -159,6 +159,7 @@ export class NativeSymphonyService implements SymphonyServiceControl {
           lastError: null,
           snapshot: null,
           ownerSessionId: null,
+          craftProjectId: null,
         },
       })
     }
@@ -193,6 +194,7 @@ export class NativeSymphonyService implements SymphonyServiceControl {
           lastError: null,
           snapshot,
           ownerSessionId: runnerConfig.craft?.ownerSessionId ?? null,
+          craftProjectId: runnerConfig.craft?.projectId ?? null,
         }
       } catch (error) {
         runtime.status = {
@@ -274,6 +276,11 @@ export class NativeSymphonyService implements SymphonyServiceControl {
 
   projectDesk(projectId: string): Promise<SymphonyOperationResult> {
     return this.#operate(projectId, 'desk', async (runner) => runner.projectDesk())
+  }
+
+  /** Read-only full-status re-read; the cached snapshot the UI renders is replaced. */
+  refresh(projectId: string): Promise<SymphonyOperationResult> {
+    return this.#operate(projectId, 'refresh', async (runner) => runner.readStatus())
   }
 
   async tick(projectId: string): Promise<SymphonyOperationResult> {

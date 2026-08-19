@@ -601,7 +601,7 @@ export function KanbanBoardContainer() {
               ))}
             </div>
           )}
-          {!showSymphony && projectOptions.length > 0 && (
+          {projectOptions.length > 0 && (
             <KanbanProjectFilter projects={projectOptions} value={projectFilter} onChange={setProjectFilter} />
           )}
           {!showSymphony && usingProjectColumns && editingProject && (
@@ -629,7 +629,7 @@ export function KanbanBoardContainer() {
       </div>
       <div className="min-h-0 flex-1">
         {showSymphony ? (
-          <SymphonyBoard onSendMessage={onSendMessage} />
+          <SymphonyBoard onSendMessage={onSendMessage} projectFilter={projectFilter} />
         ) : (
         <KanbanBoard
           columns={activeColumns}

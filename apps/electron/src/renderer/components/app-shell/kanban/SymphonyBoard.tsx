@@ -16,6 +16,8 @@ import { useTranslation } from 'react-i18next'
 /** Mirrors @craft-agent/symphony ProjectStatus, defensively (snapshot is `unknown` over RPC). */
 interface SymphonyTile {
   projectId: string
+  /** Craft project the Symphony project is bound to (for the board's project filter). */
+  craftProjectId: string | null
   /** Owner desk session — the only valid target for gate directives; null → copy-only buttons. */
   ownerSessionId: string | null
   issueIdentifier: string
@@ -61,11 +63,12 @@ function asString(value: unknown): string | null {
 }
 
 /** Parse one ProjectStatus-shaped object (from status snapshot or desk readback) into a tile. */
-function tileFromStatus(projectId: string, status: Record<string, unknown>, ownerSessionId: string | null = null): SymphonyTile {
+function tileFromStatus(projectId: string, status: Record<string, unknown>, ownerSessionId: string | null = null, craftProjectId: string | null = null): SymphonyTile {
   const gate = status.ownerGate as Record<string, unknown> | null | undefined
   const event = status.lastMaterialEvent as Record<string, unknown> | null | undefined
   return {
     projectId,
+    craftProjectId,
     ownerSessionId,
     issueIdentifier: asString(status.issueIdentifier) ?? projectId,
     objective: asString(status.objective) ?? '',
@@ -87,13 +90,14 @@ function tileFromStatus(projectId: string, status: Record<string, unknown>, owne
 }
 
 /** Parse a ProjectDeskReadback (live desk projection) into a tile. */
-function tileFromDesk(projectId: string, desk: Record<string, unknown>, ownerSessionId: string | null = null): SymphonyTile {
+function tileFromDesk(projectId: string, desk: Record<string, unknown>, ownerSessionId: string | null = null, craftProjectId: string | null = null): SymphonyTile {
   const issue = (desk.issue ?? {}) as Record<string, unknown>
   const links = (desk.links ?? {}) as Record<string, unknown>
   const gate = desk.ownerGate as Record<string, unknown> | null | undefined
   const event = desk.latestMaterialEvent as Record<string, unknown> | null | undefined
   return {
     projectId,
+    craftProjectId,
     ownerSessionId,
     issueIdentifier: asString(issue.identifier) ?? projectId,
     objective: asString(issue.objective) ?? '',
@@ -117,6 +121,7 @@ function tileFromDesk(projectId: string, desk: Record<string, unknown>, ownerSes
 function errorTile(projectId: string, error: string): SymphonyTile {
   return {
     projectId,
+    craftProjectId: null,
     ownerSessionId: null,
     issueIdentifier: projectId,
     objective: '',
@@ -137,6 +142,7 @@ function tilesFromServiceStatus(status: { projects: Array<Record<string, unknown
   for (const project of status.projects) {
     const projectId = asString(project.projectId) ?? 'unknown'
     const ownerSessionId = asString(project.ownerSessionId)
+    const craftProjectId = asString(project.craftProjectId)
     const lastError = asString(project.lastError)
     // Reconstruction snapshot is a LiveRunnerStatus: { snapshot, status, execution }.
     // Discovery-mode runners additionally carry `statuses` — one per issue the
@@ -145,11 +151,19 @@ function tilesFromServiceStatus(status: { projects: Array<Record<string, unknown
     const many = snapshot?.statuses as Array<Record<string, unknown>> | null | undefined
     const inner = snapshot?.status as Record<string, unknown> | null | undefined
     if (Array.isArray(many) && many.length > 0) {
-      for (const status of many) tiles.push(tileFromStatus(projectId, status, ownerSessionId))
-    } else if (inner) tiles.push(tileFromStatus(projectId, inner, ownerSessionId))
+      for (const status of many) tiles.push(tileFromStatus(projectId, status, ownerSessionId, craftProjectId))
+    } else if (inner) tiles.push(tileFromStatus(projectId, inner, ownerSessionId, craftProjectId))
     else tiles.push(errorTile(projectId, lastError ?? 'no snapshot'))
   }
-  return tiles
+  // The same GitHub issue can be visible through several Symphony projects
+  // (e.g. a pinned single-issue project plus repository discovery). Keep one
+  // tile per issue, preferring the multi-issue (discovery) projection.
+  const byIssue = new Map<string, SymphonyTile>()
+  for (const tile of tiles) {
+    const existing = byIssue.get(tile.issueIdentifier)
+    if (!existing || tile.error === null) byIssue.set(tile.issueIdentifier, tile)
+  }
+  return [...byIssue.values()]
 }
 
 async function copyGateCommand(command: string, t: (key: string) => string): Promise<void> {
@@ -261,7 +275,7 @@ function SymphonyTileCard({ tile, onSendMessage }: { tile: SymphonyTile; onSendM
   )
 }
 
-export function SymphonyBoard({ onSendMessage }: { onSendMessage?: (sessionId: string, message: string) => void } = {}) {
+export function SymphonyBoard({ onSendMessage, projectFilter = [] }: { onSendMessage?: (sessionId: string, message: string) => void; projectFilter?: string[] } = {}) {
   const { t } = useTranslation()
   const [tiles, setTiles] = React.useState<SymphonyTile[] | null>(null)
   const [error, setError] = React.useState<string | null>(null)
@@ -283,24 +297,21 @@ export function SymphonyBoard({ onSendMessage }: { onSendMessage?: (sessionId: s
 
   // Live refresh: re-read each project's desk projection (read-only), falling
   // back to the cached snapshot tile when a desk read fails.
+  // Refresh re-reads each project's full durable status server-side (read-only)
+  // and then re-renders from the updated snapshots, so discovery projects keep
+  // one tile per issue instead of collapsing to a single desk card.
   const handleRefresh = React.useCallback(async () => {
     if (refreshing) return
     setRefreshing(true)
     try {
-      const status = await window.electronAPI.symphony.status()
-      const projects = (status as unknown as { projects: Array<Record<string, unknown>> }).projects
-      const next = await Promise.all(
-        projects.map(async project => {
-          const projectId = asString(project.projectId) ?? 'unknown'
-          try {
-            const result = await window.electronAPI.symphony.projectDesk(projectId)
-            return tileFromDesk(projectId, (result as { result: Record<string, unknown> }).result, asString(project.ownerSessionId))
-          } catch (err) {
-            return errorTile(projectId, err instanceof Error ? err.message : String(err))
-          }
-        })
+      const before = await window.electronAPI.symphony.status()
+      await Promise.all(
+        (before.projects ?? []).map(project =>
+          window.electronAPI.symphony.refresh(project.projectId).catch(() => null)
+        )
       )
-      setTiles(next)
+      const status = await window.electronAPI.symphony.status()
+      setTiles(tilesFromServiceStatus(status as unknown as { projects: Array<Record<string, unknown>> }))
       setError(null)
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
@@ -333,7 +344,10 @@ export function SymphonyBoard({ onSendMessage }: { onSendMessage?: (sessionId: s
       <div className="min-h-0 flex-1 overflow-x-auto snap-x snap-mandatory md:snap-none">
         <div className="flex h-full min-w-max gap-3 p-4">
           {SYMPHONY_COLUMNS.map(column => {
-            const columnTiles = (tiles ?? []).filter(tile => columnFor(tile.state).id === column.id)
+            const visible = projectFilter.length === 0
+              ? (tiles ?? [])
+              : (tiles ?? []).filter(tile => tile.craftProjectId !== null && projectFilter.includes(tile.craftProjectId))
+            const columnTiles = visible.filter(tile => columnFor(tile.state).id === column.id)
             return (
               <div key={column.id} className="flex w-64 shrink-0 snap-start flex-col rounded-xl bg-foreground/[0.02] p-2">
                 <div className="flex items-center gap-2 px-1 pb-2">
