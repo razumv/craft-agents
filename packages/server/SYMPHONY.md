@@ -18,7 +18,9 @@ To configure projects, set `CRAFT_SYMPHONY_CONFIG` to an **absolute** JSON path:
 }
 ```
 
-Each `configPath` points to one explicit `LiveRunnerConfig` consumed by `@craft-agent/symphony`. Startup reconstructs provider-neutral status from durable GitHub/filesystem/Craft truth; it does not tick or create sessions/worktrees. `validate`, `shadow`, and `desk` are read-only. `shadow` reports `writes: 0`, the exact proposed action/run identity, the compact Project Desk readback, and a canonical SHA-256 receipt hash.
+Each `configPath` points to one explicit `LiveRunnerConfig` consumed by `@craft-agent/symphony`.
+
+`LiveRunnerConfig.mode` selects the scope: `issue` (default) pins the runner to one explicitly authorized issue (`issueId`/`issueNumber`/`projectItemId` required); `discovery` lets the deterministic scheduler discover eligible issues across the configured repository and GitHub Project — eligibility stays label + machine-readable-contract driven, WIP=1 and atomic claim fencing unchanged. In discovery mode mutations are fenced to the claim-fence issue and to issues/Project items actually observed through the tracker's own reads; the status snapshot carries `statuses` (one per discovered issue) and the kanban board renders one tile per issue. Startup reconstructs provider-neutral status from durable GitHub/filesystem/Craft truth; it does not tick or create sessions/worktrees. `validate`, `shadow`, and `desk` are read-only. `shadow` reports `writes: 0`, the exact proposed action/run identity, the compact Project Desk readback, and a canonical SHA-256 receipt hash.
 
 The Project Desk projection uses the existing Craft session-notes/mobile surface. It contains durable IDs and links rather than transcript excerpts: issue objective/state, branch/PR/deploy links, latest material non-heartbeat event, blocker, exact approve/reject gate commands, next completion point, run/session/context/attempt, and directive acknowledgement IDs. Archived + not-processing is reported as terminal even when a workflow badge is stale.
 
