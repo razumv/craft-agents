@@ -222,6 +222,7 @@ export const REMOTE_ELIGIBLE_CHANNELS = new Set<string>([
   RPC_CHANNELS.symphony.TICK,
   RPC_CHANNELS.symphony.STATUS,
   RPC_CHANNELS.symphony.STOP,
+  RPC_CHANNELS.symphony.GENERATE_CONFIG,
 
   // server — server-level operations (no workspace context needed)
   RPC_CHANNELS.server.GET_WORKSPACES,

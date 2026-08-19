@@ -39,6 +39,7 @@ describe('Symphony RPC handlers', () => {
     expect([...rpc.handlers.keys()].sort()).toEqual([
       RPC_CHANNELS.symphony.SHADOW,
       RPC_CHANNELS.symphony.PROJECT_DESK,
+      RPC_CHANNELS.symphony.GENERATE_CONFIG,
       RPC_CHANNELS.symphony.STATUS,
       RPC_CHANNELS.symphony.STOP,
       RPC_CHANNELS.symphony.TICK,

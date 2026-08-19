@@ -633,6 +633,10 @@ export interface ElectronAPI {
   symphony: {
     status(): Promise<import('@craft-agent/core/types').SymphonyServiceStatus>
     projectDesk(projectId: string): Promise<import('@craft-agent/core/types').SymphonyOperationResult>
+    generateConfig(workspaceId: string, projectSlug: string): Promise<{
+      projectSlug: string
+      drafts: { repository: string; path: string; warnings: string[] }[]
+    }>
   }
 
   browserPane: {

@@ -54,6 +54,7 @@ export default function ProjectInfoPage({ projectSlug }: ProjectInfoPageProps) {
   const [editGithubRepos, setEditGithubRepos] = useState('')
   const [editGithubProjectUrl, setEditGithubProjectUrl] = useState('')
   const [editGithubView, setEditGithubView] = useState('')
+  const [generatingSymphony, setGeneratingSymphony] = useState(false)
   const [saving, setSaving] = useState(false)
 
   // Load project (and re-load on broadcast)
@@ -185,6 +186,31 @@ export default function ProjectInfoPage({ projectSlug }: ProjectInfoPageProps) {
       setSaving(false)
     }
   }, [workspaceId, project, editName, editDescription, editWorkingDir, editDetails, editColor, editGithubRepos, editGithubProjectUrl, editGithubView, t])
+
+  // Generate discovery runner-config drafts from the saved GitHub binding.
+  // Server-side and read-only against GitHub; drafts land under
+  // ~/.craft-agent/symphony/drafts with TODO markers for owner review.
+  const handleGenerateSymphonyConfig = useCallback(async () => {
+    if (!workspaceId || !project) return
+    if (!project.config.github?.repositories?.length) {
+      toast.error(t('projectInfo.symphonyConfigNoBinding'))
+      return
+    }
+    setGeneratingSymphony(true)
+    try {
+      const result = await window.electronAPI.symphony.generateConfig(workspaceId, project.config.slug)
+      const warningCount = result.drafts.reduce((sum, draft) => sum + draft.warnings.length, 0)
+      toast.success(t('projectInfo.symphonyConfigGenerated', { count: result.drafts.length, warnings: warningCount }), {
+        description: result.drafts.map((draft) => draft.path).join('\n'),
+      })
+    } catch (err) {
+      toast.error(t('projectInfo.symphonyConfigFailed'), {
+        description: err instanceof Error ? err.message : String(err),
+      })
+    } finally {
+      setGeneratingSymphony(false)
+    }
+  }, [workspaceId, project, t])
 
   const handleDeleteProject = useCallback(async () => {
     if (!workspaceId || !project) return
@@ -412,6 +438,14 @@ export default function ProjectInfoPage({ projectSlug }: ProjectInfoPageProps) {
                     onChange={(e) => setEditGithubView(e.target.value)}
                     placeholder={t('projectInfo.githubProjectViewPlaceholder')}
                   />
+                </Field>
+                <Field
+                  label={t('projectInfo.symphonyConfig')}
+                  hint={t('projectInfo.symphonyConfigHint')}
+                >
+                  <Button size="sm" variant="outline" onClick={handleGenerateSymphonyConfig} disabled={generatingSymphony}>
+                    {generatingSymphony ? t('common.saving') : t('projectInfo.symphonyConfigGenerate')}
+                  </Button>
                 </Field>
                 <Field
                   label={t('projectInfo.details')}
