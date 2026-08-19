@@ -360,6 +360,7 @@ export const CHANNEL_MAP = {
   // Symphony (native v4 service) — read-only board projections + status
   'symphony.status': invoke(RPC_CHANNELS.symphony.STATUS),
   'symphony.projectDesk': invoke(RPC_CHANNELS.symphony.PROJECT_DESK),
+  'symphony.generateConfig': invoke(RPC_CHANNELS.symphony.GENERATE_CONFIG),
 
   // Browser pane management
   'browserPane.create': invoke(RPC_CHANNELS.browserPane.CREATE),

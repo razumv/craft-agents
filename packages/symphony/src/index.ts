@@ -18,3 +18,4 @@ export * from "./tracker";
 export * from "./workflow";
 export * from "./workspace-adapter";
 export * from "./workspace-truth";
+export * from "./config-generator";

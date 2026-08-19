@@ -24,6 +24,7 @@ export const RPC_CHANNELS = {
     TICK: 'symphony:tick',
     STATUS: 'symphony:status',
     STOP: 'symphony:stop',
+    GENERATE_CONFIG: 'symphony:generateConfig',
   },
   sessions: {
     GET: 'sessions:get',
