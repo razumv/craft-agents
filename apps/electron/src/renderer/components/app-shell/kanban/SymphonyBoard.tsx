@@ -1,5 +1,6 @@
 import * as React from 'react'
-import { ExternalLink, RefreshCw } from 'lucide-react'
+import { Check, Copy, ExternalLink, RefreshCw, X } from 'lucide-react'
+import { toast } from 'sonner'
 import { useTranslation } from 'react-i18next'
 
 /**
@@ -140,6 +141,11 @@ function tilesFromServiceStatus(status: { projects: Array<Record<string, unknown
   return tiles
 }
 
+async function copyGateCommand(command: string, t: (key: string) => string): Promise<void> {
+  await navigator.clipboard.writeText(command)
+  toast.success(t('kanban.symphony.gateCopied'), { description: command })
+}
+
 function SymphonyTileCard({ tile }: { tile: SymphonyTile }) {
   const { t } = useTranslation()
   return (
@@ -159,9 +165,28 @@ function SymphonyTileCard({ tile }: { tile: SymphonyTile }) {
       )}
       {tile.lastEvent && <p className="mt-1 truncate text-[11px] text-foreground/50">{tile.lastEvent}</p>}
       {tile.ownerGate?.id && (
-        <div className="mt-1.5 rounded-md bg-foreground/[0.04] px-1.5 py-1 font-mono text-[10.5px] text-foreground/70">
-          <div className="truncate">{tile.ownerGate.approveCommand}</div>
-          <div className="truncate">{tile.ownerGate.rejectCommand}</div>
+        <div className="mt-1.5 rounded-md bg-foreground/[0.04] px-1.5 py-1">
+          <div className="truncate font-mono text-[10.5px] text-foreground/70">{tile.ownerGate.id}</div>
+          {/* The gate contract is exact owner text — these deliberately copy the
+              exact command for the owner to paste into the owner session, rather
+              than sending anything themselves. */}
+          <div className="mt-1 flex items-center gap-1.5">
+            <button
+              type="button"
+              onClick={() => void copyGateCommand(tile.ownerGate!.approveCommand, t)}
+              className="inline-flex items-center gap-1 rounded-md bg-emerald-500/10 px-1.5 py-0.5 text-[10.5px] font-semibold text-emerald-600 hover:bg-emerald-500/20"
+            >
+              <Check className="h-3 w-3" /> {t('kanban.symphony.approve')}
+            </button>
+            <button
+              type="button"
+              onClick={() => void copyGateCommand(tile.ownerGate!.rejectCommand, t)}
+              className="inline-flex items-center gap-1 rounded-md bg-red-500/10 px-1.5 py-0.5 text-[10.5px] font-semibold text-red-600 hover:bg-red-500/20"
+            >
+              <X className="h-3 w-3" /> {t('kanban.symphony.reject')}
+            </button>
+            <Copy className="ml-auto h-3 w-3 text-foreground/30" />
+          </div>
         </div>
       )}
       <div className="mt-1.5 flex items-center gap-2">
