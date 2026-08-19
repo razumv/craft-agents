@@ -169,4 +169,70 @@ describe("v4 live runner mutation scope", () => {
     expect(result.execution?.status).toBe("settled");
     expect(transitionCount()).toBe(1);
   });
+
+  test("builds a restart-stable canonical shadow receipt without mutation calls", async () => {
+    const base = transitionFixture("settled").runner;
+    const snapshot = await base.readStatus();
+    let mutations = 0;
+    const tracker = {
+      get: async () => structuredClone(snapshot.snapshot),
+      tryClaim: async () => { mutations += 1; throw new Error("must not claim"); },
+    } as unknown as GitHubIssuesProjectsAdapter;
+    const craft = {
+      get: async () => structuredClone(snapshot.execution),
+      readProjectDesk: async () => ({
+        issue: {
+          projectId: snapshot.status.projectId,
+          id: snapshot.status.issueId,
+          identifier: snapshot.status.issueIdentifier,
+          objective: snapshot.status.objective,
+          state: snapshot.status.state,
+        },
+        links: { branch: null, pullRequest: snapshot.status.prUrl, deployment: null },
+        latestMaterialEvent: null,
+        blocker: null,
+        ownerGate: null,
+        nextCompletionPoint: snapshot.status.nextCompletionPoint,
+        run: null,
+        directive: null,
+        compact: "# Project Desk — Craft Protocol v4",
+      }),
+    } as unknown as CraftMobileControlPlaneAdapter;
+    const scheduler = {
+      preview: async () => ({
+        action: "resume",
+        reason: "durable claim exists; shadow would resume its exact identity",
+        issueId: "I_52",
+        issueIdentifier: "razumv/craft-protocol#52",
+        state: "running",
+        attempt: 1,
+        claimFence: "claim-52",
+        run: {
+          issueId: "I_52",
+          issueIdentifier: "razumv/craft-protocol#52",
+          attempt: 1,
+          sessionId: "run-52",
+          workspaceId: "worktree-52",
+          workspaceKey: "issue-52-a1",
+          workspacePath: "/tmp/issue-52-a1",
+        },
+      }),
+      tick: async () => { mutations += 1; },
+    } as unknown as DeterministicScheduler;
+    const makeRunner = () => new LiveV4Runner(
+      { issueId: "I_52" } as LiveRunnerConfig,
+      {} as WorkflowConfig,
+      tracker,
+      craft,
+      {} as CraftCliRpcTransport,
+      scheduler,
+    );
+
+    const first = await makeRunner().shadow();
+    const restarted = await makeRunner().shadow();
+    expect(first).toEqual(restarted);
+    expect(first).toMatchObject({ writes: 0, proposal: { action: "resume" } });
+    expect(first.receiptHash).toMatch(/^[0-9a-f]{64}$/);
+    expect(mutations).toBe(0);
+  });
 });

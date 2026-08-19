@@ -28,7 +28,8 @@ describe('Symphony RPC handlers', () => {
       async start() { throw new Error('not used') },
       async validate(id) { calls.push(['validate', id]); return { projectId: id, operation: 'validate', completedAt: 1, result: {} } },
       async shadow(id) { calls.push(['shadow', id]); return { projectId: id, operation: 'shadow', completedAt: 2, result: {} } },
-      async tick(id) { calls.push(['tick', id]); return { projectId: id, operation: 'tick', completedAt: 3, result: {} } },
+      async projectDesk(id) { calls.push(['desk', id]); return { projectId: id, operation: 'desk', completedAt: 3, result: {} } },
+      async tick(id) { calls.push(['tick', id]); return { projectId: id, operation: 'tick', completedAt: 4, result: {} } },
       status() { calls.push(['status']); return { phase: 'ready', enabled: false, acceptingOperations: true, configPath: '/tmp/config.json', stopTimeoutMs: 100, activeOperations: 0, projects: [] } },
       async stop(timeoutMs) { calls.push(['stop', timeoutMs]); return { drained: true, timeoutMs: timeoutMs ?? 100, activeOperations: 0, phase: 'stopped' } },
     }
@@ -37,6 +38,7 @@ describe('Symphony RPC handlers', () => {
 
     expect([...rpc.handlers.keys()].sort()).toEqual([
       RPC_CHANNELS.symphony.SHADOW,
+      RPC_CHANNELS.symphony.PROJECT_DESK,
       RPC_CHANNELS.symphony.STATUS,
       RPC_CHANNELS.symphony.STOP,
       RPC_CHANNELS.symphony.TICK,
@@ -44,12 +46,14 @@ describe('Symphony RPC handlers', () => {
     ].sort())
     await rpc.invoke(RPC_CHANNELS.symphony.VALIDATE, 'alpha')
     await rpc.invoke(RPC_CHANNELS.symphony.SHADOW, 'alpha')
+    await rpc.invoke(RPC_CHANNELS.symphony.PROJECT_DESK, 'alpha')
     await rpc.invoke(RPC_CHANNELS.symphony.TICK, 'alpha')
     await rpc.invoke(RPC_CHANNELS.symphony.STATUS)
     await rpc.invoke(RPC_CHANNELS.symphony.STOP, 25)
     expect(calls).toEqual([
       ['validate', 'alpha'],
       ['shadow', 'alpha'],
+      ['desk', 'alpha'],
       ['tick', 'alpha'],
       ['status'],
       ['stop', 25],
@@ -58,13 +62,14 @@ describe('Symphony RPC handlers', () => {
 
   it('rejects missing project IDs and invalid stop deadlines', async () => {
     const service = {
-      validate: async () => ({}), shadow: async () => ({}), tick: async () => ({}),
+      validate: async () => ({}), shadow: async () => ({}), projectDesk: async () => ({}), tick: async () => ({}),
       status: () => ({}), stop: async () => ({}), start: async () => ({}),
     }
     const rpc = rpcHarness()
     registerSymphonyHandlers(rpc.server, { symphonyService: service } as any)
 
     await expect(rpc.invoke(RPC_CHANNELS.symphony.VALIDATE, '')).rejects.toThrow('projectId')
+    await expect(rpc.invoke(RPC_CHANNELS.symphony.PROJECT_DESK, '   ')).rejects.toThrow('projectId')
     await expect(rpc.invoke(RPC_CHANNELS.symphony.STOP, 0)).rejects.toThrow('positive integer')
   })
 

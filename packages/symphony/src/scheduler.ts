@@ -48,6 +48,28 @@ export interface SchedulerAdapters {
   workspaces: SchedulerWorkspaceAdapter;
 }
 
+export type ShadowProposal =
+  | {
+      action: "claim" | "resume";
+      reason: string;
+      issueId: string;
+      issueIdentifier: string;
+      state: TrackerIssueSnapshot["issue"]["state"];
+      attempt: number;
+      claimFence: string;
+      run: RunIdentity;
+    }
+  | {
+      action: "observe";
+      reason: string;
+      issueId: string;
+      issueIdentifier: string;
+      state: TrackerIssueSnapshot["issue"]["state"];
+      attempt: number | null;
+      claimFence: string | null;
+      run: RunIdentity | null;
+    };
+
 export class DeterministicScheduler {
   readonly #identity: IdentityFactory;
   readonly #models: ModelPolicy;
@@ -103,6 +125,90 @@ export class DeterministicScheduler {
 
   async status(issueId: string): Promise<ProjectStatus> {
     return projectStatus(await this.adapters.github.get(issueId));
+  }
+
+  /** Pure deterministic decision preview. It never claims, heartbeats, creates, or reconciles. */
+  async preview(issueId: string): Promise<ShadowProposal> {
+    const snapshot = await this.adapters.github.get(issueId);
+    if (snapshot.claim) {
+      const claim = snapshot.claim;
+      return {
+        action: "resume",
+        reason: "durable claim exists; shadow would resume its exact identity",
+        issueId: snapshot.issue.id,
+        issueIdentifier: snapshot.issue.identifier,
+        state: snapshot.issue.state,
+        attempt: claim.attempt,
+        claimFence: claim.fence,
+        run: {
+          issueId: claim.issueId,
+          issueIdentifier: claim.issueIdentifier,
+          attempt: claim.attempt,
+          sessionId: claim.sessionId,
+          workspaceId: claim.workspaceId,
+          workspaceKey: claim.workspaceKey,
+          workspacePath: claim.workspacePath,
+        },
+      };
+    }
+    if ((await this.adapters.github.activeClaims()).length >= this.config.scheduler.wipLimit) {
+      return this.observation(snapshot, "project WIP limit is occupied");
+    }
+    if (snapshot.issue.state !== "ready" && snapshot.issue.state !== "retry-wait") {
+      return this.observation(snapshot, `state ${snapshot.issue.state} is not dispatchable`);
+    }
+    if (!this.dispatchable(snapshot)) {
+      const blockers = snapshot.issue.blockedBy
+        .filter((blocker) => blocker.state?.trim().toLowerCase() !== "done")
+        .map((blocker) => blocker.identifier ?? blocker.id ?? "unknown blocker")
+        .join(", ");
+      return this.observation(snapshot, blockers ? `blocked by ${blockers}` : "issue contract is not dispatchable");
+    }
+    this.#models.assertAllowed(snapshot.contract.modelProfile);
+    this.#risk.budgetFor(snapshot.contract);
+    const attempt = snapshot.retry?.attempt ?? 1;
+    // Fence and identity are independent of wall-clock timestamps. Use zero only
+    // to reuse the canonical claim builder, then return no lease timestamps.
+    const claim = this.#identity.claimFor(
+      snapshot.issue,
+      attempt,
+      snapshot.version,
+      snapshot.baseSha,
+      { ...this.config.model, defaultProfile: snapshot.contract.modelProfile },
+      0,
+      this.config.scheduler.claimTtlMs,
+    );
+    return {
+      action: "claim",
+      reason: "eligible deterministic dispatch (shadow only)",
+      issueId: snapshot.issue.id,
+      issueIdentifier: snapshot.issue.identifier,
+      state: snapshot.issue.state,
+      attempt,
+      claimFence: claim.fence,
+      run: {
+        issueId: claim.issueId,
+        issueIdentifier: claim.issueIdentifier,
+        attempt: claim.attempt,
+        sessionId: claim.sessionId,
+        workspaceId: claim.workspaceId,
+        workspaceKey: claim.workspaceKey,
+        workspacePath: claim.workspacePath,
+      },
+    };
+  }
+
+  private observation(snapshot: TrackerIssueSnapshot, reason: string): ShadowProposal {
+    return {
+      action: "observe",
+      reason,
+      issueId: snapshot.issue.id,
+      issueIdentifier: snapshot.issue.identifier,
+      state: snapshot.issue.state,
+      attempt: snapshot.retry?.attempt ?? null,
+      claimFence: null,
+      run: null,
+    };
   }
 
   private async reconcile(crashAfter?: CrashPoint): Promise<void> {

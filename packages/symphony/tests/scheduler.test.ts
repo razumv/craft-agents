@@ -78,6 +78,28 @@ describe("v4.1 deterministic scheduler core", () => {
     expect(simulator.github.get("issue-45").issue.state).toBe("running");
   });
 
+  test("shadow preview is restart-stable and creates no claim, session, or worktree", async () => {
+    const simulator = new CrashRestartSimulator(workflow);
+    simulator.seed(issue(), contract());
+
+    const first = await simulator.scheduler.preview("issue-45");
+    simulator.restart();
+    const afterRestart = await simulator.scheduler.preview("issue-45");
+
+    expect(first).toEqual(afterRestart);
+    expect(first).toMatchObject({
+      action: "claim",
+      attempt: 1,
+      issueId: "issue-45",
+      reason: "eligible deterministic dispatch (shadow only)",
+    });
+    expect(first.run?.sessionId).toMatch(/^craft-/);
+    expect(first.claimFence).toMatch(/^claim-/);
+    expect(simulator.github.claimSuccessCount).toBe(0);
+    expect(simulator.craft.count()).toBe(0);
+    expect(simulator.workspaces.count()).toBe(0);
+  });
+
   test("repeated ticks and scheduler replacement do not duplicate session or worktree identity", async () => {
     const simulator = new CrashRestartSimulator(workflow);
     simulator.seed(issue(), contract());

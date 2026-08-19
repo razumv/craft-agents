@@ -151,11 +151,15 @@ export interface MaterialEvidence {
   ownerGateId?: string;
 }
 
+export type LifecycleEventKind = "baseline" | "claim" | "running" | "heartbeat" | "failure" | "transition";
+
 export interface MaterialEvent {
   sequence: number;
   atMs: number;
   state: LifecycleState;
   message: string;
+  /** Optional for compatibility with alpha.1 fixtures; new provider events always set it. */
+  kind?: LifecycleEventKind;
 }
 
 export interface TrackerIssueSnapshot {
@@ -181,7 +185,13 @@ export interface ProjectStatus {
   lastMaterialEvent: MaterialEvent | null;
   blocker: string | null;
   nextCompletionPoint: string;
-  ownerGate: { id: string; command: `APPROVE ${string}` } | null;
+  ownerGate: {
+    id: string;
+    /** Backward-compatible exact approve command. */
+    command: `APPROVE ${string}`;
+    approveCommand: `APPROVE ${string}`;
+    rejectCommand: `REJECT ${string}: <reason>`;
+  } | null;
 }
 
 const normalTransitions: Record<LifecycleState, readonly LifecycleState[]> = {

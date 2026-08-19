@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'bun:test'
-import { parseArgs, resolveApiKey, shouldSetupLlmConnection } from './index.ts'
+import { parseArgs, resolveApiKey, resolveSymphonyInvocation, shouldSetupLlmConnection } from './index.ts'
 
 // ---------------------------------------------------------------------------
 // Arg parsing tests
@@ -229,6 +229,25 @@ describe('parseArgs', () => {
   it('parses --provider deepseek for run', () => {
     const args = parseArgs(['bun', 'index.ts', '--provider', 'deepseek', 'run', 'hello'])
     expect(args.provider).toBe('deepseek')
+  })
+})
+
+describe('resolveSymphonyInvocation', () => {
+  it('maps the compact Project Desk command to its read-only RPC', () => {
+    expect(resolveSymphonyInvocation(['desk', 'craft-protocol'])).toEqual({
+      operation: 'desk',
+      channel: 'symphony:projectDesk',
+      rpcArgs: ['craft-protocol'],
+    })
+  })
+
+  it('keeps shadow explicit and rejects a missing project ID', () => {
+    expect(resolveSymphonyInvocation(['shadow', 'craft-protocol'])).toEqual({
+      operation: 'shadow',
+      channel: 'symphony:shadow',
+      rpcArgs: ['craft-protocol'],
+    })
+    expect(() => resolveSymphonyInvocation(['desk'])).toThrow('desk <project-id>')
   })
 })
 

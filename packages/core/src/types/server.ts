@@ -56,7 +56,7 @@ export interface ServerHealth {
 // ---------------------------------------------------------------------------
 
 export type SymphonyServicePhase = 'disabled' | 'reconstructing' | 'ready' | 'stopping' | 'stopped' | 'error'
-export type SymphonyOperation = 'validate' | 'shadow' | 'tick' | 'reconstruct'
+export type SymphonyOperation = 'validate' | 'shadow' | 'desk' | 'tick' | 'reconstruct'
 
 export interface SymphonyProjectServiceStatus {
   projectId: string
@@ -98,6 +98,7 @@ export interface SymphonyServiceControl {
   start(): Promise<SymphonyServiceStatus>
   validate(projectId: string): Promise<SymphonyOperationResult>
   shadow(projectId: string): Promise<SymphonyOperationResult>
+  projectDesk(projectId: string): Promise<SymphonyOperationResult>
   tick(projectId: string): Promise<SymphonyOperationResult>
   status(): SymphonyServiceStatus
   stop(timeoutMs?: number): Promise<SymphonyStopResult>
