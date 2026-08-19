@@ -73,7 +73,11 @@ export interface LiveRunnerStatus {
   execution: CraftExecutionSession | null;
 }
 
+export const SHADOW_RECEIPT_SCHEMA = "craft-agent/symphony-shadow@1" as const;
+
 export interface LiveShadowReceipt {
+  /** Explicit schema identifier for the public receipt shape. */
+  schema: typeof SHADOW_RECEIPT_SCHEMA;
   /** Explicit public projection: no issue body, messages, or final response. */
   projectDesk: ProjectDeskReadback;
   proposal: ShadowProposal;
@@ -144,7 +148,7 @@ export class LiveV4Runner {
       this.craft.readProjectDesk({ status: status.status, activeRun: status.execution }),
       this.scheduler.preview(this.config.issueId),
     ]);
-    const payload = { projectDesk, proposal, writes: 0 as const };
+    const payload = { schema: SHADOW_RECEIPT_SCHEMA, projectDesk, proposal, writes: 0 as const };
     return {
       ...payload,
       receiptHash: createHash("sha256").update(canonicalJson(payload)).digest("hex"),

@@ -235,9 +235,22 @@ describe("v4 live runner mutation scope", () => {
     const serialized = JSON.stringify(first);
 
     expect(first).toEqual(restarted);
-    expect(Object.keys(first).sort()).toEqual(["projectDesk", "proposal", "receiptHash", "writes"]);
-    expect(first).toMatchObject({ writes: 0, proposal: { action: "resume" } });
+    expect(Object.keys(first).sort()).toEqual(["projectDesk", "proposal", "receiptHash", "schema", "writes"]);
+    expect(first).toMatchObject({ schema: "craft-agent/symphony-shadow@1", writes: 0, proposal: { action: "resume" } });
     expect(first.receiptHash).toMatch(/^[0-9a-f]{64}$/);
+    // The canonical hash must cover the schema field: a different schema value changes the hash.
+    const { createHash } = await import("node:crypto");
+    const canonical = (value: unknown): string => Array.isArray(value)
+      ? `[${value.map(canonical).join(",")}]`
+      : value && typeof value === "object"
+        ? `{${Object.keys(value as Record<string, unknown>).sort().map((k) => `${JSON.stringify(k)}:${canonical((value as Record<string, unknown>)[k])}`).join(",")}}`
+        : JSON.stringify(value);
+    const { receiptHash, ...payload } = first;
+    expect(receiptHash).toBe(createHash("sha256").update(canonical(payload)).digest("hex"));
+    const tampered = createHash("sha256")
+      .update(canonical({ ...payload, schema: "craft-agent/symphony-shadow@0" }))
+      .digest("hex");
+    expect(tampered).not.toBe(receiptHash);
     expect(serialized).not.toContain("finalResponse");
     expect(serialized).not.toContain("SECRET FINAL RESPONSE");
     expect(mutations).toBe(0);
