@@ -127,6 +127,23 @@ export class DeterministicScheduler {
     return projectStatus(await this.adapters.github.get(issueId));
   }
 
+  /**
+   * Discovery preview: what the next tick would act on across the whole
+   * repository — the active claim if one occupies WIP, else the first
+   * dispatchable candidate in deterministic dispatch order, else null.
+   * Read-only, like preview().
+   */
+  async previewNext(): Promise<ShadowProposal | null> {
+    const active = await this.adapters.github.activeClaims();
+    const first = active[0];
+    if (first) return this.preview(first.issue.id);
+    const candidates = await this.adapters.github.fetchIssuesByStates(["ready", "retry-wait"]);
+    for (const candidate of candidates.sort(compareForDispatch)) {
+      if (this.dispatchable(candidate)) return this.preview(candidate.issue.id);
+    }
+    return null;
+  }
+
   /** Pure deterministic decision preview. It never claims, heartbeats, creates, or reconciles. */
   async preview(issueId: string): Promise<ShadowProposal> {
     const snapshot = await this.adapters.github.get(issueId);

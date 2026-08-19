@@ -165,7 +165,7 @@ describe("v4 live runner mutation scope", () => {
     const { runner, transitionCount } = transitionFixture("settled");
     const result = await runner.transitionToPrOpen();
 
-    expect(result.snapshot.issue.state).toBe("pr-open");
+    expect(result.snapshot!.issue.state).toBe("pr-open");
     expect(result.execution?.status).toBe("settled");
     expect(transitionCount()).toBe(1);
   });
@@ -183,17 +183,17 @@ describe("v4 live runner mutation scope", () => {
       get: async () => ({ ...structuredClone(snapshot.execution!), finalResponse: transcript }),
       readProjectDesk: async () => ({
         issue: {
-          projectId: snapshot.status.projectId,
-          id: snapshot.status.issueId,
-          identifier: snapshot.status.issueIdentifier,
-          objective: snapshot.status.objective,
-          state: snapshot.status.state,
+          projectId: snapshot.status!.projectId,
+          id: snapshot.status!.issueId,
+          identifier: snapshot.status!.issueIdentifier,
+          objective: snapshot.status!.objective,
+          state: snapshot.status!.state,
         },
-        links: { branch: null, pullRequest: snapshot.status.prUrl, deployment: null },
+        links: { branch: null, pullRequest: snapshot.status!.prUrl, deployment: null },
         latestMaterialEvent: null,
         blocker: null,
         ownerGate: null,
-        nextCompletionPoint: snapshot.status.nextCompletionPoint,
+        nextCompletionPoint: snapshot.status!.nextCompletionPoint,
         run: null,
         directive: null,
         compact: "# Project Desk — Craft Protocol v4",
