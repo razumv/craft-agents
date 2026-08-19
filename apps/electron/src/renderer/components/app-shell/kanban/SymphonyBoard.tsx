@@ -16,6 +16,8 @@ import { useTranslation } from 'react-i18next'
 /** Mirrors @craft-agent/symphony ProjectStatus, defensively (snapshot is `unknown` over RPC). */
 interface SymphonyTile {
   projectId: string
+  /** Owner desk session — the only valid target for gate directives; null → copy-only buttons. */
+  ownerSessionId: string | null
   issueIdentifier: string
   objective: string
   state: string
@@ -59,11 +61,12 @@ function asString(value: unknown): string | null {
 }
 
 /** Parse one ProjectStatus-shaped object (from status snapshot or desk readback) into a tile. */
-function tileFromStatus(projectId: string, status: Record<string, unknown>): SymphonyTile {
+function tileFromStatus(projectId: string, status: Record<string, unknown>, ownerSessionId: string | null = null): SymphonyTile {
   const gate = status.ownerGate as Record<string, unknown> | null | undefined
   const event = status.lastMaterialEvent as Record<string, unknown> | null | undefined
   return {
     projectId,
+    ownerSessionId,
     issueIdentifier: asString(status.issueIdentifier) ?? projectId,
     objective: asString(status.objective) ?? '',
     state: asString(status.state) ?? 'preservation-unknown',
@@ -84,13 +87,14 @@ function tileFromStatus(projectId: string, status: Record<string, unknown>): Sym
 }
 
 /** Parse a ProjectDeskReadback (live desk projection) into a tile. */
-function tileFromDesk(projectId: string, desk: Record<string, unknown>): SymphonyTile {
+function tileFromDesk(projectId: string, desk: Record<string, unknown>, ownerSessionId: string | null = null): SymphonyTile {
   const issue = (desk.issue ?? {}) as Record<string, unknown>
   const links = (desk.links ?? {}) as Record<string, unknown>
   const gate = desk.ownerGate as Record<string, unknown> | null | undefined
   const event = desk.latestMaterialEvent as Record<string, unknown> | null | undefined
   return {
     projectId,
+    ownerSessionId,
     issueIdentifier: asString(issue.identifier) ?? projectId,
     objective: asString(issue.objective) ?? '',
     state: asString(issue.state) ?? 'preservation-unknown',
@@ -113,6 +117,7 @@ function tileFromDesk(projectId: string, desk: Record<string, unknown>): Symphon
 function errorTile(projectId: string, error: string): SymphonyTile {
   return {
     projectId,
+    ownerSessionId: null,
     issueIdentifier: projectId,
     objective: '',
     state: 'preservation-unknown',
@@ -131,6 +136,7 @@ function tilesFromServiceStatus(status: { projects: Array<Record<string, unknown
   const tiles: SymphonyTile[] = []
   for (const project of status.projects) {
     const projectId = asString(project.projectId) ?? 'unknown'
+    const ownerSessionId = asString(project.ownerSessionId)
     const lastError = asString(project.lastError)
     // Reconstruction snapshot is a LiveRunnerStatus: { snapshot, status, execution }.
     // Discovery-mode runners additionally carry `statuses` — one per issue the
@@ -139,8 +145,8 @@ function tilesFromServiceStatus(status: { projects: Array<Record<string, unknown
     const many = snapshot?.statuses as Array<Record<string, unknown>> | null | undefined
     const inner = snapshot?.status as Record<string, unknown> | null | undefined
     if (Array.isArray(many) && many.length > 0) {
-      for (const status of many) tiles.push(tileFromStatus(projectId, status))
-    } else if (inner) tiles.push(tileFromStatus(projectId, inner))
+      for (const status of many) tiles.push(tileFromStatus(projectId, status, ownerSessionId))
+    } else if (inner) tiles.push(tileFromStatus(projectId, inner, ownerSessionId))
     else tiles.push(errorTile(projectId, lastError ?? 'no snapshot'))
   }
   return tiles
@@ -151,8 +157,34 @@ async function copyGateCommand(command: string, t: (key: string) => string): Pro
   toast.success(t('kanban.symphony.gateCopied'), { description: command })
 }
 
-function SymphonyTileCard({ tile }: { tile: SymphonyTile }) {
+/**
+ * Send the exact gate command as an owner message into the owner desk session.
+ * The button lives in the owner's own app, so the press IS the owner acting —
+ * but it is still explicit: a confirm dialog shows the exact text first, and
+ * REJECT additionally asks for the mandatory reason.
+ */
+async function sendGateCommand(
+  tile: SymphonyTile,
+  kind: 'approve' | 'reject',
+  onSendMessage: (sessionId: string, message: string) => void,
+  t: (key: string, options?: Record<string, unknown>) => string,
+): Promise<void> {
+  const gate = tile.ownerGate
+  if (!gate || !tile.ownerSessionId) return
+  let command = gate.approveCommand
+  if (kind === 'reject') {
+    const reason = window.prompt(t('kanban.symphony.gateRejectReason'))?.trim()
+    if (!reason) return
+    command = `REJECT ${gate.id}: ${reason}`
+  }
+  if (!window.confirm(t('kanban.symphony.gateSendConfirm', { command }))) return
+  onSendMessage(tile.ownerSessionId, command)
+  toast.success(t('kanban.symphony.gateSent'), { description: command })
+}
+
+function SymphonyTileCard({ tile, onSendMessage }: { tile: SymphonyTile; onSendMessage?: (sessionId: string, message: string) => void }) {
   const { t } = useTranslation()
+  const canSend = !!(tile.ownerSessionId && onSendMessage)
   return (
     <div className="rounded-lg border border-border bg-card p-2.5 text-[12px] leading-snug shadow-sm">
       <div className="flex items-center justify-between gap-2">
@@ -178,14 +210,22 @@ function SymphonyTileCard({ tile }: { tile: SymphonyTile }) {
           <div className="mt-1 flex items-center gap-1.5">
             <button
               type="button"
-              onClick={() => void copyGateCommand(tile.ownerGate!.approveCommand, t)}
+              onClick={() =>
+                canSend
+                  ? void sendGateCommand(tile, 'approve', onSendMessage!, t)
+                  : void copyGateCommand(tile.ownerGate!.approveCommand, t)
+              }
               className="inline-flex items-center gap-1 rounded-md bg-emerald-500/10 px-1.5 py-0.5 text-[10.5px] font-semibold text-emerald-600 hover:bg-emerald-500/20"
             >
               <Check className="h-3 w-3" /> {t('kanban.symphony.approve')}
             </button>
             <button
               type="button"
-              onClick={() => void copyGateCommand(tile.ownerGate!.rejectCommand, t)}
+              onClick={() =>
+                canSend
+                  ? void sendGateCommand(tile, 'reject', onSendMessage!, t)
+                  : void copyGateCommand(tile.ownerGate!.rejectCommand, t)
+              }
               className="inline-flex items-center gap-1 rounded-md bg-red-500/10 px-1.5 py-0.5 text-[10.5px] font-semibold text-red-600 hover:bg-red-500/20"
             >
               <X className="h-3 w-3" /> {t('kanban.symphony.reject')}
@@ -221,7 +261,7 @@ function SymphonyTileCard({ tile }: { tile: SymphonyTile }) {
   )
 }
 
-export function SymphonyBoard() {
+export function SymphonyBoard({ onSendMessage }: { onSendMessage?: (sessionId: string, message: string) => void } = {}) {
   const { t } = useTranslation()
   const [tiles, setTiles] = React.useState<SymphonyTile[] | null>(null)
   const [error, setError] = React.useState<string | null>(null)
@@ -254,7 +294,7 @@ export function SymphonyBoard() {
           const projectId = asString(project.projectId) ?? 'unknown'
           try {
             const result = await window.electronAPI.symphony.projectDesk(projectId)
-            return tileFromDesk(projectId, (result as { result: Record<string, unknown> }).result)
+            return tileFromDesk(projectId, (result as { result: Record<string, unknown> }).result, asString(project.ownerSessionId))
           } catch (err) {
             return errorTile(projectId, err instanceof Error ? err.message : String(err))
           }
@@ -303,7 +343,7 @@ export function SymphonyBoard() {
                 </div>
                 <div className="flex min-h-0 flex-col gap-2 overflow-y-auto">
                   {columnTiles.map(tile => (
-                    <SymphonyTileCard key={`${tile.projectId}-${tile.issueIdentifier}`} tile={tile} />
+                    <SymphonyTileCard key={`${tile.projectId}-${tile.issueIdentifier}`} tile={tile} onSendMessage={onSendMessage} />
                   ))}
                 </div>
               </div>

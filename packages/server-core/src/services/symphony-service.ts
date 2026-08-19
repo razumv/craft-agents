@@ -158,6 +158,7 @@ export class NativeSymphonyService implements SymphonyServiceControl {
           updatedAt: now,
           lastError: null,
           snapshot: null,
+          ownerSessionId: null,
         },
       })
     }
@@ -191,6 +192,7 @@ export class NativeSymphonyService implements SymphonyServiceControl {
           updatedAt: now,
           lastError: null,
           snapshot,
+          ownerSessionId: runnerConfig.craft?.ownerSessionId ?? null,
         }
       } catch (error) {
         runtime.status = {

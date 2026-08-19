@@ -629,7 +629,7 @@ export function KanbanBoardContainer() {
       </div>
       <div className="min-h-0 flex-1">
         {showSymphony ? (
-          <SymphonyBoard />
+          <SymphonyBoard onSendMessage={onSendMessage} />
         ) : (
         <KanbanBoard
           columns={activeColumns}

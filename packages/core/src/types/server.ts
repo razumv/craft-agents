@@ -67,6 +67,8 @@ export interface SymphonyProjectServiceStatus {
   lastError: string | null
   /** Provider-neutral status from the native runner; never transcript content. */
   snapshot: unknown | null
+  /** Owner desk session id from the runner config — the ONLY valid target for owner-gate directives. */
+  ownerSessionId: string | null
 }
 
 export interface SymphonyServiceStatus {
