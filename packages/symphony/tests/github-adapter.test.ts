@@ -595,6 +595,57 @@ describe("v4.2 GitHub Issues and Projects adapter", () => {
     expect(snapshot.issue.state).toBe("ready");
   });
 
+  test("work that merged after its attempt failed stops being reported as a failure", async () => {
+    const { transport, adapter } = setup();
+    transport.addIssue(1);
+    const before = await adapter.get("I_1");
+    const claim = await proposedClaim(adapter, "I_1");
+    await adapter.tryClaim("I_1", before.version, claim, 1_000);
+    await adapter.markRunning(claim.fence, 1_100);
+    attachPr(transport, "I_1");
+    await adapter.advanceByEvidence(1_150);
+
+    // The attempt dies after the pull request exists — the branch jammed, the
+    // turn was cut short, the run stopped — and the claim is released.
+    await adapter.failClaim(claim.fence, "runtime", "attempt died", 1_200, {
+      maxAttempts: 1, retryBaseMs: 1, retryMaxMs: 1, claimTtlMs: 60_000, staleRunMs: 60_000,
+    } as never);
+    expect((await adapter.get("I_1")).issue.state).toBe("failed");
+
+    // Then the work lands anyway — merged by hand, or by a later auto-merge.
+    attachPr(transport, "I_1", true);
+    transport.branches.delete("v4/acme-repo-1");
+
+    const advanced = await adapter.advanceByEvidence(1_300);
+    expect(advanced).toEqual([
+      { issueId: "I_1", action: "advanced", reason: "merge evidence after a failed attempt" },
+      { issueId: "I_1", action: "advanced", reason: "merge evidence with no deployment authority" },
+    ]);
+    const done = await adapter.get("I_1");
+    expect(done.issue.state).toBe("done");
+    // The failure is not erased — it stays in the history, which is where a
+    // failed attempt belongs.
+    expect(done.events.some((event) => event.kind === "failure")).toBeTrue();
+  });
+
+  test("a failed attempt with no merge stays failed", async () => {
+    const { transport, adapter } = setup();
+    transport.addIssue(1);
+    const before = await adapter.get("I_1");
+    const claim = await proposedClaim(adapter, "I_1");
+    await adapter.tryClaim("I_1", before.version, claim, 1_000);
+    await adapter.markRunning(claim.fence, 1_100);
+    attachPr(transport, "I_1");
+    await adapter.advanceByEvidence(1_150);
+    await adapter.failClaim(claim.fence, "runtime", "attempt died", 1_200, {
+      maxAttempts: 1, retryBaseMs: 1, retryMaxMs: 1, claimTtlMs: 60_000, staleRunMs: 60_000,
+    } as never);
+
+    // An open pull request is not delivery, and nothing may promote it.
+    expect(await adapter.advanceByEvidence(1_300)).toEqual([]);
+    expect((await adapter.get("I_1")).issue.state).toBe("failed");
+  });
+
   test("a merged pull request still proves the merge after its base branch has moved on", async () => {
     const { transport, adapter } = setup();
     transport.addIssue(1);

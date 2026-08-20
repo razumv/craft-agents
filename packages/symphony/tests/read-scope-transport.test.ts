@@ -70,32 +70,72 @@ describe("per-operation read scope", () => {
     expect(inner.count("listComments")).toBe(2);
   });
 
-  test("a write drops the memo, so reads after a mutation see the provider again", async () => {
+  test("a write invalidates what it could have changed, and only that", async () => {
     const inner = new CountingTransport();
     const scoped = new ReadScopeGitHubTransport(inner);
 
     await scoped.listIssues("acme/repo", null);
     await scoped.listIssues("acme/repo", null);
+    await scoped.listComments("I_1", null);
+    await scoped.listComments("I_2", null);
+    await scoped.listLabels("I_1", null);
+    expect(inner.count("listIssues")).toBe(1);
+    expect(inner.count("listComments")).toBe(2);
+
+    // The ledger lives in comments, so appending one changes this issue's durable
+    // state — and nothing about which issues exist or what another issue says.
+    await scoped.appendComment("I_1", "ledger event");
+    await scoped.listComments("I_1", null);
+    await scoped.listComments("I_2", null);
+    await scoped.listIssues("acme/repo", null);
+    expect(inner.count("listComments")).toBe(3);
     expect(inner.count("listIssues")).toBe(1);
 
-    // A claim is exactly this: a comment, then labels, then the project field.
-    await scoped.appendComment("I_1", "ledger event");
-    await scoped.listIssues("acme/repo", null);
-
-    // Reading stale state after a claim is how WIP gets double-spent.
-    expect(inner.count("listIssues")).toBe(2);
-
+    // Labels decide the lifecycle state and ride along with the listing, so both
+    // are re-read. This is the invalidation that must not be narrowed: a stale
+    // label is how WIP gets double-spent.
     await scoped.replaceLabels("acme/repo", 1, ["v4-state-claimed"]);
+    await scoped.listLabels("I_1", null);
     await scoped.listIssues("acme/repo", null);
-    expect(inner.count("listIssues")).toBe(3);
+    expect(inner.count("listLabels")).toBe(2);
+    expect(inner.count("listIssues")).toBe(2);
+  });
 
-    await scoped.updateProjectSingleSelect("PROJECT", "ITEM", "STATUS", "opt-claimed");
-    await scoped.listIssues("acme/repo", null);
-    expect(inner.count("listIssues")).toBe(4);
+  test("a project field write invalidates that item's fields, not the whole repository", async () => {
+    const inner = new CountingTransport();
+    const scoped = new ReadScopeGitHubTransport(inner);
 
-    await scoped.updateProjectText("PROJECT", "ITEM", "GATE", "GATE-1");
+    await scoped.listProjectFieldValues("ITEM_1", null);
+    await scoped.listProjectFieldValues("ITEM_2", null);
     await scoped.listIssues("acme/repo", null);
-    expect(inner.count("listIssues")).toBe(5);
+
+    await scoped.updateProjectSingleSelect("PROJECT", "ITEM_1", "STATUS", "opt-claimed");
+    await scoped.listProjectFieldValues("ITEM_1", null);
+    await scoped.listProjectFieldValues("ITEM_2", null);
+    await scoped.listIssues("acme/repo", null);
+
+    expect(inner.count("listProjectFieldValues")).toBe(3);
+    expect(inner.count("listIssues")).toBe(1);
+
+    await scoped.updateProjectText("PROJECT", "ITEM_1", "GATE", "GATE-1");
+    await scoped.listProjectFieldValues("ITEM_1", null);
+    expect(inner.count("listProjectFieldValues")).toBe(4);
+  });
+
+  test("a merge invalidates everything, because a pull request id does not say whose it is", async () => {
+    const inner = new CountingTransport();
+    const scoped = new ReadScopeGitHubTransport(inner);
+
+    await scoped.listIssues("acme/repo", null);
+    await scoped.listComments("I_1", null);
+    await scoped.mergePullRequest("PR_1", "headline");
+    await scoped.listIssues("acme/repo", null);
+    await scoped.listComments("I_1", null);
+
+    // A merge closes an issue and changes its evidence; the id alone does not say
+    // which issue, so the coarse drop is the honest one. Merges are rare.
+    expect(inner.count("listIssues")).toBe(2);
+    expect(inner.count("listComments")).toBe(2);
   });
 
   test("clear() ends the scope, so a new operation never reuses the old one's reads", async () => {

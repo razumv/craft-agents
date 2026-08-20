@@ -249,8 +249,14 @@ const normalTransitions: Record<LifecycleState, readonly LifecycleState[]> = {
   done: [],
   blocked: ["ready", "cancelled"],
   "retry-wait": ["claimed", "failed", "cancelled"],
-  failed: [],
-  cancelled: [],
+  // Terminal, with one exception each: durable proof that the work merged. An
+  // attempt failing and the work landing are different facts — a jammed branch,
+  // a cut-short turn, a merge performed by hand afterwards — and only the second
+  // one describes the outcome. The edge is safe because a transition to `merged`
+  // hard-requires the provider's own mergedAt and mergeCommitSha, so nothing can
+  // walk it by assertion; the failure itself stays in the ledger history.
+  failed: ["merged"],
+  cancelled: ["merged"],
   "preservation-unknown": [],
 };
 
