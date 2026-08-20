@@ -21,6 +21,7 @@ import {
   type Page,
 } from "./github-transport";
 import { ModelPolicy } from "./policy";
+import { ReadScopeGitHubTransport } from "./read-scope-transport";
 import { DeterministicScheduler, type Clock, type CrashPoint, type ShadowProposal } from "./scheduler";
 import { projectStatus } from "./status";
 import { loadWorkflow } from "./workflow";
@@ -128,9 +129,34 @@ export class LiveV4Runner {
     readonly scheduler: DeterministicScheduler,
     readonly workspaces?: GitWorktreeAdapter,
     readonly intake?: GhCliTransport,
+    /**
+     * Per-operation read memo. Present in production; optional so tests and
+     * simulators can build a runner from bare adapters.
+     */
+    readonly readScope?: { clear(): void },
   ) {}
 
+  /**
+   * One operation is one observation. Clearing here means no decision is ever
+   * taken from reads gathered for a previous one, while everything inside a
+   * single operation shares the reads it already paid for.
+   */
+  #beginOperation(): void {
+    this.readScope?.clear();
+  }
+
   async preflight(): Promise<{
+    runtime: Awaited<ReturnType<CraftCliRpcTransport["identity"]>>;
+    issue: TrackerIssueSnapshot;
+    projectId: string;
+    workspace: Awaited<ReturnType<GitWorktreeAdapter["preflight"]>> | null;
+  }> {
+    this.#beginOperation();
+    return this.#preflightInScope();
+  }
+
+  /** preflight without starting a new scope, for callers already inside one. */
+  async #preflightInScope(): Promise<{
     runtime: Awaited<ReturnType<CraftCliRpcTransport["identity"]>>;
     issue: TrackerIssueSnapshot;
     projectId: string;
@@ -161,6 +187,7 @@ export class LiveV4Runner {
   }
 
   async tick(crashAfter?: CrashPoint): Promise<LiveRunnerStatus> {
+    this.#beginOperation();
     await this.scheduler.tick(crashAfter);
     return this.readStatus();
   }
@@ -175,6 +202,12 @@ export class LiveV4Runner {
   }
 
   async readStatus(): Promise<LiveRunnerStatus> {
+    this.#beginOperation();
+    return this.#readStatusInScope();
+  }
+
+  /** readStatus without starting a new scope, for callers already inside one. */
+  async #readStatusInScope(): Promise<LiveRunnerStatus> {
     if (this.config.mode === "discovery") return this.readDiscoveryStatus();
     const snapshot = await this.tracker.get(this.#pinnedIssueId());
     const execution = snapshot.claim ? await this.craft.get(snapshot.claim.sessionId) : null;
@@ -214,6 +247,9 @@ export class LiveV4Runner {
     if (this.config.mode !== "discovery") {
       throw new Error("issue intake requires a discovery-mode project (a pinned single-issue runner would never dispatch it)");
     }
+    // Intake writes bypass the memoised transport, so nothing read before this
+    // point may be reused afterwards.
+    this.#beginOperation();
     if (!input.title.trim() || !input.goal.trim()) throw new Error("issue title and goal are required");
     if (input.acceptance.filter((item) => item.trim()).length === 0) throw new Error("at least one acceptance criterion is required");
     if (input.model) new ModelPolicy(this.workflow.model).assertAllowed(input.model);
@@ -236,13 +272,31 @@ export class LiveV4Runner {
   }
 
   async projectDesk(): Promise<ProjectDeskReadback> {
-    const status = await this.readStatus();
+    this.#beginOperation();
+    const status = await this.#readStatusInScope();
     if (!status.status) throw new Error("no discovered issue to project to the desk");
     return this.craft.readProjectDesk({ status: status.status, activeRun: status.execution });
   }
 
   async shadow(): Promise<LiveShadowReceipt> {
-    const status = await this.readStatus();
+    this.#beginOperation();
+    return this.#shadowInScope();
+  }
+
+  /**
+   * Validate every external binding and produce the shadow receipt as ONE
+   * observation. Callers used to run preflight and shadow back to back, which
+   * read the whole repository twice for a single read-only decision — and a
+   * shadow already re-reads it a third time to preview the next dispatch.
+   */
+  async shadowWithPreflight(): Promise<LiveShadowReceipt> {
+    this.#beginOperation();
+    await this.#preflightInScope();
+    return this.#shadowInScope();
+  }
+
+  async #shadowInScope(): Promise<LiveShadowReceipt> {
+    const status = await this.#readStatusInScope();
     const [projectDesk, proposal] = await Promise.all([
       status.status
         ? this.craft.readProjectDesk({ status: status.status, activeRun: status.execution })
@@ -384,7 +438,11 @@ export async function createLiveRunner(config: LiveRunnerConfig): Promise<LiveV4
       },
     },
   };
-  const rawGitHub = new GhCliTransport(config.github.executable);
+  const ghCli = new GhCliTransport(config.github.executable);
+  // Reads are answered once per operation and every write drops the memo. The
+  // fencing transports wrap this, so a fenced mutation still clears it.
+  const readScope = new ReadScopeGitHubTransport(ghCli);
+  const rawGitHub: GitHubTransport = readScope;
   const mode = config.mode ?? "issue";
   let github: GitHubTransport;
   if (mode === "discovery") {
@@ -443,7 +501,7 @@ export async function createLiveRunner(config: LiveRunnerConfig): Promise<LiveV4
     gitExecutable: config.git.executable,
   });
   const scheduler = new DeterministicScheduler(workflow, { github: tracker, craft, workspaces }, new SystemClock());
-  return new LiveV4Runner(config, workflow, tracker, craft, craftTransport, scheduler, workspaces, rawGitHub);
+  return new LiveV4Runner(config, workflow, tracker, craft, craftTransport, scheduler, workspaces, ghCli, readScope);
 }
 
 export interface ContractIssueInput {

@@ -269,6 +269,29 @@ describe('NativeSymphonyService autonomous loop', () => {
     }).loop).toMatchObject({ mode: 'shadow' })
   })
 
+  it('a shadow cycle validates and reports from one observation', async () => {
+    const path = await runnerConfigPath()
+    const calls: string[] = []
+    const runner: SymphonyRunnerLike = {
+      async preflight() { calls.push('preflight'); return { valid: true } },
+      async readStatus() { calls.push('status'); return { durable: 'same' } },
+      async projectDesk() { calls.push('desk'); return { compact: 'Project Desk' } },
+      async shadow() { calls.push('shadow'); return shadowReceipt },
+      // The combined path exists: the service must prefer it over calling
+      // preflight and shadow separately, which read the repository twice.
+      async shadowWithPreflight() { calls.push('shadow+preflight'); return shadowReceipt },
+      async tick() { calls.push('tick'); return { mutated: true } },
+    }
+    const service = new NativeSymphonyService(loopConfig(path), path, async () => runner)
+    await service.start()
+    await new Promise((resolve) => setTimeout(resolve, 60))
+
+    expect(calls.filter((c) => c === 'shadow+preflight').length).toBeGreaterThan(0)
+    expect(calls).not.toContain('preflight')
+    expect(calls).not.toContain('shadow')
+    await service.stop()
+  })
+
   it('runs read-only shadow cycles, reports them, and never ticks', async () => {
     const path = await runnerConfigPath()
     const calls: string[] = []

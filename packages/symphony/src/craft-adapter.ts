@@ -22,6 +22,13 @@ export const craftSessionStatuses = [
   "context-deadline",
   "cancelled",
   "cancel-deadline",
+  /**
+   * The session carries visible user transcript beyond its frozen prompt, so
+   * what the agent was actually told is no longer the contract the lane froze.
+   * A verdict on the run, not an error on the read: the board, the desk and
+   * every other project stay readable, and this one run is abandoned.
+   */
+  "off-contract",
 ] as const;
 export type CraftSessionStatus = (typeof craftSessionStatuses)[number];
 
@@ -621,15 +628,29 @@ export class CraftMobileControlPlaneAdapter implements CraftControlAdapter {
     return session;
   }
 
+  /**
+   * Whether the session carries visible user transcript beyond its frozen
+   * prompt. Someone spoke to the worker outside the contract — there is no
+   * supported way to do that (owner directives live in the Project Desk notes,
+   * not in the execution session), so the run cannot be trusted to have
+   * implemented what was frozen. This used to throw, which made the whole
+   * project unreadable: one nudged session and the board, the desk and every
+   * other read on that project failed until the transcript was gone, which for
+   * a durable transcript means forever.
+   */
+  private hasOffContractTranscript(session: CraftRpcSession, sessionId: string): boolean {
+    const marker = promptMarker(sessionId);
+    const visibleUserMessages = messages(session).filter((message) => message.role === "user" && !message.hidden);
+    const prompts = visibleUserMessages.filter((message) => message.content?.includes(marker));
+    return prompts.length === 1 && visibleUserMessages.length !== 1;
+  }
+
   private findPrompt(session: CraftRpcSession, sessionId: string, expectedPrompt?: string): CraftMessage | null {
     const marker = promptMarker(sessionId);
     const visibleUserMessages = messages(session).filter((message) => message.role === "user" && !message.hidden);
     const prompts = visibleUserMessages.filter((message) => message.content?.includes(marker));
     if (prompts.length > 1) throw new Error("Craft run contains duplicate execution prompts");
     const prompt = prompts[0] ?? null;
-    if (prompt && visibleUserMessages.length !== 1) {
-      throw new Error("Craft execution session contains additional user transcript");
-    }
     if (!prompt) return null;
     if (!prompt.content || (expectedPrompt !== undefined && prompt.content !== expectedPrompt)) {
       throw new Error("Craft execution prompt content does not match its frozen contract");
@@ -666,7 +687,10 @@ export class CraftMobileControlPlaneAdapter implements CraftControlAdapter {
     const turnDueAt = promptAt + this.config.deadlines.turnMs;
     const finalAt = final ? timestamp(final, Number.POSITIVE_INFINITY) : null;
     let status: CraftSessionStatus;
-    if (errors.length > 0) status = "failed";
+    // Checked first: if the agent was told something outside its contract, no
+    // other verdict about this run means anything.
+    if (this.hasOffContractTranscript(session, sessionId)) status = "off-contract";
+    else if (errors.length > 0) status = "failed";
     else if (usedContext >= this.config.deadlines.maxContextTokens) status = "context-deadline";
     else if (final && finalAt !== null && finalAt <= turnDueAt && !session.isProcessing) status = "settled";
     else if (prompt && ((finalAt !== null && finalAt > turnDueAt) || nowMs >= turnDueAt)) status = "turn-deadline";
