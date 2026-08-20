@@ -579,6 +579,56 @@ describe("v4.2 GitHub Issues and Projects adapter", () => {
     expect(merged.evidence.mergeCommitSha).toBe("c".repeat(40));
   });
 
+  test("a merged pull request still proves the merge after its base branch has moved on", async () => {
+    const { transport, adapter } = setup();
+    transport.addIssue(1);
+    const before = await adapter.get("I_1");
+    const claim = await proposedClaim(adapter, "I_1");
+    await adapter.tryClaim("I_1", before.version, claim, 1_000);
+    await adapter.markRunning(claim.fence, 1_100);
+    attachPr(transport, "I_1");
+    await adapter.advanceByEvidence(1_200);
+    expect((await adapter.get("I_1")).issue.state).toBe("pr-open");
+
+    attachPr(transport, "I_1", true);
+    transport.branches.delete("v4/acme-repo-1");
+    // The base ref's oid is the tip of the base branch, and it moves — this very
+    // merge moves it, and so does anything landing after the claim. Comparing it
+    // to the claim's base stranded Dirty-play/general#76 in pr-open with its work
+    // already merged, holding the lane's only WIP slot against every later issue.
+    transport.prs.get("I_1")![0]!.baseRefOid = "9".repeat(40);
+
+    expect(await adapter.advanceByEvidence(1_300)).toEqual([
+      { issueId: "I_1", action: "advanced", reason: "merge evidence" },
+      { issueId: "I_1", action: "advanced", reason: "merge evidence with no deployment authority" },
+    ]);
+    const done = await adapter.get("I_1");
+    expect(done.issue.state).toBe("done");
+    expect(done.evidence.mergeCommitSha).toBe("c".repeat(40));
+    // The claim is released, which is the point: the lane can take the next issue.
+    expect(done.claim).toBeNull();
+  });
+
+  test("evidence from a pull request on a different commit is still refused", async () => {
+    const { transport, adapter } = setup();
+    transport.addIssue(1);
+    const before = await adapter.get("I_1");
+    const claim = await proposedClaim(adapter, "I_1");
+    await adapter.tryClaim("I_1", before.version, claim, 1_000);
+    await adapter.markRunning(claim.fence, 1_100);
+    attachPr(transport, "I_1");
+    await adapter.advanceByEvidence(1_200);
+
+    attachPr(transport, "I_1", true);
+    transport.branches.delete("v4/acme-repo-1");
+    // Head commit identity is what pins the pull request to this attempt's work.
+    // Dropping the moving base comparison must not loosen that.
+    transport.prs.get("I_1")![0]!.headRefOid = "7".repeat(40);
+
+    expect(await adapter.advanceByEvidence(1_300)).toEqual([]);
+    expect((await adapter.get("I_1")).issue.state).toBe("pr-open");
+  });
+
   test("ordinary reconcile advances running to done on durable evidence without a live session", async () => {
     const { transport, adapter } = setup();
     transport.addIssue(1);
