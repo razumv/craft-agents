@@ -49,6 +49,13 @@ export interface OwnerPushNotification {
   tag?: string
 }
 
+/**
+ * VAPID subject. Apple's push service validates it and refuses a JWT whose
+ * subject is not a routable mailto/https, so a localhost placeholder makes every
+ * send fail with an opaque rejection.
+ */
+const DEFAULT_SUBJECT = process.env.CRAFT_PUSH_SUBJECT?.trim() || 'mailto:owner@craft.invalid'
+
 const STATES_NEEDING_A_DECISION = new Set(['owner-gate', 'blocked', 'preservation-unknown'])
 
 /** Whether a lifecycle state is one the owner has to answer. */
@@ -147,7 +154,16 @@ export class OwnerPushService {
           this.unsubscribe(target.endpoint)
           this.log(`push endpoint is gone and was removed (${status})`)
         } else {
-          this.log(`push send failed: ${error instanceof Error ? error.message : String(error)}`)
+          // The status and the service's own body are the only things that
+          // distinguish a rejected VAPID subject from a rate limit or an outage,
+          // and without them a failed push is unactionable.
+          const detail = error as { statusCode?: number; body?: string }
+          const parts = [
+            error instanceof Error ? error.message : String(error),
+            detail.statusCode ? `status ${detail.statusCode}` : null,
+            detail.body ? `body ${String(detail.body).slice(0, 200)}` : null,
+          ].filter(Boolean)
+          this.log(`push send failed: ${parts.join(' — ')}`)
         }
       }
     }
@@ -160,14 +176,14 @@ export class OwnerPushService {
     if (existsSync(this.#keysPath)) {
       const parsed = JSON.parse(readFileSync(this.#keysPath, 'utf8')) as Partial<VapidKeys>
       if (parsed.publicKey && parsed.privateKey) {
-        this.#keys = { publicKey: parsed.publicKey, privateKey: parsed.privateKey, subject: parsed.subject ?? 'mailto:owner@localhost' }
+        this.#keys = { publicKey: parsed.publicKey, privateKey: parsed.privateKey, subject: parsed.subject ?? DEFAULT_SUBJECT }
         return this.#keys
       }
       throw new Error('VAPID key file exists but is incomplete; refusing to overwrite it')
     }
     const webpush = await import('web-push')
     const generated = webpush.default.generateVAPIDKeys()
-    const keys: VapidKeys = { ...generated, subject: 'mailto:owner@localhost' }
+    const keys: VapidKeys = { ...generated, subject: DEFAULT_SUBJECT }
     mkdirSync(dirname(this.#keysPath), { recursive: true, mode: 0o700 })
     writeFileSync(this.#keysPath, JSON.stringify(keys, null, 2), { mode: 0o600 })
     chmodSync(this.#keysPath, 0o600)
