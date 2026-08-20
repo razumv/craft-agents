@@ -195,6 +195,71 @@ describe('WsRpcServer lifecycle', () => {
     // This test validates the handler is registered; full timeout is covered by the 60s static value
   })
 
+  it('applies a per-channel timeout override instead of the default', async () => {
+    server = createServer()
+    await server.listen()
+    const url = `ws://127.0.0.1:${server.port}`
+
+    // A handler that never resolves, registered with a tiny explicit budget:
+    // the response must arrive on that budget, not on the 60s default.
+    server.handle('test:slow-override', async () => {
+      await new Promise(() => {})
+    }, { timeoutMs: 120 })
+
+    const { ws } = await handshake(url, TEST_TOKEN)
+    openSockets.push(ws)
+
+    const reqId = crypto.randomUUID()
+    const response = await new Promise<any>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('no response within 5s')), 5_000)
+      ws.on('message', (data) => {
+        const msg = JSON.parse(data.toString())
+        if (msg.id === reqId) {
+          clearTimeout(timer)
+          resolve(msg)
+        }
+      })
+      ws.send(JSON.stringify({ id: reqId, type: 'request', channel: 'test:slow-override' }))
+    })
+
+    expect(response.error?.message).toContain('Handler timeout: test:slow-override')
+    expect(response.error?.message).toContain('120ms')
+  })
+
+  it('keeps the default budget for channels without an override', async () => {
+    server = createServer()
+    await server.listen()
+
+    // A fast handler resolves normally; the override only changes the deadline,
+    // never the result path.
+    server.handle('test:fast', async () => 'ok', { timeoutMs: 5_000 })
+
+    const { ws } = await handshake(`ws://127.0.0.1:${server.port}`, TEST_TOKEN)
+    openSockets.push(ws)
+
+    const reqId = crypto.randomUUID()
+    const response = await new Promise<any>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('no response within 5s')), 5_000)
+      ws.on('message', (data) => {
+        const msg = JSON.parse(data.toString())
+        if (msg.id === reqId) {
+          clearTimeout(timer)
+          resolve(msg)
+        }
+      })
+      ws.send(JSON.stringify({ id: reqId, type: 'request', channel: 'test:fast' }))
+    })
+
+    expect(response.result).toBe('ok')
+    expect(response.error).toBeUndefined()
+  })
+
+  it('rejects a non-positive per-channel timeout at registration', async () => {
+    server = createServer()
+    expect(() => server!.handle('test:bad-budget', async () => 'x', { timeoutMs: 0 }))
+      .toThrow('must be a positive finite number')
+  })
+
   // -- Protocol version tests --
 
   it('rejects wrong protocol major version', async () => {

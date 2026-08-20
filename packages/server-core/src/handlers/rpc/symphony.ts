@@ -18,6 +18,22 @@ export const HANDLED_CHANNELS = [
   RPC_CHANNELS.symphony.CREATE_ISSUE,
 ] as const
 
+/**
+ * Symphony read operations scan the whole configured repository — every issue,
+ * its ledger comments and its project item. On a repository with a hundred open
+ * issues that legitimately exceeds the default 60s handler budget, and a request
+ * that dies mid-scan tells the caller nothing while the work continues server
+ * side. The loop is unaffected either way (it never crosses the WS boundary);
+ * this budget is what makes the CLI and the board usable on large repositories.
+ */
+const SYMPHONY_READ_TIMEOUT_MS = 300_000
+
+/**
+ * A tick can drive an entire agent turn, so its budget must exceed the workflow
+ * turn deadline (2,700,000 ms) rather than merely the scan cost.
+ */
+const SYMPHONY_TICK_TIMEOUT_MS = 3_000_000
+
 function projectId(value: unknown): string {
   if (typeof value !== 'string' || !value.trim()) throw new Error('Symphony projectId is required')
   return value.trim()
@@ -27,18 +43,18 @@ export function registerSymphonyHandlers(server: RpcServer, deps: HandlerDeps): 
   const service = deps.symphonyService
   if (!service) return
 
-  server.handle(RPC_CHANNELS.symphony.VALIDATE, async (_ctx, id: unknown) => service.validate(projectId(id)))
-  server.handle(RPC_CHANNELS.symphony.SHADOW, async (_ctx, id: unknown) => service.shadow(projectId(id)))
-  server.handle(RPC_CHANNELS.symphony.PROJECT_DESK, async (_ctx, id: unknown) => service.projectDesk(projectId(id)))
-  server.handle(RPC_CHANNELS.symphony.REFRESH, async (_ctx, id: unknown) => service.refresh(projectId(id)))
-  server.handle(RPC_CHANNELS.symphony.CREATE_ISSUE, async (_ctx, id: unknown, input: unknown) => service.createIssue(projectId(id), input))
+  server.handle(RPC_CHANNELS.symphony.VALIDATE, async (_ctx, id: unknown) => service.validate(projectId(id)), { timeoutMs: SYMPHONY_READ_TIMEOUT_MS })
+  server.handle(RPC_CHANNELS.symphony.SHADOW, async (_ctx, id: unknown) => service.shadow(projectId(id)), { timeoutMs: SYMPHONY_READ_TIMEOUT_MS })
+  server.handle(RPC_CHANNELS.symphony.PROJECT_DESK, async (_ctx, id: unknown) => service.projectDesk(projectId(id)), { timeoutMs: SYMPHONY_READ_TIMEOUT_MS })
+  server.handle(RPC_CHANNELS.symphony.REFRESH, async (_ctx, id: unknown) => service.refresh(projectId(id)), { timeoutMs: SYMPHONY_READ_TIMEOUT_MS })
+  server.handle(RPC_CHANNELS.symphony.CREATE_ISSUE, async (_ctx, id: unknown, input: unknown) => service.createIssue(projectId(id), input), { timeoutMs: SYMPHONY_READ_TIMEOUT_MS })
 
   // Live board updates: broadcast after every completed operation (tick, loop
   // shadow cycles, refresh, intake) so open boards re-read status themselves.
   service.subscribe?.((changedProjectId, operation) => {
     pushTyped(server, RPC_CHANNELS.symphony.CHANGED, { to: 'all' }, { projectId: changedProjectId, operation })
   })
-  server.handle(RPC_CHANNELS.symphony.TICK, async (_ctx, id: unknown) => service.tick(projectId(id)))
+  server.handle(RPC_CHANNELS.symphony.TICK, async (_ctx, id: unknown) => service.tick(projectId(id)), { timeoutMs: SYMPHONY_TICK_TIMEOUT_MS })
   server.handle(RPC_CHANNELS.symphony.STATUS, async () => service.status())
   // Generate discovery runner-config DRAFTS from a Craft project's GitHub
   // binding. Read-only against GitHub; writes only draft JSON files under the

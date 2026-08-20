@@ -23,7 +23,7 @@ import {
   type PushTarget,
   type ErrorCode,
 } from '@craft-agent/shared/protocol'
-import type { RpcServer, HandlerFn, RequestContext } from './types'
+import type { RpcServer, HandlerFn, HandlerOptions, RequestContext } from './types'
 import { serializeEnvelope, deserializeEnvelope } from './codec'
 import { createLogger } from '@craft-agent/shared/utils'
 
@@ -125,6 +125,7 @@ export class WsRpcServer implements RpcServer {
   private httpsServer: HttpsServer | null = null
   private clients = new Map<string, ClientConnection>()
   private handlers = new Map<string, HandlerFn>()
+  private handlerTimeouts = new Map<string, number>()
   private pendingInvokes = new Map<string, PendingInvoke>()
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null
   private _port = 0
@@ -180,11 +181,23 @@ export class WsRpcServer implements RpcServer {
   // RpcServer interface
   // -------------------------------------------------------------------------
 
-  handle(channel: string, handler: HandlerFn): void {
+  handle(channel: string, handler: HandlerFn, options?: HandlerOptions): void {
     if (this.handlers.has(channel)) {
       throw new Error(`Handler already registered for channel: ${channel}`)
     }
     this.handlers.set(channel, handler)
+    const timeoutMs = options?.timeoutMs
+    if (timeoutMs !== undefined) {
+      if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+        throw new Error(`Handler timeout for ${channel} must be a positive finite number of milliseconds`)
+      }
+      this.handlerTimeouts.set(channel, timeoutMs)
+    }
+  }
+
+  /** The execution budget applied to a channel: its override, else the default. */
+  private handlerTimeoutFor(channel: string): number {
+    return this.handlerTimeouts.get(channel) ?? WsRpcServer.HANDLER_TIMEOUT_MS
   }
 
   push(channel: string, target: PushTarget, ...args: any[]): void {
@@ -636,7 +649,13 @@ export class WsRpcServer implements RpcServer {
   // Request dispatching
   // -------------------------------------------------------------------------
 
-  /** Server-side timeout for RPC handler execution (ms). */
+  /**
+   * Default server-side timeout for RPC handler execution (ms). Channels whose
+   * work is legitimately longer than this — repository-wide scans, a scheduler
+   * tick that drives a whole agent turn — raise it per channel at registration
+   * via `handle(channel, handler, { timeoutMs })` instead of inflating this
+   * default for every channel.
+   */
   private static readonly HANDLER_TIMEOUT_MS = 60_000
 
   private async onRequest(client: ClientConnection, envelope: MessageEnvelope): Promise<void> {
@@ -660,13 +679,16 @@ export class WsRpcServer implements RpcServer {
     }
 
     try {
+      const timeoutMs = this.handlerTimeoutFor(channel)
+      let timer: ReturnType<typeof setTimeout> | undefined
       const result = await Promise.race([
         handler(ctx, ...(args ?? [])),
-        new Promise<never>((_, reject) =>
-          setTimeout(() => reject(new Error(`Handler timeout: ${channel} (${WsRpcServer.HANDLER_TIMEOUT_MS}ms)`)),
-            WsRpcServer.HANDLER_TIMEOUT_MS),
-        ),
-      ])
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error(`Handler timeout: ${channel} (${timeoutMs}ms)`)), timeoutMs)
+        }),
+      ]).finally(() => {
+        if (timer !== undefined) clearTimeout(timer)
+      })
       const response: MessageEnvelope = {
         id,
         type: 'response',
