@@ -703,8 +703,15 @@ export class GitHubIssuesProjectsAdapter implements TrackerAdapter {
       : durableHeadSha
         ? { branchUrl: snapshot.evidence.branchUrl, branchSha: durableHeadSha }
         : {};
-    const claimedBaseSha = snapshot.claim?.baseSha ?? baseSha;
-    if (matchingPr && durableHeadSha && matchingPr.headRefOid === durableHeadSha && matchingPr.baseRefOid === claimedBaseSha) {
+    // Identity of the pull request is pinned by its head commit, which must be
+    // the exact commit the ledger recorded, on top of the branch/base name
+    // filter above. The base ref's oid is deliberately NOT compared: it is a
+    // moving pointer to the tip of the base branch, so the first commit landing
+    // after the claim — including this pull request's own merge — makes it
+    // differ from the claim's base forever. That comparison stranded
+    // Dirty-play/general#76 in pr-open with its work merged, holding the lane's
+    // single WIP slot against every later issue.
+    if (matchingPr && durableHeadSha && matchingPr.headRefOid === durableHeadSha) {
       Object.assign(providerEvidence, prEvidence(matchingPr));
     }
     snapshot.evidence = { ...snapshot.evidence, ...providerEvidence };
