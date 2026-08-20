@@ -50,6 +50,13 @@ export interface SymphonyRunnerLike {
   readStatus(): Promise<LiveRunnerStatus | unknown>
   projectDesk(): Promise<unknown>
   shadow(): Promise<unknown>
+  /**
+   * Validate the bindings and produce the receipt as one observation. Optional
+   * so a bare test double still satisfies the interface; when a runner offers
+   * it, use it — the separate preflight+shadow pair reads the whole repository
+   * twice for a single read-only decision.
+   */
+  shadowWithPreflight?(): Promise<unknown>
   tick(): Promise<LiveRunnerStatus | unknown>
 }
 
@@ -377,7 +384,10 @@ export class NativeSymphonyService implements SymphonyServiceControl {
   shadow(projectId: string): Promise<SymphonyOperationResult> {
     return this.#operate(projectId, 'shadow', async (runner) => {
       // Validate every external binding, but keep the verbose internal preflight
-      // record out of the compact public shadow receipt.
+      // record out of the compact public shadow receipt. One combined call when
+      // the runner offers it, so the bindings and the receipt come from the same
+      // observation instead of two full reads of the same repository.
+      if (runner.shadowWithPreflight) return runner.shadowWithPreflight()
       await runner.preflight()
       return runner.shadow()
     })

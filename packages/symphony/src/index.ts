@@ -10,6 +10,7 @@ export * from "./github-transport";
 export * from "./identity";
 export * from "./ledger";
 export * from "./policy";
+export * from "./read-scope-transport";
 export * from "./runner";
 export * from "./scheduler";
 export * from "./simulator";
