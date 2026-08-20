@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 // SPDX-License-Identifier: Apache-2.0
 
+import { formatStatusOutput } from "./cli-output";
 import { createLiveRunner, loadLiveRunnerConfig } from "./runner";
 import type { CrashPoint } from "./scheduler";
 
@@ -22,7 +23,7 @@ switch (command) {
     break;
   }
   case "status":
-    output(await runner.readStatus());
+    process.stdout.write(formatStatusOutput(await runner.readStatus(), args.includes("--compact")));
     break;
   case "project":
     output(await runner.project());
