@@ -12,8 +12,17 @@ export interface RequestContext {
 
 export type HandlerFn = (ctx: RequestContext, ...args: any[]) => Promise<any> | any
 
+export interface HandlerOptions {
+  /**
+   * Server-side execution budget for this channel, overriding the default.
+   * Only raise it for channels whose work is legitimately long — the default
+   * exists so a wedged handler cannot pin a request forever.
+   */
+  timeoutMs?: number
+}
+
 export interface RpcServer {
-  handle(channel: string, handler: HandlerFn): void
+  handle(channel: string, handler: HandlerFn, options?: HandlerOptions): void
   push(channel: string, target: PushTarget, ...args: any[]): void
   invokeClient(clientId: string, channel: string, ...args: any[]): Promise<any>
   updateClientWorkspace?(clientId: string, workspaceId: string): void
