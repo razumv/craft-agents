@@ -34,6 +34,7 @@ async function fixture() {
     labels: ["v4"],
     blockedBy: [],
     dispatchable: true,
+    closed: false,
     createdAt: null,
     updatedAt: null,
   };

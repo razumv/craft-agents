@@ -177,6 +177,7 @@ const issue: NormalizedIssue = {
   labels: ["v4"],
   blockedBy: [],
   dispatchable: true,
+    closed: false,
   createdAt: "2026-08-18T18:36:44.000Z",
   updatedAt: "2026-08-18T20:33:17.000Z",
 };
@@ -271,6 +272,7 @@ const deskStatus: ProjectStatus = {
   deploymentUrl: null,
   lastMaterialEvent: null,
   blocker: null,
+  issueClosed: false,
   nextCompletionPoint: "pull request",
   ownerGate: null,
 };

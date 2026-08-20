@@ -58,6 +58,7 @@ function transitionFixture(status: CraftSessionStatus) {
       labels: ["v4"],
       blockedBy: [],
       dispatchable: true,
+    closed: false,
       createdAt: null,
       updatedAt: null,
     },

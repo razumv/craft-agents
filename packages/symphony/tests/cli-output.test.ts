@@ -23,6 +23,7 @@ function status(
     deploymentUrl: null,
     lastMaterialEvent: null,
     blocker: null,
+    issueClosed: false,
     nextCompletionPoint: "pull request",
     ownerGate: null,
   };

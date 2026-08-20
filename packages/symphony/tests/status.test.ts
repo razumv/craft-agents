@@ -22,6 +22,7 @@ const status: ProjectStatus = {
     message: "targeted verification passed",
   },
   blocker: "waiting for owner approval",
+  issueClosed: false,
   nextCompletionPoint: "exact owner decision",
   ownerGate: {
     id: "GATE-I_52-7",
@@ -59,6 +60,7 @@ describe("compact mobile run summary", () => {
       lastMaterialEvent: null,
       blocker: null,
       ownerGate: null,
+      issueClosed: false,
       nextCompletionPoint: "pull request",
     })).toContain([
       "Branch / PR: — / —",
@@ -69,6 +71,26 @@ describe("compact mobile run summary", () => {
       "Reject: —",
       "Next completion point: pull request",
     ].join("\n"));
+  });
+
+  test("closedness travels with the projection, so a terminal run reads as history", () => {
+    const failedOnClosedIssue = {
+      issue: { id: "I_52", identifier: status.issueIdentifier, state: "failed", blockedBy: [], closed: true },
+      contract: { projectId: status.projectId, goal: status.objective },
+      evidence: {},
+      events: [{ sequence: 1, atMs: 100, state: "failed", message: "attempt 1 failed", kind: "failure" }],
+    } as unknown as TrackerIssueSnapshot;
+
+    const closed = projectStatus(failedOnClosedIssue);
+    expect(closed.issueClosed).toBeTrue();
+    // The run's own verdict is untouched — it failed, and the record says so.
+    expect(closed.state).toBe("failed");
+
+    const stillOpen = projectStatus({
+      ...failedOnClosedIssue,
+      issue: { ...failedOnClosedIssue.issue, closed: false },
+    } as unknown as TrackerIssueSnapshot);
+    expect(stillOpen.issueClosed).toBeFalse();
   });
 
   test("selects the latest material lifecycle event and excludes heartbeat noise", () => {

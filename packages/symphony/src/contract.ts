@@ -91,6 +91,7 @@ export function normalizeIssue(input: unknown): NormalizedIssue {
     labels,
     blockedBy,
     dispatchable: raw.dispatchable,
+    closed: raw.closed === true,
     createdAt: timestamp(raw.created_at ?? raw.createdAt),
     updatedAt: timestamp(raw.updated_at ?? raw.updatedAt),
   };
