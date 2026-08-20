@@ -100,6 +100,13 @@ export interface WorkflowConfig {
     retryMaxMs: number;
   };
   workspace: { root: string };
+  /**
+   * Closing the loop without a human: when the tracker's own evidence says a
+   * pull request is mergeable and its checks actually ran and passed, merge it.
+   * Absent → never. `maxRisk` is a ceiling on the contract's declared risk, so
+   * anything above it still waits for a person no matter how green it looks.
+   */
+  autoMerge?: { enabled: boolean; maxRisk: RiskTier };
   model: {
     /** Primary connection (attempt 1). */
     connection: string;

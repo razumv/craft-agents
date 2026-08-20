@@ -154,6 +154,34 @@ export class GitHubIssuesProjectsAdapter implements TrackerAdapter {
     return backlog;
   }
 
+  /**
+   * Merge the open closing PR for an issue, refusing unless the provider's own
+   * evidence justifies it. Every refusal names itself: an auto-merge that stays
+   * quiet about declining is indistinguishable from one that is not running.
+   */
+  async mergeClosingPullRequest(issueId: string): Promise<{ merged: boolean; reason: string }> {
+    if (!this.transport.mergePullRequest) return { merged: false, reason: "transport cannot merge" };
+    const detailed = await this.detailed(issueId);
+    const contract = detailed.snapshot.contract;
+    const prs = await collectPages((cursor) => this.transport.listClosingPullRequests(issueId, cursor));
+    const candidates = prs.filter((pr) => (
+      pr.headRefName === contract.requiredBranch
+      && pr.baseRefName === contract.baseBranch
+    ));
+    if (candidates.length !== 1) return { merged: false, reason: `expected exactly one closing PR, found ${candidates.length}` };
+    const pr = candidates[0]!;
+    if (pr.state === "MERGED") return { merged: false, reason: "already merged" };
+    if (pr.state !== "OPEN") return { merged: false, reason: `pull request is ${pr.state}` };
+    if (pr.mergeable !== "MERGEABLE") return { merged: false, reason: `mergeability is ${pr.mergeable}` };
+    // Today's lesson, encoded: a repository whose workflow does not trigger on
+    // this base branch reports NO checks, and reading that as green merges an
+    // unverified change. Absence of checks is never success.
+    if (pr.checkCount < 1) return { merged: false, reason: "no checks ran on the head commit" };
+    if (pr.checkRollupState !== "SUCCESS") return { merged: false, reason: `checks are ${pr.checkRollupState ?? "absent"}` };
+    await this.transport.mergePullRequest(pr.id, `${contract.goal.slice(0, 60)} (${detailed.snapshot.issue.identifier})`);
+    return { merged: true, reason: "mergeable with passing checks" };
+  }
+
   async fetchIssuesByIds(ids: readonly string[]): Promise<TrackerIssueSnapshot[]> {
     if (ids.length === 0) return [];
     const unique = [...new Set(ids)];

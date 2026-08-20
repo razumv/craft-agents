@@ -39,6 +39,13 @@ export interface TrackerAdapter {
   fetchIssuesByStates(states: readonly LifecycleState[]): Promise<TrackerIssueSnapshot[]>;
   /** Open, unmanaged issues. Optional: a tracker may have no notion of them. */
   fetchBacklog?(): Promise<TrackerBacklogIssue[]>;
+  /**
+   * Merge the open pull request that closes this issue, when the tracker's own
+   * evidence says it is safe to: mergeable, and covered by checks that actually
+   * ran and passed. Returns why it declined, so a caller can say so out loud
+   * rather than silently doing nothing. Optional capability.
+   */
+  mergeClosingPullRequest?(issueId: string): Promise<{ merged: boolean; reason: string }>;
   fetchIssuesByIds(ids: readonly string[]): Promise<TrackerIssueSnapshot[]>;
   activeClaims(): Awaitable<TrackerIssueSnapshot[]>;
   get(issueId: string): Awaitable<TrackerIssueSnapshot>;

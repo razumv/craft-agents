@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import type { CraftStartContext } from "./craft-adapter";
-import type { Claim, ProjectStatus, RunIdentity, TrackerIssueSnapshot, WorkflowConfig } from "./domain";
+import type { Claim, ProjectStatus, RiskTier, RunIdentity, TrackerIssueSnapshot, WorkflowConfig } from "./domain";
 import { IdentityFactory } from "./identity";
 import { ModelPolicy, RiskPolicy } from "./policy";
 import { projectStatus } from "./status";
@@ -46,6 +46,14 @@ export interface SchedulerAdapters {
   github: TrackerAdapter;
   craft: SchedulerCraftAdapter;
   workspaces: SchedulerWorkspaceAdapter;
+  /** Injected sink for decisions worth saying out loud (auto-merge refusals). */
+  onDiagnostic?: (message: string) => void;
+}
+
+const riskOrder = { low: 0, medium: 1, high: 2 } as const;
+
+function riskAtMost(risk: RiskTier, ceiling: RiskTier): boolean {
+  return riskOrder[risk] <= riskOrder[ceiling];
 }
 
 export type ShadowProposal =
@@ -142,6 +150,31 @@ export class DeterministicScheduler {
       if (this.dispatchable(candidate)) return this.preview(candidate.issue.id);
     }
     return null;
+  }
+
+  /**
+   * Merge a finished low-risk pull request so the lane closes without a person.
+   *
+   * Deliberately narrow. The risk ceiling comes from the contract, not from how
+   * the run went, so a medium or high contract never merges itself however green
+   * it looks. Nothing here judges the change: the provider decides mergeability
+   * and the checks decide correctness — this only declines to wait when both
+   * have already spoken. Evidence advancement then carries the issue from
+   * pr-open to merged to done on the merge the provider records, exactly as it
+   * does for a merge performed by hand.
+   */
+  private async maybeAutoMerge(snapshot: TrackerIssueSnapshot): Promise<void> {
+    const policy = this.config.autoMerge;
+    if (!policy?.enabled) return;
+    if (!this.adapters.github.mergeClosingPullRequest) return;
+    if (snapshot.issue.state !== "pr-open") return;
+    if (!riskAtMost(snapshot.contract.risk, policy.maxRisk)) return;
+    // A contract that carries deployment authority is not ours to land.
+    if (snapshot.contract.deployAuthority !== "none") return;
+    const outcome = await this.adapters.github.mergeClosingPullRequest(snapshot.issue.id);
+    this.adapters.onDiagnostic?.(
+      `auto-merge ${outcome.merged ? "merged" : "declined"} ${snapshot.issue.identifier}: ${outcome.reason}`,
+    );
   }
 
   /** Pure deterministic decision preview. It never claims, heartbeats, creates, or reconciles. */
@@ -266,6 +299,7 @@ export class DeterministicScheduler {
         continue;
       }
       if (snapshot.issue.state !== "running") {
+        await this.maybeAutoMerge(snapshot);
         await this.adapters.github.heartbeat(claim.fence, now, this.config.scheduler.claimTtlMs);
         continue;
       }

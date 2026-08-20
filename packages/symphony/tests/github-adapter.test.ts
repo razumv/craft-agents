@@ -110,6 +110,18 @@ class MemoryGitHubTransport implements GitHubTransport {
     this.hit("base");
     return Promise.resolve(this.branches.get(branchName)?.oid ?? "b".repeat(40));
   }
+  readonly merged: string[] = [];
+  async mergePullRequest(pullRequestId: string, commitHeadline: string): Promise<void> {
+    this.hit("merge-pr");
+    this.merged.push(`${pullRequestId}:${commitHeadline}`);
+    const [issueId] = [...this.prs.entries()].find(([, prs]) => prs.some((pr) => pr.id === pullRequestId)) ?? [];
+    if (issueId) {
+      this.prs.set(issueId, this.prs.get(issueId)!.map((pr) => pr.id === pullRequestId
+        ? { ...pr, state: "MERGED" as const, mergedAt: "2026-08-20T12:00:00Z", mergeCommitSha: "e".repeat(40) }
+        : pr));
+    }
+    await Promise.resolve();
+  }
   async appendComment(issueId: string, body: string): Promise<GitHubComment> {
     this.hit("append-comment");
     const timestamp = "2026-08-18T19:10:00Z";
@@ -224,8 +236,17 @@ async function proposedClaim(adapter: GitHubIssuesProjectsAdapter, issueId: stri
   );
 }
 
-function attachPr(transport: MemoryGitHubTransport, issueId: string, merged = false): void {
+function attachPr(
+  transport: MemoryGitHubTransport,
+  issueId: string,
+  merged = false,
+  checks: { state: string | null; count: number } = { state: "SUCCESS", count: 1 },
+  mergeable: "MERGEABLE" | "CONFLICTING" | "UNKNOWN" = "MERGEABLE",
+): void {
   transport.prs.set(issueId, [{
+    mergeable,
+    checkRollupState: checks.state,
+    checkCount: checks.count,
     id: "PR_1",
     url: "https://github.test/acme/repo/pull/1",
     state: merged ? "MERGED" : "OPEN",
@@ -330,6 +351,51 @@ describe("v4.2 GitHub Issues and Projects adapter", () => {
     // guessing here could show a managed issue as unmanaged backlog.
 
     expect(await adapter.fetchBacklog()).toEqual([]);
+  });
+
+  test("auto-merge lands a mergeable pull request whose checks actually passed", async () => {
+    const { transport, adapter } = setup();
+    transport.addIssue(1, "pr-open").labelNames = ["v4", "state:pr-open"];
+    attachPr(transport, "I_1", false, { state: "SUCCESS", count: 2 });
+
+    const outcome = await adapter.mergeClosingPullRequest("I_1");
+
+    expect(outcome).toMatchObject({ merged: true });
+    expect(transport.merged).toHaveLength(1);
+  });
+
+  test("auto-merge refuses when no checks ran, because absence is not success", async () => {
+    const { transport, adapter } = setup();
+    transport.addIssue(1, "pr-open").labelNames = ["v4", "state:pr-open"];
+    // A repository whose workflow does not trigger on this base branch reports
+    // no checks at all. Reading that as green merges an unverified change —
+    // which is exactly what happened to a real PR before this existed.
+    attachPr(transport, "I_1", false, { state: null, count: 0 });
+
+    const outcome = await adapter.mergeClosingPullRequest("I_1");
+
+    expect(outcome).toMatchObject({ merged: false, reason: "no checks ran on the head commit" });
+    expect(transport.merged).toBeEmpty();
+  });
+
+  test("auto-merge refuses failing checks, a conflicting merge, and an already-merged PR", async () => {
+    const failing = setup();
+    failing.transport.addIssue(1, "pr-open").labelNames = ["v4", "state:pr-open"];
+    attachPr(failing.transport, "I_1", false, { state: "FAILURE", count: 3 });
+    expect(await failing.adapter.mergeClosingPullRequest("I_1")).toMatchObject({ merged: false, reason: "checks are FAILURE" });
+    expect(failing.transport.merged).toBeEmpty();
+
+    const conflicting = setup();
+    conflicting.transport.addIssue(1, "pr-open").labelNames = ["v4", "state:pr-open"];
+    attachPr(conflicting.transport, "I_1", false, { state: "SUCCESS", count: 1 }, "CONFLICTING");
+    expect(await conflicting.adapter.mergeClosingPullRequest("I_1")).toMatchObject({ merged: false, reason: "mergeability is CONFLICTING" });
+    expect(conflicting.transport.merged).toBeEmpty();
+
+    const done = setup();
+    done.transport.addIssue(1, "pr-open").labelNames = ["v4", "state:pr-open"];
+    attachPr(done.transport, "I_1", true, { state: "SUCCESS", count: 1 });
+    expect(await done.adapter.mergeClosingPullRequest("I_1")).toMatchObject({ merged: false, reason: "already merged" });
+    expect(done.transport.merged).toBeEmpty();
   });
 
   test("concurrent compare-and-set claims elect exactly one durable comment", async () => {
