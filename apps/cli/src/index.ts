@@ -189,12 +189,17 @@ async function resolveWorkspace(
 // ---------------------------------------------------------------------------
 
 function out(data: unknown, jsonMode: boolean): void {
-  if (jsonMode) {
+  // A void RPC result has no JSON representation: `JSON.stringify(undefined)`
+  // is `undefined`, and printing that word produced output no JSON parser can
+  // read. Callers that parse our stdout then failed on every void channel —
+  // `sessions:cancel` returns nothing, so the scheduler's deadline
+  // cancellation path errored the whole project instead of settling the run.
+  // Emit nothing at all; an empty stdout is the honest encoding of no value.
+  if (data === undefined) return
+  if (jsonMode || typeof data !== 'string') {
     process.stdout.write(JSON.stringify(data, null, 2) + '\n')
-  } else if (typeof data === 'string') {
-    process.stdout.write(data + '\n')
   } else {
-    process.stdout.write(JSON.stringify(data, null, 2) + '\n')
+    process.stdout.write(data + '\n')
   }
 }
 

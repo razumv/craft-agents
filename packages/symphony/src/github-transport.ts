@@ -62,6 +62,17 @@ export interface GitHubPullRequestEvidence {
   baseRefOid: string;
   mergedAt: string | null;
   mergeCommitSha: string | null;
+  /** GitHub's own mergeability verdict; UNKNOWN while it is still computing. */
+  mergeable: "MERGEABLE" | "CONFLICTING" | "UNKNOWN";
+  /**
+   * Rollup verdict over the head commit's checks, or null when the commit has
+   * none. Null is NOT success: a repository whose workflow does not trigger on
+   * this base branch reports no checks at all, and reading that as green is how
+   * an unverified change merges itself.
+   */
+  checkRollupState: string | null;
+  /** How many checks the rollup covers. Zero means nothing ran. */
+  checkCount: number;
 }
 
 export interface GitHubBranchEvidence {
@@ -80,6 +91,8 @@ export interface GitHubTransport {
   listProjectFieldValues(itemId: string, cursor: string | null): Promise<Page<GitHubProjectFieldValue>>;
   listComments(issueId: string, cursor: string | null): Promise<Page<GitHubComment>>;
   listClosingPullRequests(issueId: string, cursor: string | null): Promise<Page<GitHubPullRequestEvidence>>;
+  /** Squash-merge one pull request by node id. A mutation: callers gate it. */
+  mergePullRequest?(pullRequestId: string, commitHeadline: string): Promise<void>;
   getBranch(repository: string, branchName: string): Promise<GitHubBranchEvidence | null>;
   getBaseSha(repository: string, branchName: string): Promise<string>;
   appendComment(issueId: string, body: string): Promise<GitHubComment>;
@@ -98,6 +111,21 @@ function page<T>(connection: GraphPage<T>): Page<T> {
     nodes: connection.nodes,
     nextCursor: connection.pageInfo.hasNextPage ? connection.pageInfo.endCursor : null,
   };
+}
+
+function headRollup(raw: Record<string, unknown>): Record<string, unknown> | null {
+  const commits = raw.commits as { nodes?: { commit?: { statusCheckRollup?: Record<string, unknown> | null } }[] } | undefined;
+  return commits?.nodes?.[0]?.commit?.statusCheckRollup ?? null;
+}
+
+function rollupState(raw: Record<string, unknown>): string | null {
+  const rollup = headRollup(raw);
+  return rollup && typeof rollup.state === "string" ? rollup.state : null;
+}
+
+function rollupCount(raw: Record<string, unknown>): number {
+  const contexts = headRollup(raw)?.contexts as { totalCount?: unknown } | undefined;
+  return typeof contexts?.totalCount === "number" ? contexts.totalCount : 0;
 }
 
 function splitRepository(repository: string): [string, string] {
@@ -181,7 +209,7 @@ export class GhCliTransport implements GitHubTransport {
   }
 
   async listClosingPullRequests(issueId: string, cursor: string | null): Promise<Page<GitHubPullRequestEvidence>> {
-    const data = await this.graphql<{ node: { closedByPullRequestsReferences: GraphPage<Record<string, unknown>> } | null }>(`query PullRequests($id:ID!,$cursor:String){node(id:$id){... on Issue{closedByPullRequestsReferences(first:100,after:$cursor,includeClosedPrs:true){nodes{id url state headRefName headRefOid baseRefName baseRefOid mergedAt mergeCommit{oid}}pageInfo{hasNextPage endCursor}}}}}`, { id: issueId, cursor });
+    const data = await this.graphql<{ node: { closedByPullRequestsReferences: GraphPage<Record<string, unknown>> } | null }>(`query PullRequests($id:ID!,$cursor:String){node(id:$id){... on Issue{closedByPullRequestsReferences(first:100,after:$cursor,includeClosedPrs:true){nodes{id url state headRefName headRefOid baseRefName baseRefOid mergedAt mergeCommit{oid} mergeable commits(last:1){nodes{commit{statusCheckRollup{state contexts(first:1){totalCount}}}}}}pageInfo{hasNextPage endCursor}}}}}`, { id: issueId, cursor });
     if (!data.node) throw new Error(`GitHub issue node ${issueId} is missing`);
     const result = page(data.node.closedByPullRequestsReferences);
     return {
@@ -191,6 +219,9 @@ export class GhCliTransport implements GitHubTransport {
         baseRefName: String(raw.baseRefName), baseRefOid: String(raw.baseRefOid),
         mergedAt: typeof raw.mergedAt === "string" ? raw.mergedAt : null,
         mergeCommitSha: raw.mergeCommit && typeof raw.mergeCommit === "object" && "oid" in raw.mergeCommit ? String(raw.mergeCommit.oid) : null,
+        mergeable: raw.mergeable === "MERGEABLE" || raw.mergeable === "CONFLICTING" ? raw.mergeable : "UNKNOWN",
+        checkRollupState: rollupState(raw),
+        checkCount: rollupCount(raw),
       })),
       nextCursor: result.nextCursor,
     };
@@ -210,6 +241,13 @@ export class GhCliTransport implements GitHubTransport {
     const branch = await this.getBranch(repository, branchName);
     if (!branch) throw new Error(`base branch ${branchName} is missing`);
     return branch.oid;
+  }
+
+  async mergePullRequest(pullRequestId: string, commitHeadline: string): Promise<void> {
+    await this.graphql(
+      `mutation Merge($id:ID!,$headline:String!){mergePullRequest(input:{pullRequestId:$id,mergeMethod:SQUASH,commitHeadline:$headline}){pullRequest{id merged}}}`,
+      { id: pullRequestId, headline: commitHeadline },
+    );
   }
 
   async appendComment(issueId: string, body: string): Promise<GitHubComment> {

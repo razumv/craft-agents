@@ -64,6 +64,11 @@ export interface LiveRunnerConfig {
     states: Record<LifecycleState, GitHubStateProjection>;
   };
   git: { executable: string };
+  /**
+   * Close low-risk work without a person: merge a mergeable pull request whose
+   * checks actually ran and passed. Absent → never merges anything.
+   */
+  autoMerge?: { enabled: boolean; maxRisk: "low" | "medium" | "high" };
   model?: {
     connection: string;
     /** Account chain. How it is consumed depends on connectionStrategy. */
@@ -421,6 +426,12 @@ export async function createLiveRunner(config: LiveRunnerConfig): Promise<LiveV4
   if (model.connectionStrategy !== undefined && model.connectionStrategy !== "failover" && model.connectionStrategy !== "balanced") {
     throw new Error('live runner model.connectionStrategy must be "failover" or "balanced"');
   }
+  if (config.autoMerge !== undefined) {
+    if (typeof config.autoMerge.enabled !== "boolean") throw new Error("live runner autoMerge.enabled must be a boolean");
+    if (!["low", "medium", "high"].includes(config.autoMerge.maxRisk)) {
+      throw new Error('live runner autoMerge.maxRisk must be "low", "medium" or "high"');
+    }
+  }
   if (!model.allowedProfiles.includes(model.defaultProfile)) {
     throw new Error("live runner model.defaultProfile must be one of model.allowedProfiles");
   }
@@ -433,6 +444,7 @@ export async function createLiveRunner(config: LiveRunnerConfig): Promise<LiveV4
     },
     tracker: { ...loaded.config.tracker, kind: "github" },
     scheduler: { ...loaded.config.scheduler, maxAttempts: config.maxAttempts ?? 1 },
+    ...(config.autoMerge ? { autoMerge: config.autoMerge } : {}),
     workspace: { root: resolve(config.workspaceRoot) },
     model: {
       connection: model.connection,
@@ -513,7 +525,13 @@ export async function createLiveRunner(config: LiveRunnerConfig): Promise<LiveV4
     workspaceRoot: config.workspaceRoot,
     gitExecutable: config.git.executable,
   });
-  const scheduler = new DeterministicScheduler(workflow, { github: tracker, craft, workspaces }, new SystemClock());
+  const scheduler = new DeterministicScheduler(
+    workflow,
+    // Auto-merge refusals go to the same place discovery's skip counts go: a
+    // policy that quietly declines is indistinguishable from one not running.
+    { github: tracker, craft, workspaces, onDiagnostic: (message) => console.warn(`[symphony] ${message}`) },
+    new SystemClock(),
+  );
   return new LiveV4Runner(config, workflow, tracker, craft, craftTransport, scheduler, workspaces, ghCli, readScope);
 }
 

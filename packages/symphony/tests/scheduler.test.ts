@@ -194,6 +194,32 @@ describe("v4.1 deterministic scheduler core", () => {
     expect(simulator.github.claimSuccessCount).toBe(1);
   });
 
+  test("auto-merge is off unless configured, and never exceeds the contract's risk ceiling", async () => {
+    const attempts: string[] = [];
+    const build = (autoMerge?: { enabled: boolean; maxRisk: RiskTier }, risk: RiskTier = "low") => {
+      const simulator = new CrashRestartSimulator(workflow);
+      simulator.seed(issue(), contract(risk));
+      const github = simulator.github as unknown as {
+        mergeClosingPullRequest?: (issueId: string) => Promise<{ merged: boolean; reason: string }>;
+      };
+      github.mergeClosingPullRequest = async (issueId: string) => {
+        attempts.push(issueId);
+        return { merged: true, reason: "test" };
+      };
+      return { simulator, config: autoMerge ? { ...workflow.config, autoMerge } : workflow.config };
+    };
+
+    // No policy: nothing is ever merged, which is the default the fleet ran on.
+    const off = build();
+    await new DeterministicScheduler(off.config, { github: off.simulator.github, workspaces: off.simulator.workspaces, craft: off.simulator.craft }, off.simulator.clock).tick();
+    expect(attempts).toBeEmpty();
+
+    // Enabled, but the contract declares more risk than the ceiling allows.
+    const tooRisky = build({ enabled: true, maxRisk: "low" }, "high");
+    await new DeterministicScheduler(tooRisky.config, { github: tooRisky.simulator.github, workspaces: tooRisky.simulator.workspaces, craft: tooRisky.simulator.craft }, tooRisky.simulator.clock).tick();
+    expect(attempts).toBeEmpty();
+  });
+
   test("owner directives are immutable and gates require exact IDs", () => {
     const ledger = new OwnerDirectiveLedger();
     const entry = ledger.append({
