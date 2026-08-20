@@ -17,6 +17,10 @@ class CountingTransport implements GitHubTransport {
     return this.calls.get(name) ?? 0;
   }
 
+  async mergePullRequest(): Promise<void> {
+    this.#hit("mergePullRequest");
+  }
+
   async listIssues(): Promise<Page<never>> {
     this.#hit("listIssues");
     if (this.failNextListIssues) {
@@ -114,5 +118,44 @@ describe("per-operation read scope", () => {
     // Second attempt must reach the provider rather than replay the rejection.
     await expect(scoped.listIssues("acme/repo", null)).resolves.toMatchObject({ nextCursor: null });
     expect(inner.count("listIssues")).toBe(2);
+  });
+
+  test("every method of the transport interface survives the wrapper", async () => {
+    // The wrapper silently dropped the optional mergePullRequest, and because it
+    // is optional that was not a type error — it read downstream as "the
+    // transport cannot merge", so auto-merge sat switched off in every project
+    // while looking configured. A missing method must fail here instead.
+    const inner = new CountingTransport();
+    const scoped = new ReadScopeGitHubTransport(inner);
+    for (const name of Object.getOwnPropertyNames(CountingTransport.prototype)) {
+      if (name === "constructor" || name === "count") continue;
+      expect(typeof (scoped as unknown as Record<string, unknown>)[name]).toBe("function");
+    }
+  });
+
+  test("merging goes through and invalidates the memo, and stays absent when the inner transport lacks it", async () => {
+    const inner = new CountingTransport();
+    const scoped = new ReadScopeGitHubTransport(inner);
+
+    await scoped.listIssues("acme/repo", null);
+    await scoped.mergePullRequest!("PR_1", "headline");
+    await scoped.listIssues("acme/repo", null);
+
+    expect(inner.count("mergePullRequest")).toBe(1);
+    // A merge changes the issue, its labels and its PR, so nothing read before
+    // it may be replayed afterwards.
+    expect(inner.count("listIssues")).toBe(2);
+
+    // Optionality is preserved rather than faked: a transport without the
+    // capability must not appear to have it.
+    // Built from the instance minus the capability — `delete` on the instance
+    // would leave the prototype's method in place and prove nothing.
+    const source = new CountingTransport() as unknown as Record<string, unknown>;
+    const withoutMerge = Object.fromEntries(
+      Object.getOwnPropertyNames(CountingTransport.prototype)
+        .filter((name) => name !== "constructor" && name !== "mergePullRequest")
+        .map((name) => [name, (source[name] as () => unknown).bind(source)]),
+    ) as unknown as GitHubTransport;
+    expect(new ReadScopeGitHubTransport(withoutMerge).mergePullRequest).toBeUndefined();
   });
 });
