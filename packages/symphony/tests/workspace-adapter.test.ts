@@ -155,7 +155,8 @@ describe("v4 live git worktree adapter", () => {
     // that jammed a live contract today.
     await Bun.write(resolve(first.workspacePath, "in-progress.txt"), "uncommitted work\n");
 
-    const retry: Claim = { ...claim, attempt: 2, ...new IdentityFactory(resolve(root, ".worktrees", "v4-runs")).forAttempt(
+    // forAttempt supplies `attempt` itself; setting it here too would be overwritten.
+    const retry: Claim = { ...claim, ...new IdentityFactory(resolve(root, ".worktrees", "v4-runs")).forAttempt(
       { id: claim.issueId, identifier: claim.issueIdentifier }, 2) };
 
     const probe = await adapter.probeBranch(retry, "v4/razumv-craft-protocol-52");
@@ -174,7 +175,8 @@ describe("v4 live git worktree adapter", () => {
 
     // An earlier attempt that produced nothing is reclaimable, so a retry may proceed.
     await adapter.ensure(claim, context);
-    const retry: Claim = { ...claim, attempt: 2, ...new IdentityFactory(resolve(root, ".worktrees", "v4-runs")).forAttempt(
+    // forAttempt supplies `attempt` itself; setting it here too would be overwritten.
+    const retry: Claim = { ...claim, ...new IdentityFactory(resolve(root, ".worktrees", "v4-runs")).forAttempt(
       { id: claim.issueId, identifier: claim.issueIdentifier }, 2) };
     expect(await adapter.probeBranch(retry, "v4/razumv-craft-protocol-52")).toMatchObject({ claimable: true });
   });
