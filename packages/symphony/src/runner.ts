@@ -32,6 +32,13 @@ export interface LiveRunnerConfig {
   repositoryRoot: string;
   workspaceRoot: string;
   /**
+   * Bounded retry budget per issue. Default 1 (single attempt, then owner
+   * handoff) — the Alpha 2 canary invariant. Product projects set 2-3: each
+   * retry is a fresh session with a fresh fence, WIP=1 and claim fencing
+   * unchanged. Owner decision 2026-08-20: product default is 3.
+   */
+  maxAttempts?: number;
+  /**
    * `issue` (default) pins the runner to one explicitly authorized issue via
    * ScopedGitHubTransport. `discovery` lets the scheduler discover eligible
    * issues across the configured repository/Project (labels + contract decide
@@ -305,6 +312,9 @@ export async function loadLiveRunnerConfig(path: string): Promise<LiveRunnerConf
   const parsed = JSON.parse(await readFile(path, "utf8")) as LiveRunnerConfig;
   const mode = parsed.mode ?? "issue";
   if (mode !== "issue" && mode !== "discovery") throw new Error("live runner mode must be issue or discovery");
+  if (parsed.maxAttempts !== undefined && (!Number.isInteger(parsed.maxAttempts) || parsed.maxAttempts < 1 || parsed.maxAttempts > 10)) {
+    throw new Error("live runner maxAttempts must be an integer between 1 and 10");
+  }
   const required: Record<string, unknown> = {
     workflowPath: parsed.workflowPath,
     repositoryRoot: parsed.repositoryRoot,
@@ -338,7 +348,7 @@ export async function createLiveRunner(config: LiveRunnerConfig): Promise<LiveV4
       repository: config.github.repository,
     },
     tracker: { ...loaded.config.tracker, kind: "github" },
-    scheduler: { ...loaded.config.scheduler, maxAttempts: 1 },
+    scheduler: { ...loaded.config.scheduler, maxAttempts: config.maxAttempts ?? 1 },
     workspace: { root: resolve(config.workspaceRoot) },
     model: {
       connection: model.connection,
