@@ -370,6 +370,30 @@ describe("v4.3 Craft mobile control-plane adapter", () => {
     expect(settled?.finalResponse).toBe("Durable final response.");
   });
 
+  test("transcript outside the frozen contract is a verdict on the run, not an unreadable project", async () => {
+    const { adapter, transport } = adapterFixture();
+    const run = identity();
+    const started = await adapter.ensure(run, startContext(run));
+    transport.finish(started.rpcSessionId, "Durable final response.");
+
+    // Someone spoke to the worker directly. There is no supported way to do
+    // that — owner directives live in the Project Desk notes — so what the
+    // agent was told is no longer the contract the lane froze.
+    transport.byId(started.rpcSessionId).messages!.push({
+      id: "nudge-1",
+      role: "user",
+      content: "Plan approved — proceed.",
+      timestamp: transport.now,
+    });
+
+    // The read must still succeed: throwing here made every read on the project
+    // fail, and a durable transcript means that never recovers.
+    const inspected = await adapter.get(run.sessionId);
+    expect(inspected?.status).toBe("off-contract");
+    // The verdict outranks the settlement the session would otherwise claim.
+    expect(inspected?.finalResponse).toBe("Durable final response.");
+  });
+
   test("replacement is fresh and inherits only a bounded compact handoff, never prior transcript", async () => {
     const { adapter, transport } = adapterFixture();
     const first = identity(1);

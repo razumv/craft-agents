@@ -372,7 +372,11 @@ export function SymphonyBoard({ onSendMessage, projectFilter = [] }: { onSendMes
   const [projectErrors, setProjectErrors] = React.useState<{ projectId: string; error: string }[]>([])
   // Terminal columns (done/attention) start collapsed — finished/failed work
   // shouldn't crowd out the active pipeline. Session-local, not persisted.
-  const [expandedTerminal, setExpandedTerminal] = React.useState<Set<string>>(() => new Set())
+  // Columns the owner has toggled away from their default. The default itself is
+  // computed per render: terminal columns and empty columns collapse to a strip,
+  // because a board is for seeing work, and an empty full-width column is a
+  // column-width hole between the columns that do have work in it.
+  const [toggledColumns, setToggledColumns] = React.useState<Set<string>>(() => new Set())
   // Previous tile states, for owner-attention transition toasts (notify-lite).
   const prevStatesRef = React.useRef<Map<string, string>>(new Map())
   const [error, setError] = React.useState<string | null>(null)
@@ -697,12 +701,20 @@ export function SymphonyBoard({ onSendMessage, projectFilter = [] }: { onSendMes
               : (tiles ?? []).filter(tile => tile.craftProjectId !== null && projectFilter.includes(tile.craftProjectId))
             const columnTiles = visible.filter(tile => columnFor(tile.state, tile.issueClosed).id === column.id)
             const isTerminal = column.id === 'done' || column.id === 'attention'
-            if (isTerminal && !expandedTerminal.has(column.id)) {
+            const collapsedByDefault = isTerminal || columnTiles.length === 0
+            const collapsed = toggledColumns.has(column.id) ? !collapsedByDefault : collapsedByDefault
+            const toggle = () => setToggledColumns(prev => {
+              const next = new Set(prev)
+              if (next.has(column.id)) next.delete(column.id)
+              else next.add(column.id)
+              return next
+            })
+            if (collapsed) {
               return (
                 <button
                   key={column.id}
                   type="button"
-                  onClick={() => setExpandedTerminal(prev => new Set(prev).add(column.id))}
+                  onClick={toggle}
                   className="flex w-10 shrink-0 snap-start flex-col items-center gap-2 rounded-xl bg-foreground/[0.02] py-3 transition-colors hover:bg-foreground/[0.05]"
                   title={t(column.labelKey)}
                 >
@@ -720,15 +732,13 @@ export function SymphonyBoard({ onSendMessage, projectFilter = [] }: { onSendMes
                   <span className="h-2 w-2 rounded-full" style={{ backgroundColor: column.accent }} />
                   <span className="text-[12px] font-semibold text-foreground/80">{t(column.labelKey)}</span>
                   <span className="ml-auto text-[11px] text-foreground/40">{columnTiles.length}</span>
-                  {isTerminal && (
-                    <button
-                      type="button"
-                      onClick={() => setExpandedTerminal(prev => { const next = new Set(prev); next.delete(column.id); return next })}
-                      className="text-[10.5px] text-foreground/40 hover:text-foreground/70"
-                    >
-                      {t('kanban.symphony.collapse')}
-                    </button>
-                  )}
+                  <button
+                    type="button"
+                    onClick={toggle}
+                    className="text-[10.5px] text-foreground/40 hover:text-foreground/70"
+                  >
+                    {t('kanban.symphony.collapse')}
+                  </button>
                 </div>
                 <div className="flex min-h-0 flex-col gap-2 overflow-y-auto">
                   {columnTiles.map(tile => (

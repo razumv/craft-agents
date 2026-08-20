@@ -271,6 +271,22 @@ export class DeterministicScheduler {
       }
 
       const session = await this.adapters.craft.get(claim.sessionId, now);
+      if (session?.status === "off-contract") {
+        // Reached only for a run still claiming to be running: durable merge
+        // evidence is applied before this loop, so work that actually landed is
+        // advanced on the provider's truth rather than judged by its session.
+        // What is left is a run whose agent was told something outside the
+        // frozen contract, which cannot be allowed to settle. Retryable on
+        // purpose — a replacement attempt starts from a clean session.
+        await this.adapters.github.failClaim(
+          claim.fence,
+          "runtime",
+          "Craft execution session received transcript outside its frozen contract",
+          now,
+          this.config.scheduler,
+        );
+        continue;
+      }
       const stale = now - claim.heartbeatAtMs >= this.config.scheduler.staleRunMs || now >= claim.expiresAtMs;
       const deadlineFailure = session && [
         "ended-without-response",
