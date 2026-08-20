@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, readFile, realpath, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import { GitWorktreeAdapter, IdentityFactory, claimBindingFile, type Claim, type CraftStartContext, type IssueContract, type NormalizedIssue } from "../src";
@@ -94,6 +94,33 @@ describe("v4 live git worktree adapter", () => {
     const { root, identity, context, adapter } = await fixture();
     await git(root, ["branch", context.contract.requiredBranch, context.claim.baseSha]);
     await expect(adapter.ensure(identity, context)).rejects.toThrow("already exists without its bound worktree");
+  });
+
+  test("a retry releases the previous attempt's empty worktree instead of dead-locking on the branch", async () => {
+    const first = await fixture();
+    await first.adapter.ensure(first.identity, first.context);
+
+    // Attempt 2: same issue, new per-attempt worktree path, same deterministic branch.
+    const secondIdentity = new IdentityFactory(first.workspaceRoot).forAttempt(first.issue, 2);
+    const secondClaim: Claim = { ...first.claim, ...secondIdentity, attempt: 2, fence: "claim-52-a2" };
+    const secondContext: CraftStartContext = { ...first.context, claim: secondClaim };
+    const worktree = await first.adapter.ensure(secondIdentity, secondContext);
+
+    expect(worktree.workspacePath).toBe(secondIdentity.workspacePath);
+    // Exactly one attempt worktree survives (plus the repository itself).
+    expect((await git(first.root, ["worktree", "list", "--porcelain"])).match(/^worktree /gm)).toHaveLength(2);
+    expect(JSON.parse(await readFile(resolve(secondIdentity.workspacePath, claimBindingFile), "utf8")).attempt).toBe(2);
+  });
+
+  test("a retry does NOT release the previous attempt's worktree when it holds work", async () => {
+    const first = await fixture();
+    const created = await first.adapter.ensure(first.identity, first.context);
+    await writeFile(resolve(created.workspacePath, "worker-output.txt"), "uncommitted work\n", "utf8");
+
+    const secondIdentity = new IdentityFactory(first.workspaceRoot).forAttempt(first.issue, 2);
+    const secondClaim: Claim = { ...first.claim, ...secondIdentity, attempt: 2, fence: "claim-52-a2" };
+    await expect(first.adapter.ensure(secondIdentity, { ...first.context, claim: secondClaim }))
+      .rejects.toThrow("already exists without its bound worktree");
   });
 });
 

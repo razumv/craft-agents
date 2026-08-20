@@ -89,7 +89,16 @@ export class GitWorktreeAdapter {
     }
 
     if (await this.branchExists(branch)) {
-      throw new Error(`deterministic branch ${branch} already exists without its bound worktree`);
+      // The required branch is deterministic per ISSUE, while the worktree path
+      // is per ATTEMPT — so a retry always finds the branch already taken by
+      // the dead attempt's worktree. Release it, but only when the evidence is
+      // unambiguous: the holder must be a worktree of this same issue whose
+      // claim binding names an EARLIER attempt, and it must carry no work
+      // (no commits beyond the base, no dirty files). Anything else still
+      // fails closed — losing a worker's commits would be far worse than
+      // burning an attempt.
+      const released = await this.releaseStaleAttemptBranch(branch, claim);
+      if (!released) throw new Error(`deterministic branch ${branch} already exists without its bound worktree`);
     }
     const listed = await this.worktreePaths();
     if (listed.has(workspacePath)) throw new Error("git reports the absent worktree path as already registered");
@@ -146,6 +155,48 @@ export class GitWorktreeAdapter {
     if (!existing.split(/\r?\n/).includes(claimBindingFile)) {
       await appendFile(excludePath, `${existing.endsWith("\n") || existing === "" ? "" : "\n"}${claimBindingFile}\n`, "utf8");
     }
+  }
+
+  /**
+   * Prune the previous attempt's worktree so its deterministic branch can be
+   * recreated for this attempt. Returns false (keep failing closed) unless
+   * every safety condition holds.
+   */
+  private async releaseStaleAttemptBranch(branch: string, claim: Claim): Promise<boolean> {
+    const holders: string[] = [];
+    const output = await this.git(["worktree", "list", "--porcelain"]);
+    let current: string | null = null;
+    for (const line of output.split("\n")) {
+      if (line.startsWith("worktree ")) current = resolve(line.slice(9));
+      else if (line.startsWith("branch ") && current && line.slice(7).trim() === `refs/heads/${branch}`) holders.push(current);
+    }
+    // Exactly one holder, inside our workspace root, and not the path we want.
+    // git reports canonical paths, so compare canonically (/var vs /private/var).
+    if (holders.length !== 1) return false;
+    const holder = holders[0]!;
+    const canonicalRoot = await realpath(this.#workspaceRoot).catch(() => this.#workspaceRoot);
+    if (!inside(canonicalRoot, holder) && !inside(this.#workspaceRoot, holder)) return false;
+
+    // Its binding must belong to the same issue and an earlier attempt.
+    const raw = await readFile(resolve(holder, claimBindingFile), "utf8").catch(() => null);
+    if (raw === null) return false;
+    let binding: Claim;
+    try {
+      binding = JSON.parse(raw) as Claim;
+    } catch {
+      return false;
+    }
+    if (binding.issueId !== claim.issueId || !(binding.attempt < claim.attempt)) return false;
+
+    // It must contain no work: clean tree and no commits beyond the base it started from.
+    const status = await this.git(["-C", holder, "status", "--porcelain"], true);
+    if (status.exitCode !== 0 || status.stdout.trim() !== "") return false;
+    const ahead = await this.git(["-C", holder, "rev-list", "--count", `${binding.baseSha}..HEAD`], true);
+    if (ahead.exitCode !== 0 || ahead.stdout.trim() !== "0") return false;
+
+    await this.git(["worktree", "remove", "--force", holder]);
+    await this.git(["branch", "-D", branch]);
+    return true;
   }
 
   private async branchExists(branch: string): Promise<boolean> {
