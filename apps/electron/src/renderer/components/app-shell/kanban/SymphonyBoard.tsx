@@ -245,7 +245,13 @@ function tilesFromServiceStatus(status: { projects: Array<Record<string, unknown
     if (Array.isArray(many) && many.length > 0) {
       for (const status of many) tiles.push(tileFromStatus(projectId, status, ownerSessionId, craftProjectId))
     } else if (inner) tiles.push(tileFromStatus(projectId, inner, ownerSessionId, craftProjectId))
-    else tiles.push(errorTile(projectId, lastError ?? 'no snapshot'))
+    else if (lastError) tiles.push(errorTile(projectId, lastError))
+    // A reconstructed project with no managed issue is not an error and has no
+    // lifecycle state: it simply has nothing contracted yet, which is exactly
+    // where a freshly onboarded project starts. Emitting a tile here stamped it
+    // `preservation-unknown` — "we cannot tell what happened to the work" — and
+    // filed a healthy project under Attention. Its repository is still visible
+    // through the Backlog column, so nothing is hidden by staying quiet.
   }
   // The same GitHub issue can be visible through several Symphony projects
   // (e.g. a pinned single-issue project plus repository discovery). Keep one
