@@ -621,16 +621,23 @@ export class GitHubIssuesProjectsAdapter implements TrackerAdapter {
     const fields = await collectPages((cursor) => this.transport.listProjectFieldValues(item.id, cursor));
     const managedLabels = labels.map(normalizeLabel).filter((label) => this.#managedLabels.has(label));
     if (managedLabels.length !== 1) throw new Error("issue must have exactly one lifecycle label");
-    const status = exactField(fields, this.config.statusFieldId);
-    if (status.kind !== "single-select") throw new Error("Project status field is not single-select");
+    // An item whose status field carries no value has simply never had a state
+    // projected onto it — which is exactly how an item arrives when a Project
+    // auto-adds new repository issues. That is not ambiguity, and refusing it
+    // stopped a whole project on one unprojected card. Duplicates still fail.
+    const status = optionalExactField(fields, this.config.statusFieldId);
+    if (status && status.kind !== "single-select") throw new Error("Project status field is not single-select");
     const gate = optionalExactStringField(fields, this.config.gateFieldId);
     const parsedEvents = parseLedgerComments(comments, record.id, this.config.eventAuthorLogin);
     if (parsedEvents.length > 0 && parsedEvents[0]!.event.expectedVersion !== 1) {
       throw new Error("ledger does not begin at baseline version 1");
     }
+    // With a status value both the label and the option must agree. Without
+    // one the label alone decides, and only a label shared by several states is
+    // genuinely ambiguous — that still fails closed below.
     const projectedCandidates = lifecycleStates.filter((state) => (
       normalizeLabel(this.config.states[state].label) === managedLabels[0]
-      && this.config.states[state].projectStatusOptionId === status.optionId
+      && (status === null || this.config.states[state].projectStatusOptionId === status.optionId)
     ));
     const ledgerBaselineState = parsedEvents[0]?.event.from;
     if (!ledgerBaselineState && projectedCandidates.length !== 1) {
@@ -676,7 +683,10 @@ export class GitHubIssuesProjectsAdapter implements TrackerAdapter {
       snapshot = reduced;
       acceptedCommentIds.add(parsed.comment.databaseId);
     }
+    // An absent status value is drift by definition: the item does not yet show
+    // the state the ledger settled on, so the next commit's projection repairs it.
     const projectionDrift = managedLabels[0] !== normalizeLabel(this.config.states[snapshot.issue.state].label)
+      || status === null
       || status.optionId !== this.config.states[snapshot.issue.state].projectStatusOptionId;
     if (snapshot.issue.state === "owner-gate") {
       const expected = snapshot.evidence.ownerGateId;
@@ -927,6 +937,13 @@ function exactField(values: GitHubProjectFieldValue[], fieldId: string): GitHubP
   const matches = values.filter((value) => value.fieldId === fieldId);
   if (matches.length !== 1) throw new Error(`Project field ${fieldId} must have exactly one value`);
   return matches[0]!;
+}
+
+/** The single value for a field, or null when the item carries none. Duplicates are ambiguous. */
+function optionalExactField(values: GitHubProjectFieldValue[], fieldId: string): GitHubProjectFieldValue | null {
+  const matches = values.filter((value) => value.fieldId === fieldId);
+  if (matches.length > 1) throw new Error(`Project field ${fieldId} has ambiguous duplicate values`);
+  return matches[0] ?? null;
 }
 
 function optionalExactStringField(values: GitHubProjectFieldValue[], fieldId: string): string | null {
