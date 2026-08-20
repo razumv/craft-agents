@@ -51,6 +51,15 @@ interface SymphonyTile {
   attempt: number | null
   retryDueAtMs: number | null
   recentEvents: { sequence: number; atMs: number; state: string; message: string }[]
+  /**
+   * What the executing agent said when it stopped. The owner reads this to learn
+   * what is being asked of them; until now it lived only in the Craft session
+   * transcript, so the board could show that a decision was needed without ever
+   * showing what the decision was about.
+   */
+  agentConclusion: string | null
+  runStatus: string | null
+  contextTokens: number | null
   error: string | null
 }
 
@@ -142,6 +151,9 @@ function tileFromStatus(projectId: string, status: Record<string, unknown>, owne
     recentEvents: Array.isArray(status.recentEvents)
       ? (status.recentEvents as SymphonyTile['recentEvents']).slice(-5)
       : [],
+    agentConclusion: null,
+    runStatus: null,
+    contextTokens: null,
     error: null,
   }
 }
@@ -175,6 +187,9 @@ function tileFromDesk(projectId: string, desk: Record<string, unknown>, ownerSes
     attempt: null,
     retryDueAtMs: null,
     recentEvents: [],
+    agentConclusion: null,
+    runStatus: null,
+    contextTokens: null,
     error: null,
   }
 }
@@ -197,6 +212,9 @@ function errorTile(projectId: string, error: string): SymphonyTile {
     attempt: null,
     retryDueAtMs: null,
     recentEvents: [],
+    agentConclusion: null,
+    runStatus: null,
+    contextTokens: null,
     error,
   }
 }
@@ -242,9 +260,30 @@ function tilesFromServiceStatus(status: { projects: Array<Record<string, unknown
     const snapshot = project.snapshot as Record<string, unknown> | null | undefined
     const many = snapshot?.statuses as Array<Record<string, unknown>> | null | undefined
     const inner = snapshot?.status as Record<string, unknown> | null | undefined
+    // The execution readback belongs to whichever issue currently holds the
+    // claim, so it is attached to that tile only — never to its neighbours.
+    const execution = snapshot?.execution as Record<string, unknown> | null | undefined
+    const claimedIssueId = asString((snapshot?.snapshot as Record<string, unknown> | undefined)?.['issue']
+      ? ((snapshot?.snapshot as Record<string, unknown>).issue as Record<string, unknown>).id
+      : null)
+    const withExecution = (tile: SymphonyTile, statusIssueId: string | null): SymphonyTile => (
+      execution && statusIssueId && statusIssueId === claimedIssueId
+        ? {
+            ...tile,
+            agentConclusion: asString(execution.finalResponse),
+            runStatus: asString(execution.status),
+            contextTokens: typeof execution.contextTokens === 'number' ? execution.contextTokens : null,
+          }
+        : tile
+    )
     if (Array.isArray(many) && many.length > 0) {
-      for (const status of many) tiles.push(tileFromStatus(projectId, status, ownerSessionId, craftProjectId))
-    } else if (inner) tiles.push(tileFromStatus(projectId, inner, ownerSessionId, craftProjectId))
+      for (const status of many) {
+        tiles.push(withExecution(
+          tileFromStatus(projectId, status, ownerSessionId, craftProjectId),
+          asString(status.issueId),
+        ))
+      }
+    } else if (inner) tiles.push(withExecution(tileFromStatus(projectId, inner, ownerSessionId, craftProjectId), asString(inner.issueId)))
     else if (lastError) tiles.push(errorTile(projectId, lastError))
     // A reconstructed project with no managed issue is not an error and has no
     // lifecycle state: it simply has nothing contracted yet, which is exactly
@@ -300,17 +339,207 @@ function issueUrlFor(tile: SymphonyTile): string | null {
   return match ? `https://github.com/${match[1]}/issues/${match[2]}` : null
 }
 
-function SymphonyTileCard({ tile, onSendMessage }: { tile: SymphonyTile; onSendMessage?: (sessionId: string, message: string) => void }) {
+/**
+ * Everything known about one tile, in one place, so a decision can be taken
+ * without leaving the board. The owner's question was the honest one: the board
+ * could say a decision was needed without ever saying what it was about, because
+ * the agent's own conclusion lived only inside the Craft session transcript.
+ */
+function SymphonyDetailPanel({ tile, onClose, onSendMessage }: {
+  tile: SymphonyTile
+  onClose: () => void
+  onSendMessage?: (sessionId: string, message: string) => void
+}) {
+  const { t } = useTranslation()
+  const canSend = !!(tile.ownerSessionId && onSendMessage)
+  const issueUrl = issueUrlFor(tile)
+  const decisionNeeded = tile.state === 'owner-gate' || !!tile.ownerGate?.id
+
+  return (
+    <aside className="flex w-full shrink-0 flex-col overflow-hidden border-l border-border bg-card md:w-[26rem]">
+      <header className="flex items-start gap-2 border-b border-border px-3 py-2">
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-2">
+            <span className="truncate text-[13px] font-semibold text-foreground">{tile.issueIdentifier}</span>
+            <span className="shrink-0 rounded-md bg-foreground/[0.06] px-1.5 py-0.5 text-[10.5px] font-medium text-foreground/70">
+              {tile.state}
+            </span>
+          </div>
+          {tile.attempt !== null && (
+            <div className="mt-0.5 text-[11px] text-foreground/50">
+              {t('kanban.symphony.attempt', { attempt: tile.attempt })}
+              {tile.runStatus ? ` · ${tile.runStatus}` : ''}
+              {tile.contextTokens !== null ? ` · ${tile.contextTokens.toLocaleString()} ctx` : ''}
+            </div>
+          )}
+        </div>
+        <button
+          type="button"
+          onClick={onClose}
+          className="rounded-md p-1 text-foreground/40 hover:bg-foreground/[0.06] hover:text-foreground"
+          aria-label={t('kanban.symphony.closeDetail')}
+        >
+          <X className="h-4 w-4" />
+        </button>
+      </header>
+
+      <div className="min-h-0 flex-1 space-y-3 overflow-y-auto px-3 py-3 text-[12px] leading-relaxed">
+        {decisionNeeded && (
+          <div className="rounded-md border border-amber-500/30 bg-amber-500/[0.07] px-2 py-1.5 text-[11px] font-semibold text-amber-700 dark:text-amber-400">
+            {t('kanban.symphony.decisionNeeded')}
+          </div>
+        )}
+
+        {tile.objective && (
+          <section>
+            <h3 className="text-[10.5px] font-semibold uppercase tracking-wide text-foreground/40">
+              {t('kanban.symphony.objective')}
+            </h3>
+            <p className="mt-1 text-foreground/85">{tile.objective}</p>
+          </section>
+        )}
+
+        {/* The point of the panel: what the agent itself reported when it stopped. */}
+        {tile.agentConclusion && (
+          <section>
+            <h3 className="text-[10.5px] font-semibold uppercase tracking-wide text-foreground/40">
+              {t('kanban.symphony.agentConclusion')}
+            </h3>
+            <pre className="mt-1 whitespace-pre-wrap break-words rounded-md bg-foreground/[0.03] px-2 py-1.5 font-sans text-[11.5px] text-foreground/85">
+              {tile.agentConclusion}
+            </pre>
+          </section>
+        )}
+
+        {tile.blocker && (
+          <section>
+            <h3 className="text-[10.5px] font-semibold uppercase tracking-wide text-foreground/40">
+              {t('kanban.symphony.blocker')}
+            </h3>
+            <p className="mt-1 text-destructive">{tile.blocker}</p>
+          </section>
+        )}
+
+        {tile.error && (
+          <section>
+            <h3 className="text-[10.5px] font-semibold uppercase tracking-wide text-foreground/40">
+              {t('kanban.symphony.error')}
+            </h3>
+            <p className="mt-1 text-destructive">{tile.error}</p>
+          </section>
+        )}
+
+        {tile.nextCompletionPoint && (
+          <section>
+            <h3 className="text-[10.5px] font-semibold uppercase tracking-wide text-foreground/40">
+              {t('kanban.symphony.nextPoint')}
+            </h3>
+            <p className="mt-1 text-foreground/70">{tile.nextCompletionPoint}</p>
+          </section>
+        )}
+
+        {tile.ownerGate?.id && (
+          <section>
+            <h3 className="text-[10.5px] font-semibold uppercase tracking-wide text-foreground/40">
+              {t('kanban.symphony.ownerGate')}
+            </h3>
+            <div className="mt-1 rounded-md bg-foreground/[0.04] px-2 py-1.5">
+              <div className="break-all font-mono text-[10.5px] text-foreground/70">{tile.ownerGate.id}</div>
+              <div className="mt-1.5 flex items-center gap-1.5">
+                <button
+                  type="button"
+                  onClick={() => void (canSend
+                    ? sendGateCommand(tile, 'approve', onSendMessage!, t)
+                    : copyGateCommand(tile.ownerGate!.approveCommand, t))}
+                  className="inline-flex items-center gap-1 rounded-md bg-emerald-500/10 px-2 py-1 text-[11px] font-semibold text-emerald-600 hover:bg-emerald-500/20"
+                >
+                  <Check className="h-3 w-3" /> {t('kanban.symphony.approve')}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void (canSend
+                    ? sendGateCommand(tile, 'reject', onSendMessage!, t)
+                    : copyGateCommand(tile.ownerGate!.rejectCommand, t))}
+                  className="inline-flex items-center gap-1 rounded-md bg-red-500/10 px-2 py-1 text-[11px] font-semibold text-red-600 hover:bg-red-500/20"
+                >
+                  <X className="h-3 w-3" /> {t('kanban.symphony.reject')}
+                </button>
+              </div>
+            </div>
+          </section>
+        )}
+
+        {tile.recentEvents.length > 0 && (
+          <section>
+            <h3 className="text-[10.5px] font-semibold uppercase tracking-wide text-foreground/40">
+              {t('kanban.symphony.history', { count: tile.recentEvents.length })}
+            </h3>
+            <ul className="mt-1 space-y-1">
+              {[...tile.recentEvents].reverse().map(event => (
+                <li key={event.sequence} className="text-[11px] text-foreground/60">
+                  <span className="font-mono text-foreground/40">#{event.sequence}</span>{' '}
+                  {new Date(event.atMs).toLocaleString()}{' '}
+                  <span className="font-medium text-foreground/70">[{event.state}]</span> {event.message}
+                </li>
+              ))}
+            </ul>
+          </section>
+        )}
+
+        <section className="flex flex-wrap items-center gap-2 pt-1">
+          {issueUrl && (
+            <button
+              type="button"
+              onClick={() => window.electronAPI.openUrl(issueUrl)}
+              className="inline-flex items-center gap-1 rounded-md bg-foreground/[0.06] px-2 py-1 text-[11px] font-medium text-foreground/75 hover:bg-foreground/[0.1]"
+            >
+              {t('kanban.symphony.issue')} <ExternalLink className="h-3 w-3" />
+            </button>
+          )}
+          {tile.prUrl && (
+            <button
+              type="button"
+              onClick={() => window.electronAPI.openUrl(tile.prUrl!)}
+              className="inline-flex items-center gap-1 rounded-md bg-foreground/[0.06] px-2 py-1 text-[11px] font-medium text-foreground/75 hover:bg-foreground/[0.1]"
+            >
+              {t('kanban.symphony.pullRequest')} <ExternalLink className="h-3 w-3" />
+            </button>
+          )}
+          {tile.branchUrl && (
+            <button
+              type="button"
+              onClick={() => window.electronAPI.openUrl(tile.branchUrl!)}
+              className="inline-flex items-center gap-1 rounded-md bg-foreground/[0.06] px-2 py-1 text-[11px] font-medium text-foreground/75 hover:bg-foreground/[0.1]"
+            >
+              {t('kanban.symphony.branch')} <ExternalLink className="h-3 w-3" />
+            </button>
+          )}
+        </section>
+      </div>
+    </aside>
+  )
+}
+
+function SymphonyTileCard({ tile, onSendMessage, onOpenDetail }: {
+  tile: SymphonyTile
+  onSendMessage?: (sessionId: string, message: string) => void
+  onOpenDetail?: (tile: SymphonyTile) => void
+}) {
   const { t } = useTranslation()
   const canSend = !!(tile.ownerSessionId && onSendMessage)
   const issueUrl = issueUrlFor(tile)
   return (
-    <div className="rounded-lg border border-border bg-card p-2.5 text-[12px] leading-snug shadow-sm">
+    // The card body opens the detail panel; the identifier still opens GitHub,
+    // so the shortcut people already use keeps working.
+    <div
+      className={`rounded-lg border border-border bg-card p-2.5 text-[12px] leading-snug shadow-sm${onOpenDetail ? ' cursor-pointer transition-colors hover:border-foreground/25' : ''}`}
+      onClick={onOpenDetail ? () => onOpenDetail(tile) : undefined}
+    >
       <div className="flex items-center justify-between gap-2">
         {issueUrl ? (
           <button
             type="button"
-            onClick={() => window.electronAPI.openUrl(issueUrl)}
+            onClick={(event) => { event.stopPropagation(); window.electronAPI.openUrl(issueUrl) }}
             className="truncate text-left font-semibold text-foreground hover:underline"
             title={issueUrl}
           >
@@ -341,7 +570,7 @@ function SymphonyTileCard({ tile, onSendMessage }: { tile: SymphonyTile; onSendM
       )}
       {tile.recentEvents.length > 0 && (
         <details className="mt-1">
-          <summary className="cursor-pointer text-[10.5px] text-foreground/40">
+          <summary onClick={(event) => event.stopPropagation()} className="cursor-pointer text-[10.5px] text-foreground/40">
             {t('kanban.symphony.history', { count: tile.recentEvents.length })}
           </summary>
           <ul className="mt-1 space-y-0.5">
@@ -364,22 +593,24 @@ function SymphonyTileCard({ tile, onSendMessage }: { tile: SymphonyTile; onSendM
           <div className="mt-1 flex items-center gap-1.5">
             <button
               type="button"
-              onClick={() =>
-                canSend
-                  ? void sendGateCommand(tile, 'approve', onSendMessage!, t)
-                  : void copyGateCommand(tile.ownerGate!.approveCommand, t)
-              }
+              onClick={(event) => {
+                event.stopPropagation()
+                void (canSend
+                  ? sendGateCommand(tile, 'approve', onSendMessage!, t)
+                  : copyGateCommand(tile.ownerGate!.approveCommand, t))
+              }}
               className="inline-flex items-center gap-1 rounded-md bg-emerald-500/10 px-1.5 py-0.5 text-[10.5px] font-semibold text-emerald-600 hover:bg-emerald-500/20"
             >
               <Check className="h-3 w-3" /> {t('kanban.symphony.approve')}
             </button>
             <button
               type="button"
-              onClick={() =>
-                canSend
-                  ? void sendGateCommand(tile, 'reject', onSendMessage!, t)
-                  : void copyGateCommand(tile.ownerGate!.rejectCommand, t)
-              }
+              onClick={(event) => {
+                event.stopPropagation()
+                void (canSend
+                  ? sendGateCommand(tile, 'reject', onSendMessage!, t)
+                  : copyGateCommand(tile.ownerGate!.rejectCommand, t))
+              }}
               className="inline-flex items-center gap-1 rounded-md bg-red-500/10 px-1.5 py-0.5 text-[10.5px] font-semibold text-red-600 hover:bg-red-500/20"
             >
               <X className="h-3 w-3" /> {t('kanban.symphony.reject')}
@@ -392,7 +623,7 @@ function SymphonyTileCard({ tile, onSendMessage }: { tile: SymphonyTile; onSendM
         {tile.prUrl && (
           <button
             type="button"
-            onClick={() => window.electronAPI.openUrl(tile.prUrl!)}
+            onClick={(event) => { event.stopPropagation(); window.electronAPI.openUrl(tile.prUrl!) }}
             className="inline-flex items-center gap-1 text-[11px] font-medium text-foreground/70 hover:text-foreground"
           >
             PR <ExternalLink className="h-3 w-3" />
@@ -401,7 +632,7 @@ function SymphonyTileCard({ tile, onSendMessage }: { tile: SymphonyTile; onSendM
         {tile.branchUrl && (
           <button
             type="button"
-            onClick={() => window.electronAPI.openUrl(tile.branchUrl!)}
+            onClick={(event) => { event.stopPropagation(); window.electronAPI.openUrl(tile.branchUrl!) }}
             className="inline-flex items-center gap-1 text-[11px] font-medium text-foreground/70 hover:text-foreground"
           >
             {t('kanban.symphony.branch')} <ExternalLink className="h-3 w-3" />
@@ -419,6 +650,9 @@ export function SymphonyBoard({ onSendMessage, projectFilter = [] }: { onSendMes
   const { t } = useTranslation()
   const [tiles, setTiles] = React.useState<SymphonyTile[] | null>(null)
   const [backlog, setBacklog] = React.useState<SymphonyBacklogItem[]>([])
+  // The open tile is tracked by issue identifier, not by object, so a refresh
+  // replaces its contents without closing the panel the owner is reading.
+  const [detailIdentifier, setDetailIdentifier] = React.useState<string | null>(null)
   const [loopInfo, setLoopInfo] = React.useState<SymphonyLoopInfo | null>(null)
   const [projectErrors, setProjectErrors] = React.useState<{ projectId: string; error: string }[]>([])
   // Terminal columns (done/attention) start collapsed — finished/failed work
@@ -747,6 +981,7 @@ export function SymphonyBoard({ onSendMessage, projectFilter = [] }: { onSendMes
           </div>
         </div>
       )}
+      <div className="flex min-h-0 flex-1">
       <div className="min-h-0 flex-1 overflow-x-auto snap-x snap-mandatory md:snap-none">
         <div className="flex h-full min-w-max gap-3 p-4">
           {SYMPHONY_COLUMNS.map(column => {
@@ -820,13 +1055,33 @@ export function SymphonyBoard({ onSendMessage, projectFilter = [] }: { onSendMes
                       </button>
                     ))
                     : columnTiles.map(tile => (
-                      <SymphonyTileCard key={`${tile.projectId}-${tile.issueIdentifier}`} tile={tile} onSendMessage={onSendMessage} />
+                      <SymphonyTileCard
+                        key={`${tile.projectId}-${tile.issueIdentifier}`}
+                        tile={tile}
+                        onSendMessage={onSendMessage}
+                        onOpenDetail={t => setDetailIdentifier(t.issueIdentifier)}
+                      />
                     ))}
                 </div>
               </div>
             )
           })}
         </div>
+      </div>
+      {/* Resolved from the current tiles each render, so the panel always shows
+          the latest state of the issue rather than a snapshot from click time. */}
+      {(() => {
+        if (!detailIdentifier) return null
+        const open = (tiles ?? []).find(tile => tile.issueIdentifier === detailIdentifier)
+        if (!open) return null
+        return (
+          <SymphonyDetailPanel
+            tile={open}
+            onClose={() => setDetailIdentifier(null)}
+            onSendMessage={onSendMessage}
+          />
+        )
+      })()}
       </div>
     </div>
   )

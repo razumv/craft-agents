@@ -119,6 +119,7 @@
     "@types/semver": "^7.7.1",
     "@types/shell-quote": "^1.7.5",
     "@types/uuid": "^11.0.0",
+    "@types/web-push": "^3.6.4",
     "@typescript-eslint/eslint-plugin": "^8.52.0",
     "@typescript-eslint/parser": "^8.52.0",
     "@vitejs/plugin-react": "^5.1.2",
@@ -144,9 +145,9 @@
     "@anthropic-ai/sdk": "^0.100.0",
     "@dnd-kit/dom": "^0.4.0-beta-20260227032529",
     "@dnd-kit/helpers": "^0.4.0-beta-20260227032529",
-    "@github/copilot-sdk": "^0.1.23",
     "@earendil-works/pi-ai": "0.80.6",
     "@earendil-works/pi-coding-agent": "0.80.6",
+    "@github/copilot-sdk": "^0.1.23",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "@radix-ui/react-avatar": "^1.1.11",
     "@radix-ui/react-collapsible": "^1.1.12",
@@ -200,6 +201,7 @@
     "tailwind-merge": "^3.4.0",
     "tiptap-extension-code-block-shiki": "^1.0.0",
     "tiptap-markdown": "^0.9.0",
+    "web-push": "^3.6.7",
     "zod": "^4.0.0"
   },
   "optionalDependencies": {

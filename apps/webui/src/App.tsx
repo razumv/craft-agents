@@ -11,6 +11,7 @@
 import React, { useState, useEffect, useRef, lazy, Suspense } from 'react'
 import { useTranslation } from 'react-i18next'
 import { createWebApi } from './adapter/web-api'
+import { OwnerPushPrompt } from './OwnerPushPrompt'
 import type { WsRpcClient } from '../../electron/src/transport/client'
 
 // Lazy-load the Electron App after window.electronAPI is set up.
@@ -64,6 +65,9 @@ export default function App() {
   const [phase, setPhase] = useState<Phase>('loading')
   const [error, setError] = useState('')
   const clientRef = useRef<WsRpcClient | null>(null)
+  // Held in state, not only in the ref, so the push prompt renders once the
+  // client exists rather than on a later unrelated re-render.
+  const [client, setClient] = useState<WsRpcClient | null>(null)
   const initRef = useRef(false)
 
   const initialize = async () => {
@@ -111,6 +115,7 @@ export default function App() {
 
       const { api, client } = createWebApi({ serverUrl: wsUrl, workspaceId })
       clientRef.current = client
+      setClient(client)
 
       // 4. Set window.electronAPI — must happen before any Electron component mounts
       ;(window as any).electronAPI = api
@@ -143,6 +148,7 @@ export default function App() {
 
   return (
     <Suspense fallback={<LoadingScreen />}>
+      {client && <OwnerPushPrompt invoke={(channel, ...args) => client.invoke(channel, ...args)} />}
       <ElectronApp />
     </Suspense>
   )

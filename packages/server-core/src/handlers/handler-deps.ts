@@ -30,6 +30,8 @@ export interface HandlerDeps<
   messagingRegistry?: IMessagingGatewayRegistry
   /** Headless-only native Symphony service; omitted by Electron hosts. */
   symphonyService?: SymphonyServiceControl
+  /** Web Push for decisions only the owner can take; absent → no push at all. */
+  ownerPush?: import('../services/owner-push').OwnerPushService
   /** Present for immutable packaged releases; absent in development/Electron fallback. */
   buildIdentity?: BuildIdentity
 }
