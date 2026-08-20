@@ -94,7 +94,16 @@ export interface WorkflowConfig {
   };
   workspace: { root: string };
   model: {
+    /** Primary connection (attempt 1). */
     connection: string;
+    /**
+     * Optional failover chain. Attempt N uses connections[N-1] (clamped to the
+     * last entry), so a provider usage limit — classified `runtime`, hence
+     * retryable — moves the next attempt to the next account instead of
+     * burning the retry budget on the same exhausted quota. Absent → every
+     * attempt uses `connection`.
+     */
+    connections?: string[];
     defaultProfile: string;
     allowedProfiles: string[];
   };

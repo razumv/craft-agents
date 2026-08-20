@@ -83,3 +83,29 @@ describe("generateDiscoveryRunnerConfigs", () => {
     expect(draft!.warnings.some((w) => w.includes("working directory"))).toBe(true);
   });
 });
+
+describe("connection failover chain", () => {
+  test("attempt N picks connections[N-1], clamps past the end, and ignores an empty chain", async () => {
+    const { connectionForAttempt } = await import("../src/identity");
+    const chain = { connection: "chatgpt-plus", connections: ["chatgpt-plus", "chatgpt-plus-2", "chatgpt-plus-3"] };
+    expect(connectionForAttempt(chain, 1)).toBe("chatgpt-plus");
+    expect(connectionForAttempt(chain, 2)).toBe("chatgpt-plus-2");
+    expect(connectionForAttempt(chain, 3)).toBe("chatgpt-plus-3");
+    // Attempts beyond the chain stay on the last account rather than wrapping
+    // back to an exhausted one.
+    expect(connectionForAttempt(chain, 4)).toBe("chatgpt-plus-3");
+    expect(connectionForAttempt({ connection: "solo" }, 3)).toBe("solo");
+    expect(connectionForAttempt({ connection: "solo", connections: [] }, 2)).toBe("solo");
+  });
+
+  test("policy allows every chain connection and dedupes the primary", async () => {
+    const { ModelPolicy } = await import("../src/policy");
+    const policy = new ModelPolicy({
+      connection: "chatgpt-plus",
+      connections: ["chatgpt-plus", "chatgpt-plus-2", " "],
+      defaultProfile: "pi/gpt-5.6-sol",
+      allowedProfiles: ["pi/gpt-5.6-sol"],
+    });
+    expect(policy.allowedConnections()).toEqual(["chatgpt-plus", "chatgpt-plus-2"]);
+  });
+});

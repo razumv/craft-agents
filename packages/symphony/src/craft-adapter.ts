@@ -108,6 +108,8 @@ export interface CraftAdapterConfig {
   promptLabelId: string;
   model: {
     connection: string;
+    /** Failover chain (see WorkflowConfig.model.connections); any entry is accepted. */
+    connections?: string[];
     allowedProfiles: string[];
   };
   expectedRuntime: CraftRuntimeIdentity;
@@ -265,6 +267,7 @@ export class CraftMobileControlPlaneAdapter implements CraftControlAdapter {
     }
     this.#models = new ModelPolicy({
       connection: config.model.connection,
+      connections: config.model.connections ? [...config.model.connections] : undefined,
       defaultProfile: config.model.allowedProfiles[0] ?? "",
       allowedProfiles: [...config.model.allowedProfiles],
     });
@@ -513,7 +516,12 @@ export class CraftMobileControlPlaneAdapter implements CraftControlAdapter {
 
   private assertRequest(identity: RunIdentity, context: CraftStartContext): void {
     this.#models.assertAllowed(context.claim.modelProfile);
-    if (context.claim.modelConnection !== this.config.model.connection) throw new Error(`Craft connection does not match model policy (expected ${this.config.model.connection})`);
+    // The claim may legitimately carry a failover-chain connection (attempt 2+),
+    // so validate membership in the policy's allowlist, not equality.
+    const allowedConnections = this.#models.allowedConnections();
+    if (!allowedConnections.includes(context.claim.modelConnection)) {
+      throw new Error(`Craft connection is outside model policy (allowed: ${allowedConnections.join(", ")})`);
+    }
     if (context.claim.sessionId !== identity.sessionId || context.claim.workspaceId !== identity.workspaceId) {
       throw new Error("Craft start context does not match deterministic run identity");
     }

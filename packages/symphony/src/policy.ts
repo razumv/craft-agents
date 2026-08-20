@@ -10,6 +10,12 @@ export class ModelPolicy {
       throw new Error(`model policy rejected ${this.config.connection}/${profile}`);
     }
   }
+
+  /** Every connection the policy permits: the primary plus any failover chain entries. */
+  allowedConnections(): string[] {
+    const chain = this.config.connections?.filter((entry) => entry.trim()) ?? [];
+    return [...new Set([this.config.connection, ...chain])];
+  }
 }
 
 export class RiskPolicy {

@@ -26,6 +26,16 @@ The Project Desk projection uses the existing Craft session-notes/mobile surface
 
 A live `tick` is rejected unless `enabled` is explicitly set to `true`. Enabling is an activation decision and is outside Alpha 2 Increment 2.
 
+## Model failover chain
+
+`model.connections` (workflow config or the live runner's `model` block) lists connections in attempt order:
+
+```json
+{ "model": { "connection": "chatgpt-plus", "connections": ["chatgpt-plus", "chatgpt-plus-2", "chatgpt-plus-3"], "defaultProfile": "pi/gpt-5.6-sol", "allowedProfiles": ["pi/gpt-5.6-sol"] } }
+```
+
+Attempt N claims on `connections[N-1]`, clamped to the last entry; absent chain → every attempt uses `connection`. A provider usage limit is a `runtime` failure, so it is retryable: with `maxAttempts: 3` and a three-account chain, an exhausted account moves the next attempt to the next account instead of burning the budget on the same quota. The pick is deterministic per attempt, so restart reconstruction rebinds the exact same connection it claimed, and the claim records it as durable evidence.
+
 ## Autonomous polling loop
 
 An optional `loop` block turns on a service-owned polling loop:
