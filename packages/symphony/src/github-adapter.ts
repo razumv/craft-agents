@@ -464,8 +464,20 @@ export class GitHubIssuesProjectsAdapter implements TrackerAdapter {
   private async loadAll(strict: boolean, requested = new Set<string>()): Promise<Map<string, Hydrated>> {
     const records = await collectPages((cursor) => this.transport.listIssues(this.config.repository, cursor));
     const cores = new Map<string, CoreHydrated>();
+    let skippedUnmanaged = 0;
     for (const record of records) {
       if (record.id === this.config.claimFenceIssueId) continue;
+      // Hydration costs six further queries per issue, and an issue with no
+      // lifecycle label is discarded either way — it cannot hold a claim, so it
+      // cannot affect WIP. When the listing already told us its labels, decide
+      // here and pay nothing. Unknown labels (a truncated page, or a transport
+      // that cannot supply them) fall through to hydration as before.
+      // Never skip an explicitly requested id: fetchIssuesByIds treats a missing
+      // requested issue as an error, and the caller asked for that issue by name.
+      if (!requested.has(record.id) && this.#listingHasNoLifecycleLabel(record)) {
+        skippedUnmanaged += 1;
+        continue;
+      }
       try {
         cores.set(record.id, await this.hydrateCore(record));
       } catch (error) {
@@ -480,6 +492,11 @@ export class GitHubIssuesProjectsAdapter implements TrackerAdapter {
         }
         this.config.onDiagnostic?.(`omitting malformed GitHub issue ${record.id}: ${errorMessage(error)}`);
       }
+    }
+    if (skippedUnmanaged > 0) {
+      // Say what was skipped: a silent narrowing of a repository-wide scan is
+      // indistinguishable from a scan that found nothing.
+      this.config.onDiagnostic?.(`skipped ${skippedUnmanaged} GitHub issues with no lifecycle label from the listing`);
     }
     const byContract = indexUnique(cores, (entry) => entry.contract.id);
     const byIdentifier = indexUnique(cores, (entry) => entry.snapshot.issue.identifier);
@@ -508,7 +525,19 @@ export class GitHubIssuesProjectsAdapter implements TrackerAdapter {
   }
 
   /** True only when the issue verifiably carries zero managed lifecycle labels. */
+  /**
+   * Whether the repository listing itself proves this issue carries no managed
+   * lifecycle label. Returns false whenever the labels are unknown, so an
+   * uncertain case is hydrated rather than skipped.
+   */
+  #listingHasNoLifecycleLabel(record: GitHubIssueRecord): boolean {
+    const names = record.labelNames;
+    if (!names) return false;
+    return !names.map(normalizeLabel).some((label) => this.#managedLabels.has(label));
+  }
+
   private async hasNoLifecycleLabel(record: GitHubIssueRecord): Promise<boolean> {
+    if (record.labelNames) return this.#listingHasNoLifecycleLabel(record);
     try {
       const labels = await collectPages((cursor) => this.transport.listLabels(record.id, cursor));
       return !labels.map(normalizeLabel).some((label) => this.#managedLabels.has(label));

@@ -15,6 +15,13 @@ export interface GitHubIssueRecord {
   createdAt: string;
   updatedAt: string;
   assigneeId: string | null;
+  /**
+   * Label names carried by the listing itself, when the transport can supply
+   * them without an extra request. Discovery uses this to decide whether an
+   * issue is worth hydrating at all; `null` means "unknown, ask separately"
+   * so a transport that cannot provide them stays correct.
+   */
+  labelNames?: readonly string[] | null;
 }
 
 export interface GitHubIssueLink {
@@ -83,6 +90,9 @@ export interface GitHubTransport {
 
 type GraphPage<T> = { nodes: T[]; pageInfo: { hasNextPage: boolean; endCursor: string | null } };
 
+/** Labels requested inline per issue in the repository listing. */
+const LISTING_LABEL_PAGE_SIZE = 50;
+
 function page<T>(connection: GraphPage<T>): Page<T> {
   return {
     nodes: connection.nodes,
@@ -102,13 +112,28 @@ export class GhCliTransport implements GitHubTransport {
 
   async listIssues(repository: string, cursor: string | null): Promise<Page<GitHubIssueRecord>> {
     const [owner, name] = splitRepository(repository);
-    const data = await this.graphql<{ repository: { issues: GraphPage<GitHubIssueRecord> } }>(`query Issues($owner:String!,$name:String!,$cursor:String){repository(owner:$owner,name:$name){issues(first:100,after:$cursor,orderBy:{field:CREATED_AT,direction:ASC}){nodes{id number title body url state createdAt updatedAt assignees(first:1){nodes{id}}}pageInfo{hasNextPage endCursor}}}}`, { owner, name, cursor });
+    // Labels ride along with the listing: hydrating an issue costs six further
+    // queries, and an issue with no lifecycle label is never hydrated. Asking
+    // for them here turns a repository-wide scan from O(issues) round trips
+    // into O(pages) for everything the lane does not manage.
+    const data = await this.graphql<{ repository: { issues: GraphPage<GitHubIssueRecord> } }>(`query Issues($owner:String!,$name:String!,$cursor:String){repository(owner:$owner,name:$name){issues(first:100,after:$cursor,orderBy:{field:CREATED_AT,direction:ASC}){nodes{id number title body url state createdAt updatedAt assignees(first:1){nodes{id}}labels(first:LABEL_PAGE){nodes{name}totalCount}}pageInfo{hasNextPage endCursor}}}}`.replace("LABEL_PAGE", String(LISTING_LABEL_PAGE_SIZE)), { owner, name, cursor });
     return page({
       ...data.repository.issues,
-      nodes: data.repository.issues.nodes.map((issue) => ({
-        ...issue,
-        assigneeId: (issue as GitHubIssueRecord & { assignees?: { nodes: { id: string }[] } }).assignees?.nodes[0]?.id ?? null,
-      })),
+      nodes: data.repository.issues.nodes.map((issue) => {
+        const raw = issue as GitHubIssueRecord & {
+          assignees?: { nodes: { id: string }[] };
+          labels?: { nodes: { name: string }[]; totalCount: number };
+        };
+        // A truncated label set is reported as unknown rather than as a short
+        // list: claiming "no lifecycle label" from a partial page would skip an
+        // issue that actually holds a claim.
+        const truncated = raw.labels ? raw.labels.totalCount > raw.labels.nodes.length : true;
+        return {
+          ...issue,
+          assigneeId: raw.assignees?.nodes[0]?.id ?? null,
+          labelNames: raw.labels && !truncated ? raw.labels.nodes.map((label) => label.name) : null,
+        };
+      }),
     });
   }
 
