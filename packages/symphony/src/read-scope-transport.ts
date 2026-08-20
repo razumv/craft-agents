@@ -37,7 +37,17 @@ export class ReadScopeGitHubTransport implements GitHubTransport {
   #hits = 0;
   #misses = 0;
 
-  constructor(readonly inner: GitHubTransport) {}
+  constructor(readonly inner: GitHubTransport) {
+    // Assigned here, not as a field initializer: a field initializer can run
+    // before the parameter property is in place, which would read `inner` as
+    // undefined and drop the method for a transport that has it.
+    if (inner.mergePullRequest) {
+      this.mergePullRequest = async (pullRequestId, commitHeadline) => {
+        this.clear();
+        return inner.mergePullRequest!(pullRequestId, commitHeadline);
+      };
+    }
+  }
 
   /** Drop everything remembered. Called at the start of an operation and by every write. */
   clear(): void {
@@ -134,4 +144,15 @@ export class ReadScopeGitHubTransport implements GitHubTransport {
     this.clear();
     return this.inner.updateProjectText(projectId, itemId, fieldId, value);
   }
+
+  /**
+   * Forwarded explicitly rather than left to fall through, because it does not
+   * fall through: an optional method missing from this wrapper is not a type
+   * error, it silently reads as "the transport cannot merge" — which is how
+   * auto-merge sat switched off for every project while looking configured.
+   *
+   * Defined as a field so it is absent exactly when the inner transport's is,
+   * instead of always present and failing at the call.
+   */
+  readonly mergePullRequest?: (pullRequestId: string, commitHeadline: string) => Promise<void>;
 }
