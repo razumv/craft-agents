@@ -36,6 +36,20 @@ The workflow schema is exported as `@craft-agent/symphony/workflow.schema.json`.
 - root-confined, atomic workspace claim bindings;
 - fresh replacement sessions with bounded status handoff and no transcript inheritance.
 
+## Read-only backlog grooming
+
+`LiveV4Runner.proposeGrooming()` reads one repository's existing unmanaged backlog and returns either one parser-valid contract proposal or an exact refusal. It never labels, comments, edits, claims, or updates a Project field. Candidate order is the scheduler's upstream order: priority 1 through 4 ascending; every other value and null after; creation time oldest first with null last; then identifier.
+
+A candidate is refused when an open blocker, open parent, or prerequisite label is present. Contract acceptance criteria are copied only from explicit issue-authored acceptance bullets and retain exact source-line mappings; unsupported additions are defects. Missing falsifiable acceptance or explicit non-goals produces a refusal rather than an invented contract.
+
+The grooming risk rubric is deterministic and evaluated in this order:
+
+1. **High** — credentials/secrets, authentication/authorization, payments/billing, data deletion/destructive operations, or anything described as irreversible.
+2. **Low** — explicitly documentation-only or tests/fixtures-only work.
+3. **Medium** — all other executable changes.
+
+High-risk classification cannot be downgraded. Every proposal copies the exact verification budget declared by `workflow.verification[risk]` and is round-tripped through the real issue contract parser before it is returned.
+
 ## Focused verification
 
 From this package:

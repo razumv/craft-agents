@@ -21,6 +21,7 @@ import {
   type Page,
 } from "./github-transport";
 import { ModelPolicy } from "./policy";
+import { proposeBacklogGrooming, type GroomingProposal } from "./grooming";
 import { ReadScopeGitHubTransport } from "./read-scope-transport";
 import { DeterministicScheduler, type Clock, type CrashPoint, type ShadowProposal } from "./scheduler";
 import type { TrackerBacklogIssue } from "./tracker";
@@ -287,6 +288,17 @@ export class LiveV4Runner {
       this.config.github.statusFieldId, this.config.github.states.ready.projectStatusOptionId,
     );
     return created;
+  }
+
+  /**
+   * Read one repository backlog and return a grounded grooming proposal or an
+   * exact refusal. The only adapter capability reachable here is fetchBacklog;
+   * the pure proposal builder has no transport reference and cannot mutate.
+   */
+  async proposeGrooming(): Promise<GroomingProposal> {
+    this.#beginOperation();
+    const backlog = await this.tracker.fetchBacklog();
+    return proposeBacklogGrooming(this.config.github.repository, backlog, this.workflow);
   }
 
   async projectDesk(): Promise<ProjectDeskReadback> {

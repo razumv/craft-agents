@@ -7,6 +7,7 @@ export * from "./craft-transport";
 export * from "./domain";
 export * from "./github-adapter";
 export * from "./github-transport";
+export * from "./grooming";
 export * from "./identity";
 export * from "./ledger";
 export * from "./policy";

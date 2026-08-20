@@ -323,7 +323,7 @@ describe("v4.2 GitHub Issues and Projects adapter", () => {
     expect(snapshot.issue.identifier).toBe("acme/repo#1");
   });
 
-  test("backlog is the open unmanaged issues, and costs nothing beyond the listing", async () => {
+  test("backlog is the open unmanaged issues without full lifecycle hydration", async () => {
     const { transport, adapter } = setup();
     const managed = transport.addIssue(1, "ready");
     const unmanaged = transport.addIssue(2, "ready");
@@ -339,7 +339,9 @@ describe("v4.2 GitHub Issues and Projects adapter", () => {
     // the closed one is not work anybody is waiting on.
     expect(backlog.map((entry) => entry.identifier)).toEqual(["acme/repo#2"]);
     expect(backlog[0]).toMatchObject({ number: 2, labels: ["bug", "tracking:child"] });
-    // No per-issue hydration: the labels rode along with the listing.
+    // Blocker edges are read for grooming, but no lifecycle/Project hydration is
+    // needed: labels, body, priority and parent rode along with the listing.
+    expect(transport.calls.get("blocked-by")).toBe(1);
     expect(transport.calls.get("project-items") ?? 0).toBe(0);
     expect(transport.calls.get("comments") ?? 0).toBe(0);
   });
