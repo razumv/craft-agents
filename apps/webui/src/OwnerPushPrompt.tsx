@@ -53,7 +53,12 @@ export function OwnerPushPrompt({ invoke }: Props) {
   }
 
   return (
-    <div className="flex items-center gap-3 px-4 py-2 text-[13px] bg-background shadow-minimal">
+    // The bar sits above the app shell, which means it — not the shell — is what
+    // the notch and status bar overlap, so it carries the safe-area inset itself.
+    <div
+      className="flex items-center gap-3 px-4 pb-2 text-[13px] bg-background shadow-minimal"
+      style={{ paddingTop: 'calc(env(safe-area-inset-top, 0px) + 0.5rem)' }}
+    >
       <span className="text-foreground/70 flex-1">
         {note ?? t('webui.ownerPush.offer')}
       </span>
