@@ -442,6 +442,15 @@ export interface ContractIssueInput {
   acceptance: string[];
   nonGoals: string[];
   model?: string;
+  /**
+   * Contract ids / issue identifiers this work depends on. The tracker resolves
+   * them into blockedBy, so a dependent issue is simply not dispatchable until
+   * its dependencies are done — this is how v4 expresses decomposition
+   * (separate issues + edges), instead of the Tasks world's subtask DAG.
+   */
+  dependencies?: string[];
+  /** Overrides the runner config default (risk tiers carry different budgets). */
+  verificationBudget?: string;
 }
 
 /** Quote a scalar whenever plain YAML could misread it (reserved leading chars bit us live: a backtick-led scalar is a parse error). */
@@ -457,6 +466,7 @@ export function contractIssueBody(
   defaults: { id: string; model: string; verificationBudget: string },
 ): string {
   const list = (items: string[]) => items.map((item) => `  - ${yamlScalar(item)}`).join("\n");
+  const dependencies = (input.dependencies ?? []).filter((entry) => entry.trim());
   return [
     "## Work contract",
     "",
@@ -466,7 +476,8 @@ export function contractIssueBody(
     `risk: ${input.risk}`,
     "deployAuthority: none",
     `model: ${yamlScalar(input.model ?? defaults.model)}`,
-    `verificationBudget: ${yamlScalar(defaults.verificationBudget)}`,
+    `verificationBudget: ${yamlScalar(input.verificationBudget?.trim() || defaults.verificationBudget)}`,
+    ...(dependencies.length ? ["dependencies:", list(dependencies)] : []),
     "acceptance:",
     list(input.acceptance),
     "nonGoals:",
