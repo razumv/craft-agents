@@ -391,6 +391,18 @@ export class GitHubIssuesProjectsAdapter implements TrackerAdapter {
     for (const snapshot of active.sort((a, b) => a.issue.id.localeCompare(b.issue.id))) {
       results.push(...await this.advanceClaimByEvidence(snapshot, nowMs));
     }
+    // An attempt failing and the work landing are different facts, and the state
+    // must report the second one. A failure released the claim, so these issues
+    // are not "active" and nothing here used to look at them again — leaving
+    // razumv/magicmarkets#146 labelled failed with its pull request merged, which
+    // is the board telling the owner the opposite of what happened. The failed
+    // attempt stays in the ledger history, where a failure belongs.
+    for (const entry of [...(await this.loadAll(false)).values()].sort((a, b) => a.snapshot.issue.id.localeCompare(b.snapshot.issue.id))) {
+      const snapshot = entry.snapshot;
+      if (snapshot.claim) continue;
+      if (!landedWithoutSaying(snapshot)) continue;
+      results.push(...await this.advanceClaimByEvidence(snapshot, nowMs));
+    }
     return results;
   }
 
@@ -399,13 +411,15 @@ export class GitHubIssuesProjectsAdapter implements TrackerAdapter {
     let snapshot = start;
     // Bounded so a hypothetical evidence cycle can never spin the tick.
     for (let hop = 0; hop < lifecycleStates.length; hop += 1) {
-      const claim = snapshot.claim;
-      if (!claim) break;
       const step = nextEvidenceStep(snapshot);
       if (!step) break;
       const from = snapshot.issue.state;
+      // A terminal issue has no claim and needs none: there is no run to fence
+      // against, only a merge that already happened and a state that has not
+      // caught up with it.
+      const fence = snapshot.claim?.fence;
       snapshot = await this.transition(snapshot.issue.id, step.to, nowMs, {
-        fence: claim.fence,
+        ...(fence ? { fence } : {}),
         message: `durable ${step.reason} advanced ${from} to ${step.to}`,
         evidence: snapshot.evidence,
       });
@@ -733,6 +747,15 @@ export class GitHubIssuesProjectsAdapter implements TrackerAdapter {
  * deployment authority; anything deployable stays in `merged` for the real
  * deployment to prove.
  */
+/**
+ * A terminal-unsuccessful issue whose own pull request merged. The attempt
+ * failed; the work did not.
+ */
+function landedWithoutSaying(snapshot: TrackerIssueSnapshot): boolean {
+  if (!["failed", "cancelled"].includes(snapshot.issue.state)) return false;
+  return Boolean(snapshot.evidence.mergedAt && snapshot.evidence.mergeCommitSha);
+}
+
 function nextEvidenceStep(snapshot: TrackerIssueSnapshot): { to: LifecycleState; reason: string } | undefined {
   const state = snapshot.issue.state;
   const evidence = snapshot.evidence;
@@ -741,6 +764,12 @@ function nextEvidenceStep(snapshot: TrackerIssueSnapshot): { to: LifecycleState;
     // High-risk work must pass through owner-gate before merged; leave it be.
     if (snapshot.contract.risk === "high" && state !== "owner-gate") return undefined;
     return { to: "merged", reason: "merge evidence" };
+  }
+  // The gate that a high-risk contract owes is a gate before merging. Once the
+  // merge is a fact, refusing to record it does not un-merge anything; it only
+  // keeps the board reporting a failure over delivered work.
+  if (["failed", "cancelled"].includes(state) && evidence.mergedAt && evidence.mergeCommitSha) {
+    return { to: "merged", reason: "merge evidence after a failed attempt" };
   }
   if (state === "merged" && snapshot.contract.deployAuthority === "none") {
     return { to: "done", reason: "merge evidence with no deployment authority" };

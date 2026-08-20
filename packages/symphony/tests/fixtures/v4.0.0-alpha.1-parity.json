@@ -16,8 +16,8 @@
     "done": [],
     "blocked": ["ready", "cancelled"],
     "retry-wait": ["claimed", "failed", "cancelled"],
-    "failed": [],
-    "cancelled": [],
+    "failed": ["merged"],
+    "cancelled": ["merged"],
     "preservation-unknown": []
   },
   "claimAndEvidence": {
