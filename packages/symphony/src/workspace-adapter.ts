@@ -163,7 +163,44 @@ export class GitWorktreeAdapter {
    * recreated for this attempt. Returns false (keep failing closed) unless
    * every safety condition holds.
    */
+  /**
+   * Whether a claim for this branch could take it, asked BEFORE the claim is
+   * spent. `ensure` already refuses a branch held by work — deliberately, since
+   * discarding a worker's commits is worse than burning an attempt — but it
+   * refuses after the claim exists, so a jammed branch consumed the whole retry
+   * budget one attempt at a time. Probing first lets the scheduler skip the
+   * issue and dispatch something else instead.
+   *
+   * Read-only: it releases nothing and creates nothing.
+   */
+  async probeBranch(claim: Claim, requiredBranch: string): Promise<{ claimable: boolean; reason: string }> {
+    const branch = validateBranch(requiredBranch);
+    if (!await this.branchExists(branch)) return { claimable: true, reason: "branch does not exist yet" };
+    const workspacePath = resolve(this.#workspaceRoot, claim.workspaceKey);
+    const existing = await lstat(workspacePath).catch((error) => missing(error) ? null : Promise.reject(error));
+    // This attempt's own worktree already being there is resumption, not a jam.
+    if (existing?.isDirectory()) return { claimable: true, reason: "this attempt's worktree already exists" };
+    const releasable = await this.#releasableHolder(branch, claim) !== null;
+    return releasable
+      ? { claimable: true, reason: "branch is held by an earlier empty attempt and can be released" }
+      : { claimable: false, reason: `deterministic branch ${branch} is held by work a retry cannot reclaim` };
+  }
+
   private async releaseStaleAttemptBranch(branch: string, claim: Claim): Promise<boolean> {
+    const holder = await this.#releasableHolder(branch, claim);
+    if (holder === null) return false;
+    await this.git(["worktree", "remove", "--force", holder]);
+    await this.git(["branch", "-D", branch]);
+    return true;
+  }
+
+  /**
+   * The worktree currently holding this branch, when releasing it is provably
+   * safe, else null. Shared by the read-only probe and the actual release so
+   * the two can never disagree — a probe that says yes where the release says
+   * no would be worse than having no probe at all.
+   */
+  async #releasableHolder(branch: string, claim: Claim): Promise<string | null> {
     const holders: string[] = [];
     const output = await this.git(["worktree", "list", "--porcelain"]);
     let current: string | null = null;
@@ -173,31 +210,29 @@ export class GitWorktreeAdapter {
     }
     // Exactly one holder, inside our workspace root, and not the path we want.
     // git reports canonical paths, so compare canonically (/var vs /private/var).
-    if (holders.length !== 1) return false;
+    if (holders.length !== 1) return null;
     const holder = holders[0]!;
     const canonicalRoot = await realpath(this.#workspaceRoot).catch(() => this.#workspaceRoot);
-    if (!inside(canonicalRoot, holder) && !inside(this.#workspaceRoot, holder)) return false;
+    if (!inside(canonicalRoot, holder) && !inside(this.#workspaceRoot, holder)) return null;
 
     // Its binding must belong to the same issue and an earlier attempt.
     const raw = await readFile(resolve(holder, claimBindingFile), "utf8").catch(() => null);
-    if (raw === null) return false;
+    if (raw === null) return null;
     let binding: Claim;
     try {
       binding = JSON.parse(raw) as Claim;
     } catch {
-      return false;
+      return null;
     }
-    if (binding.issueId !== claim.issueId || !(binding.attempt < claim.attempt)) return false;
+    if (binding.issueId !== claim.issueId || !(binding.attempt < claim.attempt)) return null;
 
     // It must contain no work: clean tree and no commits beyond the base it started from.
     const status = await this.git(["-C", holder, "status", "--porcelain"], true);
-    if (status.exitCode !== 0 || status.stdout.trim() !== "") return false;
+    if (status.exitCode !== 0 || status.stdout.trim() !== "") return null;
     const ahead = await this.git(["-C", holder, "rev-list", "--count", `${binding.baseSha}..HEAD`], true);
-    if (ahead.exitCode !== 0 || ahead.stdout.trim() !== "0") return false;
+    if (ahead.exitCode !== 0 || ahead.stdout.trim() !== "0") return null;
 
-    await this.git(["worktree", "remove", "--force", holder]);
-    await this.git(["branch", "-D", branch]);
-    return true;
+    return holder;
   }
 
   /**
