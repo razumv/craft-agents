@@ -40,6 +40,11 @@ export interface SchedulerCraftAdapter {
 
 export interface SchedulerWorkspaceAdapter {
   ensure(identity: RunIdentity, context?: CraftStartContext): Promise<unknown>;
+  /**
+   * Read-only: could a claim for this branch actually take it? Optional, so a
+   * simulator or test double needs nothing new.
+   */
+  probeBranch?(claim: Claim, requiredBranch: string): Promise<{ claimable: boolean; reason: string }>;
 }
 
 export interface SchedulerAdapters {
@@ -118,6 +123,21 @@ export class DeterministicScheduler {
         this.clock.nowMs(),
         this.config.scheduler.claimTtlMs,
       );
+      // Ask before spending the claim. `ensure` refuses a branch held by real
+      // work — rightly, since discarding a worker's commits is worse than
+      // burning an attempt — but it refuses after the claim exists, so a jammed
+      // branch ate the whole retry budget one attempt at a time. Skipping the
+      // candidate leaves it exactly as it was, for a person to look at, and
+      // lets the tick dispatch something that can actually run.
+      if (this.adapters.workspaces.probeBranch) {
+        const probe = await this.adapters.workspaces.probeBranch(claim, candidate.contract.requiredBranch);
+        if (!probe.claimable) {
+          this.adapters.onDiagnostic?.(
+            `skipping ${candidate.issue.identifier} without claiming: ${probe.reason}`,
+          );
+          continue;
+        }
+      }
       const claimed = await this.adapters.github.tryClaim(
         candidate.issue.id,
         candidate.version,

@@ -148,6 +148,37 @@ describe("v4 live git worktree adapter", () => {
     expect(JSON.parse(await readFile(resolve(secondIdentity.workspacePath, claimBindingFile), "utf8")).attempt).toBe(2);
   });
 
+  test("the probe refuses a branch held by work, and agrees with what ensure would do", async () => {
+    const { root, claim, context, adapter } = await fixture();
+    const first = await adapter.ensure(claim, context);
+    // The first attempt does real work and never commits it — exactly the state
+    // that jammed a live contract today.
+    await Bun.write(resolve(first.workspacePath, "in-progress.txt"), "uncommitted work\n");
+
+    const retry: Claim = { ...claim, attempt: 2, ...new IdentityFactory(resolve(root, ".worktrees", "v4-runs")).forAttempt(
+      { id: claim.issueId, identifier: claim.issueIdentifier }, 2) };
+
+    const probe = await adapter.probeBranch(retry, "v4/razumv-craft-protocol-52");
+    expect(probe.claimable).toBeFalse();
+    expect(probe.reason).toContain("a retry cannot reclaim");
+
+    // And the probe told the truth: ensure refuses the same branch.
+    await expect(adapter.ensure(retry, { ...context, claim: retry })).rejects.toThrow(/already exists/);
+  });
+
+  test("the probe allows a fresh branch and an earlier empty attempt", async () => {
+    const { root, claim, context, adapter } = await fixture();
+
+    // Nothing exists yet.
+    expect(await adapter.probeBranch(claim, "v4/razumv-craft-protocol-52")).toMatchObject({ claimable: true });
+
+    // An earlier attempt that produced nothing is reclaimable, so a retry may proceed.
+    await adapter.ensure(claim, context);
+    const retry: Claim = { ...claim, attempt: 2, ...new IdentityFactory(resolve(root, ".worktrees", "v4-runs")).forAttempt(
+      { id: claim.issueId, identifier: claim.issueIdentifier }, 2) };
+    expect(await adapter.probeBranch(retry, "v4/razumv-craft-protocol-52")).toMatchObject({ claimable: true });
+  });
+
   test("a retry does NOT release the previous attempt's worktree when it holds work", async () => {
     const first = await fixture();
     const created = await first.adapter.ensure(first.identity, first.context);
