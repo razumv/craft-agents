@@ -634,9 +634,17 @@ export class GitHubIssuesProjectsAdapter implements TrackerAdapter {
     // With a status value both the label and the option must agree. Without
     // one the label alone decides, and only a label shared by several states is
     // genuinely ambiguous — that still fails closed below.
+    // A status the lane does not own is not a disagreement, it is a human column.
+    // A board sets its own default when an issue is added — "Backlog", "Todo" —
+    // and treating that as ambiguity refused a freshly written contract until
+    // someone set the field by hand. The lane owns exactly the options it was
+    // configured with; anything else is as good as unprojected, and the next
+    // commit projects the real state over it.
+    const laneOptionIds = new Set(lifecycleStates.map((state) => this.config.states[state].projectStatusOptionId));
+    const laneStatus = status && status.optionId !== null && laneOptionIds.has(status.optionId) ? status : null;
     const projectedCandidates = lifecycleStates.filter((state) => (
       normalizeLabel(this.config.states[state].label) === managedLabels[0]
-      && (status === null || this.config.states[state].projectStatusOptionId === status.optionId)
+      && (laneStatus === null || this.config.states[state].projectStatusOptionId === laneStatus.optionId)
     ));
     const ledgerBaselineState = parsedEvents[0]?.event.from;
     if (!ledgerBaselineState && projectedCandidates.length !== 1) {
@@ -685,8 +693,8 @@ export class GitHubIssuesProjectsAdapter implements TrackerAdapter {
     // An absent status value is drift by definition: the item does not yet show
     // the state the ledger settled on, so the next commit's projection repairs it.
     const projectionDrift = managedLabels[0] !== normalizeLabel(this.config.states[snapshot.issue.state].label)
-      || status === null
-      || status.optionId !== this.config.states[snapshot.issue.state].projectStatusOptionId;
+      || laneStatus === null
+      || laneStatus.optionId !== this.config.states[snapshot.issue.state].projectStatusOptionId;
     if (snapshot.issue.state === "owner-gate") {
       const expected = snapshot.evidence.ownerGateId;
       if (!expected) throw new Error("owner-gate ledger event lacks immutable gate ID");

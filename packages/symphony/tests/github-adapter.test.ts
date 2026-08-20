@@ -579,6 +579,22 @@ describe("v4.2 GitHub Issues and Projects adapter", () => {
     expect(merged.evidence.mergeCommitSha).toBe("c".repeat(40));
   });
 
+  test("a board's own default status column does not read as ambiguity", async () => {
+    const { transport, adapter } = setup();
+    transport.addIssue(1);
+    // A project sets its own default when an issue is added to a board, and that
+    // option belongs to no lifecycle state. Treating it as a disagreement
+    // refused a freshly written contract until a human set the field by hand.
+    for (const values of transport.fields.values()) {
+      for (const value of values) {
+        if (value.kind === "single-select" && value.fieldId === "STATUS") value.optionId = "human-backlog";
+      }
+    }
+
+    const snapshot = await adapter.get("I_1");
+    expect(snapshot.issue.state).toBe("ready");
+  });
+
   test("a merged pull request still proves the merge after its base branch has moved on", async () => {
     const { transport, adapter } = setup();
     transport.addIssue(1);
