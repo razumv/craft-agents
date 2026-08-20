@@ -297,6 +297,29 @@ describe('NativeSymphonyService autonomous loop', () => {
     await service.stop()
   })
 
+  it('tick cycles do not pay for a second full-status read', async () => {
+    const path = await runnerConfigPath()
+    const calls: string[] = []
+    const runner: SymphonyRunnerLike = {
+      async preflight() { calls.push('preflight'); return { valid: true } },
+      async readStatus() { calls.push('status'); return { durable: 'same' } },
+      async projectDesk() { calls.push('desk'); return { compact: 'Project Desk' } },
+      async shadow() { calls.push('shadow'); return shadowReceipt },
+      async tick() { calls.push('tick'); return { durable: 'ticked' } },
+    }
+    const service = new NativeSymphonyService(loopConfig(path, { mode: 'tick' }, true), path, async () => runner)
+    await service.start()
+    await new Promise((resolve) => setTimeout(resolve, 60))
+    const ticks = calls.filter((c) => c === 'tick').length
+    expect(ticks).toBeGreaterThan(0)
+    // A tick already stores a full status as the snapshot, so the loop must not
+    // follow it with a refresh: on a large repository that is a second
+    // repository-wide scan bought for nothing. Only reconstruction reads status.
+    expect(calls.filter((c) => c === 'status').length).toBe(1)
+    expect(service.status().projects[0]!.snapshot).toMatchObject({ durable: 'ticked' })
+    await service.stop()
+  })
+
   it('drops a project after maxConsecutiveErrors and stop cancels the loop', async () => {
     const path = await runnerConfigPath()
     let shadows = 0

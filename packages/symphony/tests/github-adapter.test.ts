@@ -261,6 +261,47 @@ describe("v4.2 GitHub Issues and Projects adapter", () => {
     expect((transport.calls.get("field-values") ?? 0) >= 4).toBeTrue();
   });
 
+  test("listing labels let discovery skip unmanaged issues without hydrating them", async () => {
+    const { transport, adapter } = setup();
+    const managed = transport.addIssue(1, "ready");
+    const unmanaged = transport.addIssue(2, "ready");
+    // The listing itself reports labels. Only #1 carries a lifecycle label; #2
+    // is an ordinary tracker issue the lane does not manage.
+    managed.labelNames = ["v4", "state:ready"];
+    unmanaged.labelNames = ["bug", "tracking:child"];
+
+    const found = await adapter.fetchIssuesByStates(["ready"]);
+
+    expect(found.map((entry) => entry.issue.identifier)).toEqual(["acme/repo#1"]);
+    // One issue hydrated, so exactly one project-item lookup — the unmanaged
+    // issue cost nothing beyond the listing page it arrived in.
+    expect(transport.calls.get("project-items")).toBe(1);
+    expect(transport.calls.get("comments")).toBe(1);
+  });
+
+  test("unknown listing labels still hydrate, so a truncated label page cannot hide a claim", async () => {
+    const { transport, adapter } = setup();
+    transport.addIssue(1, "ready");
+    // labelNames stays undefined: the transport could not prove the label set.
+
+    const found = await adapter.fetchIssuesByStates(["ready"]);
+
+    expect(found.map((entry) => entry.issue.identifier)).toEqual(["acme/repo#1"]);
+    expect(transport.calls.get("project-items")).toBe(1);
+  });
+
+  test("an explicitly requested issue is hydrated even when its listing labels look unmanaged", async () => {
+    const { transport, adapter } = setup();
+    const record = transport.addIssue(1, "ready");
+    record.labelNames = ["bug"];
+    // Its real labels still carry the lifecycle label; only the listing view
+    // looked unmanaged. Asking for it by id must not silently drop it.
+
+    const snapshot = await adapter.get("I_1");
+
+    expect(snapshot.issue.identifier).toBe("acme/repo#1");
+  });
+
   test("concurrent compare-and-set claims elect exactly one durable comment", async () => {
     const { transport, truth, adapter } = setup();
     transport.addIssue(1);
