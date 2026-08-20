@@ -248,6 +248,11 @@ export class NativeSymphonyService implements SymphonyServiceControl {
         try {
           if (loop.mode === 'tick') await this.tick(projectId)
           else await this.shadow(projectId)
+          // Keep the board snapshot fresh: shadow/tick receipts no longer touch
+          // it (see #operate), so every cycle ends with a read-only full-status
+          // re-read — new GitHub issues appear without a manual refresh, and
+          // the symphony:changed push fires for live boards.
+          await this.refresh(projectId)
           this.#loopErrors.delete(projectId)
         } catch {
           const errors = (this.#loopErrors.get(projectId) ?? 0) + 1
