@@ -11,6 +11,12 @@ export interface GitWorktreeAdapterConfig {
   repositoryRoot: string;
   workspaceRoot: string;
   gitExecutable: string;
+  /**
+   * Called when a dead attempt's uncommitted work was rescued onto a branch
+   * before its worktree was released. Optional: preservation happens either way,
+   * but nobody can act on work they were never told about.
+   */
+  onPreserved?: (info: { issueId: string; attempt: number; branch: string; preservedBranch: string; commit: string }) => void;
 }
 
 export interface GitWorktree {
@@ -180,27 +186,93 @@ export class GitWorktreeAdapter {
     const existing = await lstat(workspacePath).catch((error) => missing(error) ? null : Promise.reject(error));
     // This attempt's own worktree already being there is resumption, not a jam.
     if (existing?.isDirectory()) return { claimable: true, reason: "this attempt's worktree already exists" };
-    const releasable = await this.#releasableHolder(branch, claim) !== null;
-    return releasable
-      ? { claimable: true, reason: "branch is held by an earlier empty attempt and can be released" }
-      : { claimable: false, reason: `deterministic branch ${branch} is held by work a retry cannot reclaim` };
+    const holder = await this.#staleHolder(branch, claim);
+    if (holder === null) return { claimable: false, reason: `deterministic branch ${branch} is held by work a retry cannot reclaim` };
+    return holder.carriesWork
+      ? { claimable: true, reason: "branch is held by an earlier attempt whose work will be preserved before release" }
+      : { claimable: true, reason: "branch is held by an earlier empty attempt and can be released" };
   }
 
   private async releaseStaleAttemptBranch(branch: string, claim: Claim): Promise<boolean> {
-    const holder = await this.#releasableHolder(branch, claim);
+    const holder = await this.#staleHolder(branch, claim);
     if (holder === null) return false;
-    await this.git(["worktree", "remove", "--force", holder]);
+    // Work first, release second, and never the other way round: a rescue that
+    // runs after `worktree remove --force` has nothing left to rescue.
+    if (holder.carriesWork) await this.#preserveHolderWork(holder.path, holder.binding, branch);
+    await this.git(["worktree", "remove", "--force", holder.path]);
     await this.git(["branch", "-D", branch]);
     return true;
   }
 
   /**
-   * The worktree currently holding this branch, when releasing it is provably
-   * safe, else null. Shared by the read-only probe and the actual release so
-   * the two can never disagree — a probe that says yes where the release says
-   * no would be worse than having no probe at all.
+   * Rescue a dead attempt's work onto its own branch before the deterministic
+   * branch is released.
+   *
+   * This exists because of a failure I caused: restarting the Craft server
+   * during a deploy killed two workers mid-turn, and their uncommitted work then
+   * held the deterministic branch, so every retry failed closed and the issues
+   * went terminal with the work still sitting in a worktree nobody would look
+   * at. Fail-closed was right — losing commits is worse than burning an attempt
+   * — but refusing was never the only safe option: the work can be kept AND the
+   * branch freed.
+   *
+   * The preserved branch name carries the commit's own SHA, which makes a repeat
+   * of the same rescue idempotent rather than a collision. Every step is
+   * verified before the destructive one runs, and any failure propagates — a
+   * silent rescue failure would be indistinguishable from the data loss this is
+   * here to prevent.
    */
-  async #releasableHolder(branch: string, claim: Claim): Promise<string | null> {
+  async #preserveHolderWork(holder: string, binding: Claim, branch: string): Promise<void> {
+    const dirty = (await this.git(["-C", holder, "status", "--porcelain"])).trim() !== "";
+    if (dirty) {
+      await this.git(["-C", holder, "add", "-A"]);
+      const message = [
+        `chore(v4): preserve interrupted work from attempt ${binding.attempt}`,
+        "",
+        `The attempt for ${binding.issueIdentifier} ended without committing — its`,
+        "turn was cut short rather than completed. This commit is that work,",
+        "unreviewed and unverified, kept so a retry can start from a clean branch",
+        "without discarding it.",
+        "",
+        "Co-Authored-By: Craft Agent <agents-noreply@craft.do>",
+      ].join("\n");
+      await this.git(["-C", holder, "commit", "--no-verify", "-m", message]);
+    }
+
+    const head = (await this.git(["-C", holder, "rev-parse", "HEAD"])).trim();
+    if (head === binding.baseSha) return; // Nothing survived the commit; there is nothing to preserve.
+    const preserved = `v4-preserved/${stripRefPrefix(branch)}-a${binding.attempt}-${head.slice(0, 7)}`;
+
+    const existing = await this.git(["rev-parse", "--verify", `refs/heads/${preserved}`], true);
+    if (existing.exitCode === 0) {
+      // Same branch, same commit: an earlier rescue already did this.
+      if (existing.stdout.trim() !== head) throw new Error(`preservation branch ${preserved} exists at a different commit`);
+    } else {
+      await this.git(["branch", preserved, head]);
+      const verify = await this.git(["rev-parse", "--verify", `refs/heads/${preserved}`], true);
+      if (verify.exitCode !== 0 || verify.stdout.trim() !== head) {
+        throw new Error(`refusing to release ${branch}: preservation branch ${preserved} was not created`);
+      }
+    }
+    this.config.onPreserved?.({
+      issueId: binding.issueId,
+      attempt: binding.attempt,
+      branch,
+      preservedBranch: preserved,
+      commit: head,
+    });
+  }
+
+  /**
+   * The worktree currently holding this branch when it provably belongs to an
+   * earlier attempt of the same issue, else null. `carriesWork` says whether it
+   * has anything worth rescuing first.
+   *
+   * Shared by the read-only probe and the actual release so the two can never
+   * disagree — a probe that says yes where the release says no would be worse
+   * than having no probe at all.
+   */
+  async #staleHolder(branch: string, claim: Claim): Promise<{ path: string; binding: Claim; carriesWork: boolean } | null> {
     const holders: string[] = [];
     const output = await this.git(["worktree", "list", "--porcelain"]);
     let current: string | null = null;
@@ -226,13 +298,16 @@ export class GitWorktreeAdapter {
     }
     if (binding.issueId !== claim.issueId || !(binding.attempt < claim.attempt)) return null;
 
-    // It must contain no work: clean tree and no commits beyond the base it started from.
+    // Whether it holds work decides how it is released, not whether it can be.
+    // A git command that cannot even be run is not "no work" — that is unknown,
+    // and unknown still fails closed.
     const status = await this.git(["-C", holder, "status", "--porcelain"], true);
-    if (status.exitCode !== 0 || status.stdout.trim() !== "") return null;
+    if (status.exitCode !== 0) return null;
     const ahead = await this.git(["-C", holder, "rev-list", "--count", `${binding.baseSha}..HEAD`], true);
-    if (ahead.exitCode !== 0 || ahead.stdout.trim() !== "0") return null;
+    if (ahead.exitCode !== 0) return null;
 
-    return holder;
+    const carriesWork = status.stdout.trim() !== "" || ahead.stdout.trim() !== "0";
+    return { path: holder, binding, carriesWork };
   }
 
   /**
@@ -303,6 +378,15 @@ function validateBranch(value: string): string {
     throw new Error("required branch is not a safe git branch name");
   }
   return branch;
+}
+
+/**
+ * Flatten a branch name for use inside another branch name. `v4/x` nested under
+ * `v4-preserved/` would need a directory where git already has a ref file, so the
+ * separator becomes a dash instead.
+ */
+function stripRefPrefix(branch: string): string {
+  return branch.replace(/\//g, "-");
 }
 
 function inside(root: string, candidate: string): boolean {
