@@ -26,7 +26,7 @@ import type {
   GitHubTransport,
   Page,
 } from "./github-transport";
-import type { StartupReconciliation, TrackerAdapter, TrackerTransitionOptions } from "./tracker";
+import type { StartupReconciliation, TrackerAdapter, TrackerBacklogIssue, TrackerTransitionOptions } from "./tracker";
 import { claimBindingsEqual, type WorkspaceTruthReader } from "./workspace-truth";
 
 const eventPrefix = "<!-- craft-protocol-v4:event\n";
@@ -124,6 +124,34 @@ export class GitHubIssuesProjectsAdapter implements TrackerAdapter {
     const wanted = new Set(states);
     const hydrated = await this.loadAll(false);
     return [...hydrated.values()].map((entry) => entry.snapshot).filter((entry) => wanted.has(entry.issue.state));
+  }
+
+  /**
+   * Open issues the lane does not manage, straight from the listing pages.
+   * Costs nothing beyond the listing itself: the labels needed to decide this
+   * already ride along with each record, which is the same fact that lets
+   * discovery skip hydrating them. Issues whose labels are unknown (a truncated
+   * label page) are omitted rather than guessed at — they are hydrated by
+   * discovery anyway, so a managed issue can never be mistaken for backlog.
+   */
+  async fetchBacklog(): Promise<TrackerBacklogIssue[]> {
+    const records = await collectPages((cursor) => this.transport.listIssues(this.config.repository, cursor));
+    const backlog: TrackerBacklogIssue[] = [];
+    for (const record of records) {
+      if (record.id === this.config.claimFenceIssueId) continue;
+      if (record.state !== "OPEN") continue;
+      if (!this.#listingHasNoLifecycleLabel(record)) continue;
+      backlog.push({
+        id: record.id,
+        identifier: `${this.config.repository}#${record.number}`,
+        number: record.number,
+        title: record.title,
+        url: record.url ?? null,
+        labels: [...(record.labelNames ?? [])],
+        updatedAt: record.updatedAt ?? null,
+      });
+    }
+    return backlog;
   }
 
   async fetchIssuesByIds(ids: readonly string[]): Promise<TrackerIssueSnapshot[]> {
