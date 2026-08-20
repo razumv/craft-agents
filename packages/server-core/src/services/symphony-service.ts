@@ -342,13 +342,19 @@ export class NativeSymphonyService implements SymphonyServiceControl {
         if (this.#loopDropped.has(projectId)) continue
         if (!runtime.runner || runtime.status.phase === 'running') continue
         try {
-          if (loop.mode === 'tick') await this.tick(projectId)
-          else await this.shadow(projectId)
-          // Keep the board snapshot fresh: shadow/tick receipts no longer touch
-          // it (see #operate), so every cycle ends with a read-only full-status
-          // re-read — new GitHub issues appear without a manual refresh, and
-          // the symphony:changed push fires for live boards.
-          await this.refresh(projectId)
+          if (loop.mode === 'tick') {
+            // A tick already stores a full LiveRunnerStatus as the snapshot
+            // (see #operate), so re-reading it here would buy nothing and cost
+            // another repository-wide scan.
+            await this.tick(projectId)
+          } else {
+            await this.shadow(projectId)
+            // A shadow receipt is a different shape and must not clobber the
+            // snapshot, so shadow cycles end with a read-only full-status
+            // re-read — new GitHub issues appear without a manual refresh, and
+            // the symphony:changed push fires for live boards.
+            await this.refresh(projectId)
+          }
           this.#loopErrors.delete(projectId)
         } catch {
           const errors = (this.#loopErrors.get(projectId) ?? 0) + 1
