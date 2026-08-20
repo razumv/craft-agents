@@ -302,6 +302,36 @@ describe("v4.2 GitHub Issues and Projects adapter", () => {
     expect(snapshot.issue.identifier).toBe("acme/repo#1");
   });
 
+  test("backlog is the open unmanaged issues, and costs nothing beyond the listing", async () => {
+    const { transport, adapter } = setup();
+    const managed = transport.addIssue(1, "ready");
+    const unmanaged = transport.addIssue(2, "ready");
+    const closedUnmanaged = transport.addIssue(3, "done");
+    managed.labelNames = ["v4", "state:ready"];
+    unmanaged.labelNames = ["bug", "tracking:child"];
+    closedUnmanaged.labelNames = ["bug"];
+    closedUnmanaged.state = "CLOSED";
+
+    const backlog = await adapter.fetchBacklog();
+
+    // Only the open, unmanaged issue: the managed one belongs to the lane and
+    // the closed one is not work anybody is waiting on.
+    expect(backlog.map((entry) => entry.identifier)).toEqual(["acme/repo#2"]);
+    expect(backlog[0]).toMatchObject({ number: 2, labels: ["bug", "tracking:child"] });
+    // No per-issue hydration: the labels rode along with the listing.
+    expect(transport.calls.get("project-items") ?? 0).toBe(0);
+    expect(transport.calls.get("comments") ?? 0).toBe(0);
+  });
+
+  test("an issue whose listing labels are unknown is never reported as backlog", async () => {
+    const { transport, adapter } = setup();
+    transport.addIssue(1, "ready");
+    // labelNames undefined: a truncated label page. Discovery hydrates it, so
+    // guessing here could show a managed issue as unmanaged backlog.
+
+    expect(await adapter.fetchBacklog()).toEqual([]);
+  });
+
   test("concurrent compare-and-set claims elect exactly one durable comment", async () => {
     const { transport, truth, adapter } = setup();
     transport.addIssue(1);

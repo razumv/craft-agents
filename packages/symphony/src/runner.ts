@@ -23,6 +23,7 @@ import {
 import { ModelPolicy } from "./policy";
 import { ReadScopeGitHubTransport } from "./read-scope-transport";
 import { DeterministicScheduler, type Clock, type CrashPoint, type ShadowProposal } from "./scheduler";
+import type { TrackerBacklogIssue } from "./tracker";
 import { projectStatus } from "./status";
 import { loadWorkflow } from "./workflow";
 import { GitWorktreeAdapter } from "./workspace-adapter";
@@ -99,6 +100,12 @@ export interface LiveRunnerStatus {
   execution: CraftExecutionSession | null;
   /** Discovery mode only: one status per issue discovered in the repository. */
   statuses?: ProjectStatus[];
+  /**
+   * Discovery mode only: open issues the lane does not manage. Present so a
+   * surface can show the repository as it is, rather than only the slice that
+   * has already been contracted.
+   */
+  backlog?: TrackerBacklogIssue[];
 }
 
 export const SHADOW_RECEIPT_SCHEMA = "craft-agent/symphony-shadow@1" as const;
@@ -221,7 +228,12 @@ export class LiveV4Runner {
    */
   private async readDiscoveryStatus(): Promise<LiveRunnerStatus> {
     const allStates = Object.keys(this.config.github.states) as (keyof typeof this.config.github.states)[];
-    const snapshots = await this.tracker.fetchIssuesByStates(allStates);
+    const [snapshots, backlog] = await Promise.all([
+      this.tracker.fetchIssuesByStates(allStates),
+      // Free within one operation: the read scope has already answered the
+      // listing pages this walks. A tracker without the notion returns nothing.
+      this.tracker.fetchBacklog?.() ?? Promise.resolve([]),
+    ]);
     const statuses = snapshots.map((snapshot) => projectStatus(snapshot));
     const active = snapshots.find((snapshot) => snapshot.claim !== null && snapshot.claim !== undefined);
     const primary = active ?? snapshots[0] ?? null;
@@ -231,6 +243,7 @@ export class LiveV4Runner {
       status: primary ? projectStatus(primary) : null,
       execution,
       statuses,
+      backlog,
     };
   }
 

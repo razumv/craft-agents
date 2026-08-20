@@ -54,6 +54,21 @@ interface SymphonyTile {
   error: string | null
 }
 
+/**
+ * An open repository issue the lane does not manage. It has no run, no claim and
+ * no contract — it is shown so the board reflects the repository rather than
+ * only the slice already contracted, because a board that shows nothing but the
+ * lane's own queue makes an untouched project look like a finished one.
+ */
+interface SymphonyBacklogItem {
+  projectId: string
+  craftProjectId: string | null
+  issueIdentifier: string
+  title: string
+  url: string | null
+  labels: string[]
+}
+
 interface SymphonyColumn {
   id: string
   labelKey: string
@@ -62,6 +77,8 @@ interface SymphonyColumn {
 }
 
 const SYMPHONY_COLUMNS: readonly SymphonyColumn[] = [
+  // Not a lifecycle state: unmanaged repository issues, read-only.
+  { id: 'backlog', labelKey: 'kanban.symphony.backlog', states: [], accent: '#6b7280' },
   { id: 'ready', labelKey: 'kanban.symphony.ready', states: ['ready'], accent: '#8b8b8b' },
   { id: 'claimed', labelKey: 'kanban.symphony.claimed', states: ['claimed'], accent: '#5b8def' },
   { id: 'running', labelKey: 'kanban.symphony.running', states: ['running'], accent: '#7c5bef' },
@@ -185,6 +202,33 @@ function errorTile(projectId: string, error: string): SymphonyTile {
 }
 
 /** Extract tiles from the cached service status (reconstruction snapshots). */
+function backlogFromServiceStatus(status: { projects: Array<Record<string, unknown>> }): SymphonyBacklogItem[] {
+  const items: SymphonyBacklogItem[] = []
+  const seen = new Set<string>()
+  for (const project of status.projects) {
+    const projectId = asString(project.projectId) ?? 'unknown'
+    const craftProjectId = asString(project.craftProjectId)
+    const snapshot = project.snapshot as Record<string, unknown> | null | undefined
+    const backlog = snapshot?.backlog as Array<Record<string, unknown>> | null | undefined
+    if (!Array.isArray(backlog)) continue
+    for (const entry of backlog) {
+      const issueIdentifier = asString(entry.identifier)
+      // Two Symphony projects can watch one repository; show each issue once.
+      if (!issueIdentifier || seen.has(issueIdentifier)) continue
+      seen.add(issueIdentifier)
+      items.push({
+        projectId,
+        craftProjectId,
+        issueIdentifier,
+        title: asString(entry.title) ?? issueIdentifier,
+        url: asString(entry.url),
+        labels: Array.isArray(entry.labels) ? (entry.labels as unknown[]).filter((l): l is string => typeof l === 'string') : [],
+      })
+    }
+  }
+  return items
+}
+
 function tilesFromServiceStatus(status: { projects: Array<Record<string, unknown>> }): SymphonyTile[] {
   const tiles: SymphonyTile[] = []
   for (const project of status.projects) {
@@ -368,6 +412,7 @@ function SymphonyTileCard({ tile, onSendMessage }: { tile: SymphonyTile; onSendM
 export function SymphonyBoard({ onSendMessage, projectFilter = [] }: { onSendMessage?: (sessionId: string, message: string) => void; projectFilter?: string[] } = {}) {
   const { t } = useTranslation()
   const [tiles, setTiles] = React.useState<SymphonyTile[] | null>(null)
+  const [backlog, setBacklog] = React.useState<SymphonyBacklogItem[]>([])
   const [loopInfo, setLoopInfo] = React.useState<SymphonyLoopInfo | null>(null)
   const [projectErrors, setProjectErrors] = React.useState<{ projectId: string; error: string }[]>([])
   // Terminal columns (done/attention) start collapsed — finished/failed work
@@ -445,6 +490,7 @@ export function SymphonyBoard({ onSendMessage, projectFilter = [] }: { onSendMes
       prevStatesRef.current = new Map(nextTiles.map(tile => [tile.issueIdentifier, tile.state]))
 
       setTiles(nextTiles)
+      setBacklog(backlogFromServiceStatus(raw))
       setLoopInfo(raw.loop ?? null)
       setError(null)
     } catch (err) {
@@ -506,7 +552,9 @@ export function SymphonyBoard({ onSendMessage, projectFilter = [] }: { onSendMes
         )
       )
       const status = await window.electronAPI.symphony.status()
-      setTiles(tilesFromServiceStatus(status as unknown as { projects: Array<Record<string, unknown>> }))
+      const raw = status as unknown as { projects: Array<Record<string, unknown>> }
+      setTiles(tilesFromServiceStatus(raw))
+      setBacklog(backlogFromServiceStatus(raw))
       setError(null)
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
@@ -700,8 +748,16 @@ export function SymphonyBoard({ onSendMessage, projectFilter = [] }: { onSendMes
               ? (tiles ?? [])
               : (tiles ?? []).filter(tile => tile.craftProjectId !== null && projectFilter.includes(tile.craftProjectId))
             const columnTiles = visible.filter(tile => columnFor(tile.state, tile.issueClosed).id === column.id)
+            const isBacklog = column.id === 'backlog'
+            const visibleBacklog = isBacklog
+              ? (projectFilter.length === 0
+                  ? backlog
+                  : backlog.filter(item => item.craftProjectId !== null && projectFilter.includes(item.craftProjectId)))
+              : []
             const isTerminal = column.id === 'done' || column.id === 'attention'
-            const collapsedByDefault = isTerminal || columnTiles.length === 0
+            const itemCount = isBacklog ? visibleBacklog.length : columnTiles.length
+            // Backlog is reference, not work in flight: collapsed unless asked for.
+            const collapsedByDefault = isTerminal || isBacklog || itemCount === 0
             const collapsed = toggledColumns.has(column.id) ? !collapsedByDefault : collapsedByDefault
             const toggle = () => setToggledColumns(prev => {
               const next = new Set(prev)
@@ -722,7 +778,7 @@ export function SymphonyBoard({ onSendMessage, projectFilter = [] }: { onSendMes
                   <span className="text-[11px] font-semibold text-foreground/60 [writing-mode:vertical-rl]">
                     {t(column.labelKey)}
                   </span>
-                  <span className="text-[11px] font-semibold text-foreground/40">{columnTiles.length}</span>
+                  <span className="text-[11px] font-semibold text-foreground/40">{itemCount}</span>
                 </button>
               )
             }
@@ -731,7 +787,7 @@ export function SymphonyBoard({ onSendMessage, projectFilter = [] }: { onSendMes
                 <div className="flex items-center gap-2 px-1 pb-2">
                   <span className="h-2 w-2 rounded-full" style={{ backgroundColor: column.accent }} />
                   <span className="text-[12px] font-semibold text-foreground/80">{t(column.labelKey)}</span>
-                  <span className="ml-auto text-[11px] text-foreground/40">{columnTiles.length}</span>
+                  <span className="ml-auto text-[11px] text-foreground/40">{itemCount}</span>
                   <button
                     type="button"
                     onClick={toggle}
@@ -741,9 +797,25 @@ export function SymphonyBoard({ onSendMessage, projectFilter = [] }: { onSendMes
                   </button>
                 </div>
                 <div className="flex min-h-0 flex-col gap-2 overflow-y-auto">
-                  {columnTiles.map(tile => (
-                    <SymphonyTileCard key={`${tile.projectId}-${tile.issueIdentifier}`} tile={tile} onSendMessage={onSendMessage} />
-                  ))}
+                  {isBacklog
+                    ? visibleBacklog.map(item => (
+                      <button
+                        key={`${item.projectId}-${item.issueIdentifier}`}
+                        type="button"
+                        onClick={() => item.url && window.electronAPI.openUrl(item.url)}
+                        className="flex flex-col gap-1 rounded-lg bg-background/60 p-2 text-left transition-colors hover:bg-background"
+                        title={item.issueIdentifier}
+                      >
+                        <span className="text-[11px] font-semibold text-foreground/50">{item.issueIdentifier}</span>
+                        <span className="line-clamp-2 text-[12px] text-foreground/80">{item.title}</span>
+                        {item.labels.length > 0 && (
+                          <span className="truncate text-[10.5px] text-foreground/40">{item.labels.join(' · ')}</span>
+                        )}
+                      </button>
+                    ))
+                    : columnTiles.map(tile => (
+                      <SymphonyTileCard key={`${tile.projectId}-${tile.issueIdentifier}`} tile={tile} onSendMessage={onSendMessage} />
+                    ))}
                 </div>
               </div>
             )
