@@ -53,11 +53,14 @@ export function OwnerPushPrompt({ invoke }: Props) {
   }
 
   return (
-    // The bar sits above the app shell, which means it — not the shell — is what
-    // the notch and status bar overlap, so it carries the safe-area inset itself.
+    // Floating and anchored to the bottom, not injected above the app shell.
+    // In the layout flow it lost both ways: the notch covered it on iPhone, and
+    // on desktop the shell's own header sat on top of it — either way the button
+    // could not be pressed. Nothing renders over the bottom edge, and on a phone
+    // that is the half of the screen a thumb reaches.
     <div
-      className="flex items-center gap-3 px-4 pb-2 text-[13px] bg-background shadow-minimal"
-      style={{ paddingTop: 'calc(env(safe-area-inset-top, 0px) + 0.5rem)' }}
+      className="fixed left-1/2 -translate-x-1/2 z-50 flex items-center gap-3 px-4 py-2 max-w-[min(32rem,calc(100vw-1.5rem))] rounded-xl bg-background shadow-minimal border border-foreground/10 text-[13px]"
+      style={{ bottom: 'calc(env(safe-area-inset-bottom, 0px) + 1rem)' }}
     >
       <span className="text-foreground/70 flex-1">
         {note ?? t('webui.ownerPush.offer')}
@@ -65,7 +68,7 @@ export function OwnerPushPrompt({ invoke }: Props) {
       <button
         onClick={enable}
         disabled={busy}
-        className="px-3 py-1 rounded-md bg-background shadow-minimal text-foreground/80 cursor-pointer disabled:opacity-50"
+        className="px-3 py-1 rounded-md bg-background shadow-minimal text-foreground/80 cursor-pointer disabled:opacity-50 shrink-0"
       >
         {busy ? t('common.loading') : t('webui.ownerPush.enable')}
       </button>
@@ -74,7 +77,7 @@ export function OwnerPushPrompt({ invoke }: Props) {
           localStorage.setItem('ownerPushDismissed', '1')
           setDismissed(true)
         }}
-        className="px-2 py-1 text-foreground/50 cursor-pointer"
+        className="px-2 py-1 text-foreground/50 cursor-pointer shrink-0"
       >
         {t('common.dismiss')}
       </button>

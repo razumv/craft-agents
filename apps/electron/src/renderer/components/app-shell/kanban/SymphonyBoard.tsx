@@ -94,6 +94,10 @@ const SYMPHONY_COLUMNS: readonly SymphonyColumn[] = [
   { id: 'review', labelKey: 'kanban.symphony.review', states: ['pr-open', 'review'], accent: '#efae5b' },
   { id: 'owner-gate', labelKey: 'kanban.symphony.ownerGate', states: ['owner-gate'], accent: '#ef5b8d' },
   { id: 'done', labelKey: 'kanban.symphony.done', states: ['merged', 'deployed', 'done'], accent: '#3fa66a' },
+  // Terminal, but not delivered. Its own column because filing these under Done
+  // made Done lie, and filing them under Attention would ask for a decision
+  // nobody can take on a closed issue.
+  { id: 'closed', labelKey: 'kanban.symphony.closed', states: [], accent: '#6b7280' },
   {
     id: 'attention',
     labelKey: 'kanban.symphony.attention',
@@ -102,20 +106,25 @@ const SYMPHONY_COLUMNS: readonly SymphonyColumn[] = [
   },
 ]
 
+const DELIVERED_STATES = ['merged', 'deployed', 'done']
+
 /**
- * A closed issue is a record, not a request. However its run ended — merged,
- * finished by hand, dropped, or retried into nothing — nobody can act on a
- * closed issue, and the scheduler will not dispatch one either, since closed is
- * not dispatchable. So closed tiles always file under Done, whatever lifecycle
- * state they carry; the state on the tile still says exactly what it said.
+ * A closed issue is a record, not a request: nobody can act on it, and the
+ * scheduler will not dispatch one either. So a closed issue never belongs in a
+ * working column — a closed `retry-wait` card sitting in Ready is a queue entry
+ * that can never be picked up.
  *
- * The narrower version of this rule shipped first, covering only `failed` and
- * `cancelled`, and a closed issue in `retry-wait` promptly showed up sitting in
- * Ready — a card in the queue that could never be picked up.
+ * But it does not all belong in Done either. Routing every closed issue there
+ * put cards badged `failed` under a heading that reads "delivered", which is the
+ * board telling the owner something untrue. Delivery is what Done means, so only
+ * a closed issue whose state proves delivery goes there; everything else closed
+ * files under Closed, which claims nothing beyond being over.
  */
 function columnFor(state: string, issueClosed = false): SymphonyColumn {
-  if (issueClosed) return SYMPHONY_COLUMNS.find(c => c.id === 'done')!
-  return SYMPHONY_COLUMNS.find(c => c.states.includes(state)) ?? SYMPHONY_COLUMNS[SYMPHONY_COLUMNS.length - 1]!
+  const byState = SYMPHONY_COLUMNS.find(c => c.states.includes(state));
+  if (!issueClosed) return byState ?? SYMPHONY_COLUMNS[SYMPHONY_COLUMNS.length - 1]!
+  const id = DELIVERED_STATES.includes(state) ? 'done' : 'closed'
+  return SYMPHONY_COLUMNS.find(c => c.id === id)!
 }
 
 function asString(value: unknown): string | null {
@@ -995,7 +1004,7 @@ export function SymphonyBoard({ onSendMessage, projectFilter = [] }: { onSendMes
                   ? backlog
                   : backlog.filter(item => item.craftProjectId !== null && projectFilter.includes(item.craftProjectId)))
               : []
-            const isTerminal = column.id === 'done' || column.id === 'attention'
+            const isTerminal = column.id === 'done' || column.id === 'closed' || column.id === 'attention'
             const itemCount = isBacklog ? visibleBacklog.length : columnTiles.length
             // Backlog is reference, not work in flight: collapsed unless asked for.
             const collapsedByDefault = isTerminal || isBacklog || itemCount === 0
