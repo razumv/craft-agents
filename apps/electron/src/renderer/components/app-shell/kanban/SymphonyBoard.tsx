@@ -77,18 +77,18 @@ const SYMPHONY_COLUMNS: readonly SymphonyColumn[] = [
 ]
 
 /**
- * Attention is for work a person can still act on. A terminal run on an issue
- * the tracker has closed is a record, not a request — it was resolved, whether
- * by a merge, by hand, or by a decision to drop it — and leaving it in an alarm
- * column forever is how an alarm column stops being read. Those tiles join the
- * collapsed Done strip instead; the state on the tile still says `failed`.
+ * A closed issue is a record, not a request. However its run ended — merged,
+ * finished by hand, dropped, or retried into nothing — nobody can act on a
+ * closed issue, and the scheduler will not dispatch one either, since closed is
+ * not dispatchable. So closed tiles always file under Done, whatever lifecycle
+ * state they carry; the state on the tile still says exactly what it said.
+ *
+ * The narrower version of this rule shipped first, covering only `failed` and
+ * `cancelled`, and a closed issue in `retry-wait` promptly showed up sitting in
+ * Ready — a card in the queue that could never be picked up.
  */
-const TERMINAL_ATTENTION_STATES: readonly string[] = ['failed', 'cancelled']
-
 function columnFor(state: string, issueClosed = false): SymphonyColumn {
-  if (issueClosed && TERMINAL_ATTENTION_STATES.includes(state)) {
-    return SYMPHONY_COLUMNS.find(c => c.id === 'done')!
-  }
+  if (issueClosed) return SYMPHONY_COLUMNS.find(c => c.id === 'done')!
   return SYMPHONY_COLUMNS.find(c => c.states.includes(state)) ?? SYMPHONY_COLUMNS[SYMPHONY_COLUMNS.length - 1]!
 }
 

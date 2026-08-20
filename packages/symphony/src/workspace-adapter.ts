@@ -104,6 +104,7 @@ export class GitWorktreeAdapter {
     if (listed.has(workspacePath)) throw new Error("git reports the absent worktree path as already registered");
 
     await mkdir(dirname(workspacePath), { recursive: true });
+    await this.ensureBaseShaPresent(claim.baseSha);
     await this.git(["worktree", "add", "-b", branch, workspacePath, claim.baseSha]);
     try {
       await this.writeBinding(workspacePath, claim);
@@ -197,6 +198,29 @@ export class GitWorktreeAdapter {
     await this.git(["worktree", "remove", "--force", holder]);
     await this.git(["branch", "-D", branch]);
     return true;
+  }
+
+  /**
+   * The base SHA comes from the tracker, so it can easily be newer than this
+   * local clone — the moment work merges, the next claim's base is a commit
+   * nobody fetched here yet, and `worktree add` dies with
+   * "fatal: invalid reference". Under a manual tick that reads as a one-off; in
+   * an autonomous loop every attempt fails the same way until a human happens
+   * to fetch, which burns the whole retry budget on a stale checkout.
+   *
+   * Fetch only when the object is genuinely absent, so the common path stays
+   * offline and a fetch failure on an already-present base never blocks work.
+   */
+  private async ensureBaseShaPresent(baseSha: string): Promise<void> {
+    if ((await this.git(["cat-file", "-e", `${baseSha}^{commit}`], true)).exitCode === 0) return;
+    const fetched = await this.git(["fetch", "--quiet", "origin", baseSha], true);
+    if (fetched.exitCode !== 0) {
+      // Not every remote allows fetching a bare SHA; fall back to a full fetch.
+      await this.git(["fetch", "--quiet", "origin"], true);
+    }
+    if ((await this.git(["cat-file", "-e", `${baseSha}^{commit}`], true)).exitCode !== 0) {
+      throw new Error(`base commit ${baseSha} is not present after fetching origin`);
+    }
   }
 
   private async branchExists(branch: string): Promise<boolean> {
