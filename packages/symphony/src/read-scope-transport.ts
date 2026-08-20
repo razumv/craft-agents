@@ -37,17 +37,7 @@ export class ReadScopeGitHubTransport implements GitHubTransport {
   #hits = 0;
   #misses = 0;
 
-  constructor(readonly inner: GitHubTransport) {
-    // Assigned here, not as a field initializer: a field initializer can run
-    // before the parameter property is in place, which would read `inner` as
-    // undefined and drop the method for a transport that has it.
-    if (inner.mergePullRequest) {
-      this.mergePullRequest = async (pullRequestId, commitHeadline) => {
-        this.clear();
-        return inner.mergePullRequest!(pullRequestId, commitHeadline);
-      };
-    }
-  }
+  constructor(readonly inner: GitHubTransport) {}
 
   /** Drop everything remembered. Called at the start of an operation and by every write. */
   clear(): void {
@@ -154,5 +144,9 @@ export class ReadScopeGitHubTransport implements GitHubTransport {
    * Defined as a field so it is absent exactly when the inner transport's is,
    * instead of always present and failing at the call.
    */
-  readonly mergePullRequest?: (pullRequestId: string, commitHeadline: string) => Promise<void>;
+  /** A merge changes the issue, its labels and its pull request, so it drops the memo like every other write. */
+  async mergePullRequest(pullRequestId: string, commitHeadline: string): Promise<void> {
+    this.clear();
+    return this.inner.mergePullRequest(pullRequestId, commitHeadline);
+  }
 }

@@ -92,7 +92,14 @@ export interface GitHubTransport {
   listComments(issueId: string, cursor: string | null): Promise<Page<GitHubComment>>;
   listClosingPullRequests(issueId: string, cursor: string | null): Promise<Page<GitHubPullRequestEvidence>>;
   /** Squash-merge one pull request by node id. A mutation: callers gate it. */
-  mergePullRequest?(pullRequestId: string, commitHeadline: string): Promise<void>;
+  /**
+   * Required, not optional. As an optional member every wrapper that forgot to
+   * forward it type-checked fine and read downstream as "this transport cannot
+   * merge" — which is how auto-merge stayed off in every project while the
+   * configuration said it was on. A transport that genuinely cannot merge should
+   * throw, where the failure is visible.
+   */
+  mergePullRequest(pullRequestId: string, commitHeadline: string): Promise<void>;
   getBranch(repository: string, branchName: string): Promise<GitHubBranchEvidence | null>;
   getBaseSha(repository: string, branchName: string): Promise<string>;
   appendComment(issueId: string, body: string): Promise<GitHubComment>;
