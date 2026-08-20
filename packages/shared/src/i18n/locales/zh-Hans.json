@@ -538,6 +538,7 @@
   "kanban.symphony.issueGoal": "目标（一句话）",
   "kanban.symphony.issueModel": "模型",
   "kanban.symphony.issueModelDefault": "策略默认",
+  "kanban.symphony.issueNoTarget": "未配置 discovery 项目 — 新建 Issue 需要覆盖整个仓库的项目",
   "kanban.symphony.issueNonGoals": "非目标 — 每行一条（可选）",
   "kanban.symphony.issueProject": "项目",
   "kanban.symphony.issueRisk": "风险",

@@ -538,6 +538,7 @@
   "kanban.symphony.issueGoal": "Cel (jedno zdanie)",
   "kanban.symphony.issueModel": "Model",
   "kanban.symphony.issueModelDefault": "domyślny z polityki",
+  "kanban.symphony.issueNoTarget": "Brak projektu discovery — nowe issue wymagają projektu obejmującego repozytorium",
   "kanban.symphony.issueNonGoals": "Poza zakresem — jedno na wiersz (opcjonalnie)",
   "kanban.symphony.issueProject": "Projekt",
   "kanban.symphony.issueRisk": "Ryzyko",
