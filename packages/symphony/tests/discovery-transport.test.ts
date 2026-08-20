@@ -106,6 +106,15 @@ describe("loadLiveRunnerConfig discovery mode", () => {
     expect(config.mode).toBe("discovery");
   });
 
+  test("maxAttempts is configurable, bounded, and defaults to the canary single attempt", async () => {
+    const one = await loadLiveRunnerConfig(await write({ ...base, mode: "discovery" }));
+    expect(one.maxAttempts).toBeUndefined();
+    const three = await loadLiveRunnerConfig(await write({ ...base, mode: "discovery", maxAttempts: 3 }));
+    expect(three.maxAttempts).toBe(3);
+    await expect(loadLiveRunnerConfig(await write({ ...base, mode: "discovery", maxAttempts: 0 }))).rejects.toThrow("between 1 and 10");
+    await expect(loadLiveRunnerConfig(await write({ ...base, mode: "discovery", maxAttempts: 2.5 }))).rejects.toThrow("between 1 and 10");
+  });
+
   test("single-issue mode still requires issueId; unknown modes fail", async () => {
     await expect(loadLiveRunnerConfig(await write(base))).rejects.toThrow("issueId");
     await expect(loadLiveRunnerConfig(await write({ ...base, mode: "everything" }))).rejects.toThrow("issue or discovery");
