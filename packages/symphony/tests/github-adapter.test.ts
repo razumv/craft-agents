@@ -398,6 +398,46 @@ describe("v4.2 GitHub Issues and Projects adapter", () => {
     expect(done.transport.merged).toBeEmpty();
   });
 
+  test("an item whose status was never projected still hydrates from its lifecycle label", async () => {
+    const { transport, adapter } = setup();
+    transport.addIssue(1, "ready");
+    // A Project that auto-adds new repository issues creates the item with no
+    // status value. Refusing that stopped an entire project on one card.
+    transport.fields.set("ITEM_1", [{ kind: "text", fieldId: "GATE", fieldName: "Gate", value: null }]);
+
+    const [snapshot] = await adapter.fetchIssuesByStates(["ready"]);
+
+    expect(snapshot?.issue.state).toBe("ready");
+    expect(snapshot?.issue.identifier).toBe("acme/repo#1");
+  });
+
+  test("a status the label cannot disambiguate still fails closed", async () => {
+    // compactConfig maps several states onto one label, so with no status value
+    // the label alone cannot say which state it is — that is real ambiguity.
+    const transport = new MemoryGitHubTransport();
+    transport.branches.set("main", { name: "main", url: "https://github.test/acme/repo/tree/main", oid: "b".repeat(40) });
+    transport.comments.set("FENCE", []);
+    const adapter = new GitHubIssuesProjectsAdapter(compactConfig(), transport, new MemoryWorkspaceTruth());
+    transport.addIssue(1, "running");
+    transport.labels.set("I_1", ["v4", "agent-running"]);
+    transport.fields.set("ITEM_1", [{ kind: "text", fieldId: "GATE", fieldName: "Gate", value: null }]);
+
+    // Omitted rather than accepted: repository-wide discovery tolerates an
+    // issue it cannot read, and this one carries no claim.
+    expect(await adapter.fetchIssuesByStates(["running"])).toEqual([]);
+  });
+
+  test("duplicate values for one field are still ambiguous", async () => {
+    const { transport, adapter } = setup();
+    transport.addIssue(1, "ready");
+    transport.fields.set("ITEM_1", [
+      { kind: "single-select", fieldId: "STATUS", fieldName: "Status", optionId: "opt-ready", value: "ready" },
+      { kind: "single-select", fieldId: "STATUS", fieldName: "Status", optionId: "opt-done", value: "done" },
+    ]);
+
+    expect(await adapter.fetchIssuesByStates(["ready"])).toEqual([]);
+  });
+
   test("concurrent compare-and-set claims elect exactly one durable comment", async () => {
     const { transport, truth, adapter } = setup();
     transport.addIssue(1);
