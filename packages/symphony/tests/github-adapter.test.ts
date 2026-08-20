@@ -628,6 +628,93 @@ describe("v4.2 GitHub Issues and Projects adapter", () => {
     expect(done.events.some((event) => event.kind === "failure")).toBeTrue();
   });
 
+  test("a run that died before recording a branch still gets credit when its pull request merged", async () => {
+    const { transport, adapter } = setup();
+    transport.addIssue(1);
+    const before = await adapter.get("I_1");
+    const claim = await proposedClaim(adapter, "I_1");
+    await adapter.tryClaim("I_1", before.version, claim, 1_000);
+    await adapter.markRunning(claim.fence, 1_100);
+
+    // The run dies before any branch evidence reaches the ledger.
+    await adapter.failClaim(claim.fence, "runtime", "died before pushing", 1_200, {
+      maxAttempts: 1, retryBaseMs: 1, retryMaxMs: 1, claimTtlMs: 60_000, staleRunMs: 60_000,
+    } as never);
+    const failed = await adapter.get("I_1");
+    expect(failed.issue.state).toBe("failed");
+    expect(failed.evidence.branchSha).toBeUndefined();
+
+    // Its pull request merged anyway, and the branch was deleted with the merge —
+    // so there is no head commit to match, and none was ever recorded to match it
+    // against. The deterministic branch name is derived from this issue.
+    attachPr(transport, "I_1", true);
+    transport.branches.delete("v4/acme-repo-1");
+
+    await adapter.advanceByEvidence(1_300);
+    expect((await adapter.get("I_1")).issue.state).toBe("done");
+  });
+
+  test("a ledger branch SHA that disagrees with the pull request still refuses", async () => {
+    const { transport, adapter } = setup();
+    transport.addIssue(1);
+    const before = await adapter.get("I_1");
+    const claim = await proposedClaim(adapter, "I_1");
+    await adapter.tryClaim("I_1", before.version, claim, 1_000);
+    await adapter.markRunning(claim.fence, 1_100);
+    attachPr(transport, "I_1");
+    // The ledger now holds this attempt's branch SHA.
+    await adapter.advanceByEvidence(1_150);
+    expect((await adapter.get("I_1")).evidence.branchSha).toBe("d".repeat(40));
+
+    attachPr(transport, "I_1", true);
+    transport.branches.delete("v4/acme-repo-1");
+    transport.prs.get("I_1")![0]!.headRefOid = "7".repeat(40);
+
+    // A recorded SHA that disagrees is a different commit, not a missing one.
+    expect(await adapter.advanceByEvidence(1_300)).toEqual([]);
+    expect((await adapter.get("I_1")).issue.state).toBe("pr-open");
+  });
+
+  test("an issue closed by hand while in flight is recorded as cancelled", async () => {
+    const { transport, adapter } = setup();
+    transport.addIssue(1);
+    const before = await adapter.get("I_1");
+    const claim = await proposedClaim(adapter, "I_1");
+    await adapter.tryClaim("I_1", before.version, claim, 1_000);
+    await adapter.markRunning(claim.fence, 1_100);
+
+    // Someone closes it. The lane can never dispatch a closed issue, so leaving
+    // the label in flight leaves a badge that would never change again.
+    transport.issues.find((issue) => issue.id === "I_1")!.state = "CLOSED";
+
+    expect(await adapter.advanceByEvidence(1_200)).toEqual([
+      { issueId: "I_1", action: "advanced", reason: "closed by hand without a merge" },
+    ]);
+    const settled = await adapter.get("I_1");
+    expect(settled.issue.state).toBe("cancelled");
+    // Cancelled, not done: nothing merged, so nothing was delivered.
+    expect(settled.evidence.mergedAt).toBeUndefined();
+    expect(settled.claim).toBeNull();
+  });
+
+  test("a closed issue whose work merged is recorded as delivered, not cancelled", async () => {
+    const { transport, adapter } = setup();
+    transport.addIssue(1);
+    const before = await adapter.get("I_1");
+    const claim = await proposedClaim(adapter, "I_1");
+    await adapter.tryClaim("I_1", before.version, claim, 1_000);
+    await adapter.markRunning(claim.fence, 1_100);
+    attachPr(transport, "I_1");
+    await adapter.advanceByEvidence(1_150);
+    attachPr(transport, "I_1", true);
+    transport.branches.delete("v4/acme-repo-1");
+    transport.issues.find((issue) => issue.id === "I_1")!.state = "CLOSED";
+
+    // Closed AND merged must take the delivery path, never the cancelled one.
+    await adapter.advanceByEvidence(1_200);
+    expect((await adapter.get("I_1")).issue.state).toBe("done");
+  });
+
   test("a failed attempt with no merge stays failed", async () => {
     const { transport, adapter } = setup();
     transport.addIssue(1);
