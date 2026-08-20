@@ -91,6 +91,41 @@ describe("v4 live git worktree adapter", () => {
     expect(JSON.parse(await readFile(resolve(identity.workspacePath, claimBindingFile), "utf8"))).toEqual(claim);
   });
 
+  test("a base commit missing locally is fetched from origin instead of failing the attempt", async () => {
+    const { root, claim, context, adapter } = await fixture();
+
+    // A second repository plays origin, and carries a commit this clone has
+    // never seen — exactly the state a clone is in the moment work merges.
+    const upstream = await mkdtemp(resolve(tmpdir(), "craft-v4-upstream-"));
+    roots.push(upstream);
+    await git(upstream, ["init", "-b", "main"]);
+    await Bun.write(resolve(upstream, "README.md"), "upstream\n");
+    await git(upstream, ["add", "README.md"]);
+    await git(upstream, ["-c", "user.name=Craft Agent Tests", "-c", "user.email=tests@example.invalid", "commit", "-m", "upstream"]);
+    const upstreamSha = (await git(upstream, ["rev-parse", "HEAD"])).trim();
+    await git(root, ["remote", "add", "origin", upstream]);
+
+    // The tracker hands us that SHA as the base. Before this fix `worktree add`
+    // died with "fatal: invalid reference" and, under an autonomous loop, every
+    // retry died the same way until a human fetched.
+    const advanced: Claim = { ...claim, baseSha: upstreamSha };
+    const created = await adapter.ensure(advanced, { ...context, claim: advanced });
+
+    expect(created.baseSha).toBe(upstreamSha);
+    // The object is now in the local clone, and the worktree really sits on it.
+    expect((await git(root, ["rev-parse", "--verify", `${upstreamSha}^{commit}`])).trim()).toBe(upstreamSha);
+    expect((await git(created.workspacePath, ["rev-parse", "HEAD"])).trim()).toBe(upstreamSha);
+  });
+
+  test("a base commit that no fetch can supply still fails closed", async () => {
+    const { claim, context, adapter } = await fixture();
+    const absent: Claim = { ...claim, baseSha: "0".repeat(40) };
+
+    // No origin configured and an unknown SHA: the attempt must fail with a
+    // diagnostic about the base, not silently branch from something else.
+    await expect(adapter.ensure(absent, { ...context, claim: absent })).rejects.toThrow(/is not present after fetching origin|invalid reference/);
+  });
+
   test("fails closed when the deterministic branch exists without its bound worktree", async () => {
     const { root, identity, context, adapter } = await fixture();
     await git(root, ["branch", context.contract.requiredBranch, context.claim.baseSha]);
