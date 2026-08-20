@@ -230,6 +230,9 @@ export class DeterministicScheduler {
 
   private async reconcile(crashAfter?: CrashPoint): Promise<void> {
     const now = this.clock.nowMs();
+    // Durable evidence outranks the session: a dead run must not strand an
+    // already-merged issue short of its terminal state.
+    await this.adapters.github.advanceByEvidence?.(now);
     const activeClaims = await this.adapters.github.activeClaims();
     for (const snapshot of activeClaims.sort((a, b) => a.issue.id.localeCompare(b.issue.id))) {
       const claim = snapshot.claim!;

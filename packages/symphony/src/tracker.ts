@@ -45,6 +45,13 @@ export interface TrackerAdapter {
     options?: TrackerTransitionOptions,
   ): Awaitable<TrackerIssueSnapshot>;
   reconcileStartup?(nowMs: number): Promise<readonly StartupReconciliation[]>;
+  /**
+   * Ordinary-tick counterpart of {@link reconcileStartup}: advances active
+   * claims purely on durable provider evidence, so terminal synchronization no
+   * longer depends on a live executing session. Idempotent and fail-closed —
+   * nothing moves without exact evidence.
+   */
+  advanceByEvidence?(nowMs: number): Promise<readonly StartupReconciliation[]>;
 }
 
 export type StartupReconciliation = {
