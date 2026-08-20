@@ -160,7 +160,6 @@ export class GitHubIssuesProjectsAdapter implements TrackerAdapter {
    * quiet about declining is indistinguishable from one that is not running.
    */
   async mergeClosingPullRequest(issueId: string): Promise<{ merged: boolean; reason: string }> {
-    if (!this.transport.mergePullRequest) return { merged: false, reason: "transport cannot merge" };
     const detailed = await this.detailed(issueId);
     const contract = detailed.snapshot.contract;
     const prs = await collectPages((cursor) => this.transport.listClosingPullRequests(issueId, cursor));

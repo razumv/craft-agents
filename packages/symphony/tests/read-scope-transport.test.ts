@@ -133,29 +133,17 @@ describe("per-operation read scope", () => {
     }
   });
 
-  test("merging goes through and invalidates the memo, and stays absent when the inner transport lacks it", async () => {
+  test("merging goes through and invalidates the memo", async () => {
     const inner = new CountingTransport();
     const scoped = new ReadScopeGitHubTransport(inner);
 
     await scoped.listIssues("acme/repo", null);
-    await scoped.mergePullRequest!("PR_1", "headline");
+    await scoped.mergePullRequest("PR_1", "headline");
     await scoped.listIssues("acme/repo", null);
 
     expect(inner.count("mergePullRequest")).toBe(1);
-    // A merge changes the issue, its labels and its PR, so nothing read before
-    // it may be replayed afterwards.
+    // A merge changes the issue, its labels and its pull request, so nothing
+    // read before it may be replayed afterwards.
     expect(inner.count("listIssues")).toBe(2);
-
-    // Optionality is preserved rather than faked: a transport without the
-    // capability must not appear to have it.
-    // Built from the instance minus the capability — `delete` on the instance
-    // would leave the prototype's method in place and prove nothing.
-    const source = new CountingTransport() as unknown as Record<string, unknown>;
-    const withoutMerge = Object.fromEntries(
-      Object.getOwnPropertyNames(CountingTransport.prototype)
-        .filter((name) => name !== "constructor" && name !== "mergePullRequest")
-        .map((name) => [name, (source[name] as () => unknown).bind(source)]),
-    ) as unknown as GitHubTransport;
-    expect(new ReadScopeGitHubTransport(withoutMerge).mergePullRequest).toBeUndefined();
   });
 });
