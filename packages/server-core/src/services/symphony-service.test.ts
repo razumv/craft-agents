@@ -149,6 +149,65 @@ describe('NativeSymphonyService', () => {
     expect(ticks).toBe(0)
   })
 
+  it('a project that fails to reconstruct is refused without failing the service', async () => {
+    const path = await runnerConfigPath()
+    const other = await runnerConfigPath()
+    let readStatusCalls = 0
+    const runner: SymphonyRunnerLike = {
+      async preflight() { return {} },
+      async readStatus() {
+        readStatusCalls += 1
+        // Only the second project can be read; the first is unreachable, the
+        // way a rate-limited or unreachable repository behaves.
+        if (readStatusCalls === 1) throw new Error('gh: API rate limit already exceeded')
+        return { state: 'ready' }
+      },
+      async projectDesk() { return {} },
+      async shadow() { return { writes: 0 } },
+      async tick() { return { state: 'ticked' } },
+    }
+    const service = new NativeSymphonyService({
+      version: 1 as const,
+      enabled: true,
+      stopTimeoutMs: 25,
+      projects: [{ id: 'alpha', configPath: path }, { id: 'beta', configPath: other }],
+    }, path, async () => runner)
+
+    // Enabled service, failing project: this must resolve rather than throw.
+    // The throw used to reach a process.exit(1) in the server entry point.
+    const status = await service.start()
+
+    expect(status.phase).toBe('ready')
+    expect(status.acceptingOperations).toBeTrue()
+    expect(status.projects.find((project) => project.projectId === 'alpha')).toMatchObject({
+      phase: 'error',
+      lastError: 'gh: API rate limit already exceeded',
+    })
+    // The healthy project is untouched by its neighbour's failure.
+    expect(status.projects.find((project) => project.projectId === 'beta')).toMatchObject({ phase: 'ready' })
+    await expect(service.tick('beta')).resolves.toMatchObject({ operation: 'tick' })
+    await service.stop()
+  })
+
+  it('reports error phase when nothing reconstructs, and still does not throw', async () => {
+    const path = await runnerConfigPath()
+    const runner: SymphonyRunnerLike = {
+      async preflight() { return {} },
+      async readStatus() { throw new Error('gh: API rate limit already exceeded') },
+      async projectDesk() { return {} },
+      async shadow() { return { writes: 0 } },
+      async tick() { return { state: 'ticked' } },
+    }
+    const service = new NativeSymphonyService(config(path, true), path, async () => runner)
+
+    const status = await service.start()
+
+    expect(status.phase).toBe('error')
+    expect(status.acceptingOperations).toBeFalse()
+    expect(status.projects[0]).toMatchObject({ phase: 'error' })
+    await service.stop()
+  })
+
   it('allows one explicitly enabled tick and stops within a bounded deadline', async () => {
     const path = await runnerConfigPath()
     let release!: () => void

@@ -276,10 +276,25 @@ const instance = await (async () => {
 // Reconstruct configured Symphony projects from durable provider truth only.
 // With no explicit config this is an inert, default-off no-op. A live tick is
 // additionally rejected unless the config contains enabled=true.
+// A project that cannot be reconstructed is refused per project by the service
+// itself, so it can never tick against state it failed to read. That does not
+// justify taking the server down with it: this used to exit(1), which turned
+// one transient GitHub rate limit into a total outage of every session, board
+// and workspace, and let one unreachable repository block the projects that
+// reconstructed fine. The service retries failed projects on its own.
 try {
-  await symphonyService.start()
+  const symphonyStatus = await symphonyService.start()
+  const brokenProjects = symphonyStatus.projects.filter((project) => project.phase === 'error')
+  if (brokenProjects.length > 0) {
+    console.error(
+      `[symphony] ${brokenProjects.length}/${symphonyStatus.projects.length} projects failed to reconstruct and are refused until they recover:`,
+      brokenProjects.map((project) => `${project.projectId}: ${project.lastError ?? 'unknown error'}`).join('; '),
+    )
+  }
 } catch (error) {
-  console.error('[symphony] Startup reconstruction failed:', error)
+  // Only a service-level failure (unreadable/invalid service config) reaches
+  // here now; that is a genuine misconfiguration and must not start.
+  console.error('[symphony] Service start failed:', error)
   await instance.stop()
   process.exit(1)
 }

@@ -128,12 +128,20 @@ export async function loadSymphonyServerConfig(path: string): Promise<SymphonySe
 }
 
 export class NativeSymphonyService implements SymphonyServiceControl {
+  /**
+   * Delay before retrying projects that failed to reconstruct. Long enough not
+   * to hammer a provider that is rate-limiting us, short enough that a blip
+   * heals well inside a GitHub rate-limit window.
+   */
+  private static readonly RECONSTRUCT_RETRY_MS = 60_000
+
   readonly #projects = new Map<string, ProjectRuntime>()
   readonly #active = new Set<Promise<unknown>>()
   #phase: SymphonyServiceStatus['phase']
   #accepting = false
   #startPromise: Promise<SymphonyServiceStatus> | null = null
   #loopTimer: ReturnType<typeof setTimeout> | null = null
+  #reconstructRetryTimer: ReturnType<typeof setTimeout> | null = null
   #loopCycles = 0
   #loopLastCycleAt: number | null = null
   #loopCycleActive = false
@@ -185,6 +193,8 @@ export class NativeSymphonyService implements SymphonyServiceControl {
     }
 
     this.#phase = 'reconstructing'
+    let reconstructed = 0
+    let failed = 0
     for (const runtime of this.#projects.values()) {
       try {
         const runnerConfig = await loadLiveRunnerConfig(runtime.config.configPath)
@@ -206,6 +216,82 @@ export class NativeSymphonyService implements SymphonyServiceControl {
           allowedProfiles: [...(runnerConfig.model?.allowedProfiles ?? [])],
           verificationBudget: runnerConfig.verificationBudget ?? null,
         }
+        reconstructed += 1
+      } catch (error) {
+        failed += 1
+        runtime.status = {
+          ...runtime.status,
+          phase: 'error',
+          lastOperation: 'reconstruct',
+          updatedAt: Date.now(),
+          lastError: error instanceof Error ? error.message : String(error),
+        }
+        // Deliberately not rethrown. A project that failed to reconstruct is
+        // refused per project — #operate has no runner to hand out, so nothing
+        // can tick against durable state we could not read. That is the whole
+        // fail-closed requirement, and it does not need the process to die:
+        // this used to propagate to a process.exit(1), so one transient GitHub
+        // rate limit or network blip took down the entire server — every
+        // session, board and workspace with it — and one unreachable
+        // repository blocked the other projects that had reconstructed fine.
+      }
+    }
+
+    this.#phase = reconstructed > 0 ? 'ready' : 'error'
+    // Operations stay open as long as something reconstructed; per-project
+    // gating does the refusing. With nothing reconstructed there is nothing to
+    // operate on, but the retry below still recovers without a restart.
+    this.#accepting = reconstructed > 0
+    if (this.#accepting && this.config.loop?.enabled) this.#scheduleLoop()
+    if (failed > 0) this.#scheduleReconstructRetry()
+    return this.status()
+  }
+
+  /** Whether the service is shutting down. A method, so narrowing never elides a re-check after an await. */
+  #shuttingDown(): boolean {
+    return this.#phase === 'stopped' || this.#phase === 'stopping'
+  }
+
+  /** Fixed-delay retry for projects still in error, so a transient provider outage self-heals. */
+  #scheduleReconstructRetry(): void {
+    if (this.#reconstructRetryTimer || this.#shuttingDown()) return
+    this.#reconstructRetryTimer = setTimeout(() => {
+      this.#reconstructRetryTimer = null
+      void this.#retryFailedProjects()
+    }, NativeSymphonyService.RECONSTRUCT_RETRY_MS)
+    // Never hold the process open just for a retry.
+    this.#reconstructRetryTimer.unref?.()
+  }
+
+  async #retryFailedProjects(): Promise<void> {
+    if (this.#shuttingDown()) return
+    const pending = [...this.#projects.values()].filter((runtime) => runtime.status.phase === 'error')
+    if (pending.length === 0) return
+
+    let recovered = 0
+    for (const runtime of pending) {
+      if (this.#shuttingDown()) return
+      try {
+        const runnerConfig = await loadLiveRunnerConfig(runtime.config.configPath)
+        runtime.runner = await this.runnerFactory(runnerConfig)
+        const snapshot = await runtime.runner.readStatus()
+        const now = Date.now()
+        runtime.status = {
+          ...runtime.status,
+          phase: 'ready',
+          lastOperation: 'reconstruct',
+          reconstructedAt: now,
+          updatedAt: now,
+          lastError: null,
+          snapshot,
+          ownerSessionId: runnerConfig.craft?.ownerSessionId ?? null,
+          craftProjectId: runnerConfig.craft?.projectId ?? null,
+          mode: runnerConfig.mode === 'discovery' ? 'discovery' : 'issue',
+          repository: runnerConfig.github?.repository ?? null,
+          allowedProfiles: [...(runnerConfig.model?.allowedProfiles ?? [])],
+          verificationBudget: runnerConfig.verificationBudget ?? null,
+        }
+        recovered += 1
       } catch (error) {
         runtime.status = {
           ...runtime.status,
@@ -214,16 +300,18 @@ export class NativeSymphonyService implements SymphonyServiceControl {
           updatedAt: Date.now(),
           lastError: error instanceof Error ? error.message : String(error),
         }
-        this.#phase = 'error'
-        this.#accepting = false
-        if (this.config.enabled) throw error
       }
     }
 
-    if (this.#phase !== 'error') this.#phase = 'ready'
-    this.#accepting = this.#phase === 'ready'
-    if (this.#accepting && this.config.loop?.enabled) this.#scheduleLoop()
-    return this.status()
+    if (recovered > 0) {
+      const wasAccepting = this.#accepting
+      this.#phase = 'ready'
+      this.#accepting = true
+      if (!wasAccepting && this.config.loop?.enabled) this.#scheduleLoop()
+    }
+    if ([...this.#projects.values()].some((runtime) => runtime.status.phase === 'error')) {
+      this.#scheduleReconstructRetry()
+    }
   }
 
   /**
@@ -410,6 +498,10 @@ export class NativeSymphonyService implements SymphonyServiceControl {
     if (this.#loopTimer) {
       clearTimeout(this.#loopTimer)
       this.#loopTimer = null
+    }
+    if (this.#reconstructRetryTimer) {
+      clearTimeout(this.#reconstructRetryTimer)
+      this.#reconstructRetryTimer = null
     }
     if (this.#phase === 'disabled' || this.#phase === 'stopped') {
       this.#phase = this.#phase === 'disabled' ? 'disabled' : 'stopped'
