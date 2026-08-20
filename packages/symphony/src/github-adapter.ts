@@ -127,31 +127,43 @@ export class GitHubIssuesProjectsAdapter implements TrackerAdapter {
   }
 
   /**
-   * Open issues the lane does not manage, straight from the listing pages.
-   * Costs nothing beyond the listing itself: the labels needed to decide this
-   * already ride along with each record, which is the same fact that lets
-   * discovery skip hydrating them. Issues whose labels are unknown (a truncated
-   * label page) are omitted rather than guessed at — they are hydrated by
-   * discovery anyway, so a managed issue can never be mistaken for backlog.
+   * Open issues the lane does not manage, built from the same repository listing
+   * that discovery uses. Labels, body, creation time, priority and parent ride
+   * on that listing; native blocker edges are read only for the resulting
+   * backlog candidates. Unknown/truncated labels are omitted rather than
+   * guessed at, so a managed issue can never be mistaken for backlog.
    */
   async fetchBacklog(): Promise<TrackerBacklogIssue[]> {
     const records = await collectPages((cursor) => this.transport.listIssues(this.config.repository, cursor));
-    const backlog: TrackerBacklogIssue[] = [];
-    for (const record of records) {
-      if (record.id === this.config.claimFenceIssueId) continue;
-      if (record.state !== "OPEN") continue;
-      if (!this.#listingHasNoLifecycleLabel(record)) continue;
-      backlog.push({
+    const candidates = records.filter((record) => (
+      record.id !== this.config.claimFenceIssueId
+      && record.state === "OPEN"
+      && this.#listingHasNoLifecycleLabel(record)
+    ));
+    return Promise.all(candidates.map(async (record) => {
+      const blockedBy = await collectPages((cursor) => this.transport.listBlockedBy(record.id, cursor));
+      const relation = (issue: GitHubIssueLink) => ({
+        id: issue.id,
+        identifier: `${this.config.repository}#${issue.number}`,
+        state: issue.state,
+        title: issue.title,
+        url: issue.url,
+      });
+      return {
         id: record.id,
         identifier: `${this.config.repository}#${record.number}`,
         number: record.number,
         title: record.title,
+        description: record.body,
         url: record.url ?? null,
         labels: [...(record.labelNames ?? [])],
+        priority: Number.isInteger(record.priority) ? record.priority! : null,
+        createdAt: record.createdAt ?? null,
         updatedAt: record.updatedAt ?? null,
-      });
-    }
-    return backlog;
+        blockedBy: blockedBy.map(relation),
+        parent: record.parent ? relation(record.parent) : null,
+      };
+    }));
   }
 
   /**

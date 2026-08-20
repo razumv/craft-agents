@@ -30,9 +30,17 @@ export interface TrackerBacklogIssue {
   identifier: string;
   number: number;
   title: string;
+  /** The issue's own text. Grooming may quote it, but must not augment it. */
+  description: string;
   url: string | null;
   labels: string[];
+  priority: number | null;
+  createdAt: string | null;
   updatedAt: string | null;
+  /** Native open/closed blocker relations, read directly from the tracker. */
+  blockedBy: { id: string; identifier: string; state: "OPEN" | "CLOSED"; title: string; url: string }[];
+  /** Native parent relation when the tracker exposes one. */
+  parent: { id: string; identifier: string; state: "OPEN" | "CLOSED"; title: string; url: string } | null;
 }
 
 export interface TrackerAdapter {

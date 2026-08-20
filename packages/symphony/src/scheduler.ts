@@ -452,11 +452,19 @@ export class DeterministicScheduler {
   }
 }
 
-function compareForDispatch(left: TrackerIssueSnapshot, right: TrackerIssueSnapshot): number {
+export interface UpstreamOrderedIssue {
+  issue: { identifier: string; priority: number | null; createdAt: string | null };
+}
+
+/**
+ * The upstream Symphony ordering rule. Keep this one comparator shared by
+ * dispatch and grooming so the two queues cannot silently drift.
+ */
+export function compareForDispatch(left: UpstreamOrderedIssue, right: UpstreamOrderedIssue): number {
   const priority = (value: number | null): number => value !== null && value >= 1 && value <= 4 ? value : Number.MAX_SAFE_INTEGER;
   const priorityOrder = priority(left.issue.priority) - priority(right.issue.priority);
   if (priorityOrder !== 0) return priorityOrder;
   const created = (value: string | null): number => value ? Date.parse(value) : Number.MAX_SAFE_INTEGER;
   const createdOrder = created(left.issue.createdAt) - created(right.issue.createdAt);
-  return createdOrder || left.issue.identifier.localeCompare(right.issue.identifier) || left.issue.id.localeCompare(right.issue.id);
+  return createdOrder || left.issue.identifier.localeCompare(right.issue.identifier);
 }

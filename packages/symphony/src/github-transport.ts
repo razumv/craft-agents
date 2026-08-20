@@ -22,6 +22,10 @@ export interface GitHubIssueRecord {
    * so a transport that cannot provide them stays correct.
    */
   labelNames?: readonly string[] | null;
+  /** Upstream-normalized priority when a provider listing exposes one. */
+  priority?: number | null;
+  /** Native parent issue relation, carried by the repository listing. */
+  parent?: GitHubIssueLink | null;
 }
 
 export interface GitHubIssueLink {
@@ -141,6 +145,14 @@ function splitRepository(repository: string): [string, string] {
   return parts as [string, string];
 }
 
+function priorityFromLabels(labels: readonly string[]): number | null {
+  for (const label of labels) {
+    const match = /^(?:priority[:\s-]*|p)([1-4])$/i.exec(label.trim());
+    if (match) return Number(match[1]);
+  }
+  return null;
+}
+
 /** Authenticated gh CLI implementation. It is inert until a caller invokes an operation. */
 export class GhCliTransport implements GitHubTransport {
   constructor(readonly executable = "gh") {}
@@ -151,7 +163,7 @@ export class GhCliTransport implements GitHubTransport {
     // queries, and an issue with no lifecycle label is never hydrated. Asking
     // for them here turns a repository-wide scan from O(issues) round trips
     // into O(pages) for everything the lane does not manage.
-    const data = await this.graphql<{ repository: { issues: GraphPage<GitHubIssueRecord> } }>(`query Issues($owner:String!,$name:String!,$cursor:String){repository(owner:$owner,name:$name){issues(first:100,after:$cursor,orderBy:{field:CREATED_AT,direction:ASC}){nodes{id number title body url state createdAt updatedAt assignees(first:1){nodes{id}}labels(first:LABEL_PAGE){nodes{name}totalCount}}pageInfo{hasNextPage endCursor}}}}`.replace("LABEL_PAGE", String(LISTING_LABEL_PAGE_SIZE)), { owner, name, cursor });
+    const data = await this.graphql<{ repository: { issues: GraphPage<GitHubIssueRecord> } }>(`query Issues($owner:String!,$name:String!,$cursor:String){repository(owner:$owner,name:$name){issues(first:100,after:$cursor,orderBy:{field:CREATED_AT,direction:ASC}){nodes{id number title body url state createdAt updatedAt assignees(first:1){nodes{id}}labels(first:LABEL_PAGE){nodes{name}totalCount}parent{id number title state url}}pageInfo{hasNextPage endCursor}}}}`.replace("LABEL_PAGE", String(LISTING_LABEL_PAGE_SIZE)), { owner, name, cursor });
     return page({
       ...data.repository.issues,
       nodes: data.repository.issues.nodes.map((issue) => {
@@ -167,6 +179,11 @@ export class GhCliTransport implements GitHubTransport {
           ...issue,
           assigneeId: raw.assignees?.nodes[0]?.id ?? null,
           labelNames: raw.labels && !truncated ? raw.labels.nodes.map((label) => label.name) : null,
+          // GitHub Issues have no repository-level priority field. Preserve an
+          // exact 1..4 priority label when present; everything else is the
+          // upstream comparator's null/other bucket.
+          priority: raw.labels && !truncated ? priorityFromLabels(raw.labels.nodes.map((label) => label.name)) : null,
+          parent: issue.parent ?? null,
         };
       }),
     });
