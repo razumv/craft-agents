@@ -22,6 +22,13 @@ interface SymphonyLoopInfo {
   droppedProjects: string[]
 }
 
+/** Per-project intake options surfaced by the service (model policy + defaults). */
+interface SymphonyProjectOption {
+  projectId: string
+  allowedProfiles: string[]
+  verificationBudget: string | null
+}
+
 interface SymphonyTile {
   projectId: string
   /** Craft project the Symphony project is bound to (for the board's project filter). */
@@ -353,13 +360,30 @@ export function SymphonyBoard({ onSendMessage, projectFilter = [] }: { onSendMes
   const [refreshing, setRefreshing] = React.useState(false)
   const [composerOpen, setComposerOpen] = React.useState(false)
   const [creating, setCreating] = React.useState(false)
-  const [draft, setDraft] = React.useState({ projectId: '', title: '', goal: '', risk: 'low' as 'low' | 'medium' | 'high', acceptance: '', nonGoals: '' })
+  const [projectOptions, setProjectOptions] = React.useState<SymphonyProjectOption[]>([])
+  const [draft, setDraft] = React.useState({
+    projectId: '',
+    title: '',
+    goal: '',
+    risk: 'low' as 'low' | 'medium' | 'high',
+    acceptance: '',
+    nonGoals: '',
+    model: '',
+    dependencies: [] as string[],
+  })
+  const activeProject = projectOptions.find(option => option.projectId === draft.projectId) ?? projectOptions[0]
 
   const loadFromStatus = React.useCallback(async () => {
     try {
       const status = await window.electronAPI.symphony.status()
       const raw = status as unknown as { projects: Array<Record<string, unknown>>; loop: SymphonyLoopInfo | null }
       const nextTiles = tilesFromServiceStatus(raw)
+
+      setProjectOptions(raw.projects.map(project => ({
+        projectId: asString(project.projectId) ?? 'unknown',
+        allowedProfiles: Array.isArray(project.allowedProfiles) ? (project.allowedProfiles as string[]) : [],
+        verificationBudget: asString(project.verificationBudget),
+      })))
 
       // Surface project-level failures loudly instead of a silent stub tile.
       setProjectErrors(raw.projects
@@ -400,7 +424,8 @@ export function SymphonyBoard({ onSendMessage, projectFilter = [] }: { onSendMes
 
   const handleCreateIssue = React.useCallback(async () => {
     if (creating) return
-    const projectId = draft.projectId || (tiles?.[0]?.projectId ?? '')
+    // Explicit project — never "whichever tile happened to be first".
+    const projectId = draft.projectId || activeProject?.projectId || ''
     if (!projectId || !draft.title.trim() || !draft.goal.trim() || !draft.acceptance.trim()) return
     setCreating(true)
     try {
@@ -410,17 +435,19 @@ export function SymphonyBoard({ onSendMessage, projectFilter = [] }: { onSendMes
         risk: draft.risk,
         acceptance: draft.acceptance.split('\n').map(l => l.trim()).filter(Boolean),
         nonGoals: draft.nonGoals.split('\n').map(l => l.trim()).filter(Boolean),
+        ...(draft.model ? { model: draft.model } : {}),
+        ...(draft.dependencies.length ? { dependencies: draft.dependencies } : {}),
       })
       toast.success(t('kanban.symphony.issueCreated'))
       setComposerOpen(false)
-      setDraft(d => ({ ...d, title: '', goal: '', acceptance: '', nonGoals: '' }))
+      setDraft(d => ({ ...d, title: '', goal: '', acceptance: '', nonGoals: '', dependencies: [] }))
       await loadFromStatus()
     } catch (err) {
       toast.error(t('kanban.symphony.issueCreateFailed'), { description: err instanceof Error ? err.message : String(err) })
     } finally {
       setCreating(false)
     }
-  }, [creating, draft, tiles, loadFromStatus, t])
+  }, [creating, draft, activeProject, loadFromStatus, t])
 
   React.useEffect(() => {
     void loadFromStatus()
@@ -510,23 +537,54 @@ export function SymphonyBoard({ onSendMessage, projectFilter = [] }: { onSendMes
       )}
       {composerOpen && (
         <div className="space-y-2 border-b border-border/50 bg-foreground/[0.02] px-4 py-3 text-[12px]">
-          <div className="flex gap-2">
-            <input
-              className="h-8 flex-1 rounded-lg border border-border bg-card px-2"
-              placeholder={t('kanban.symphony.issueTitle')}
-              value={draft.title}
-              onChange={e => setDraft(d => ({ ...d, title: e.target.value }))}
-            />
-            <select
-              className="h-8 rounded-lg border border-border bg-card px-2"
-              value={draft.risk}
-              onChange={e => setDraft(d => ({ ...d, risk: e.target.value as typeof d.risk }))}
-            >
-              <option value="low">low</option>
-              <option value="medium">medium</option>
-              <option value="high">high</option>
-            </select>
+          {/* Project + model are explicit: a contract issue lands in exactly one
+              configured Symphony project, and the executor profile must be one the
+              project's model policy accepts (anything else fails contract parsing). */}
+          <div className="flex flex-wrap gap-2">
+            <label className="flex items-center gap-1.5 text-[11px] text-foreground/60">
+              {t('kanban.symphony.issueProject')}
+              <select
+                className="h-8 rounded-lg border border-border bg-card px-2 text-[12px] text-foreground"
+                value={draft.projectId || activeProject?.projectId || ''}
+                onChange={e => setDraft(d => ({ ...d, projectId: e.target.value, model: '' }))}
+              >
+                {projectOptions.map(option => (
+                  <option key={option.projectId} value={option.projectId}>{option.projectId}</option>
+                ))}
+              </select>
+            </label>
+            <label className="flex items-center gap-1.5 text-[11px] text-foreground/60">
+              {t('kanban.symphony.issueModel')}
+              <select
+                className="h-8 rounded-lg border border-border bg-card px-2 text-[12px] text-foreground"
+                value={draft.model}
+                onChange={e => setDraft(d => ({ ...d, model: e.target.value }))}
+              >
+                <option value="">{t('kanban.symphony.issueModelDefault')}</option>
+                {(activeProject?.allowedProfiles ?? []).map(profile => (
+                  <option key={profile} value={profile}>{profile}</option>
+                ))}
+              </select>
+            </label>
+            <label className="flex items-center gap-1.5 text-[11px] text-foreground/60">
+              {t('kanban.symphony.issueRisk')}
+              <select
+                className="h-8 rounded-lg border border-border bg-card px-2 text-[12px] text-foreground"
+                value={draft.risk}
+                onChange={e => setDraft(d => ({ ...d, risk: e.target.value as typeof d.risk }))}
+              >
+                <option value="low">low</option>
+                <option value="medium">medium</option>
+                <option value="high">high</option>
+              </select>
+            </label>
           </div>
+          <input
+            className="h-8 w-full rounded-lg border border-border bg-card px-2"
+            placeholder={t('kanban.symphony.issueTitle')}
+            value={draft.title}
+            onChange={e => setDraft(d => ({ ...d, title: e.target.value }))}
+          />
           <input
             className="h-8 w-full rounded-lg border border-border bg-card px-2"
             placeholder={t('kanban.symphony.issueGoal')}
@@ -547,7 +605,42 @@ export function SymphonyBoard({ onSendMessage, projectFilter = [] }: { onSendMes
             value={draft.nonGoals}
             onChange={e => setDraft(d => ({ ...d, nonGoals: e.target.value }))}
           />
-          <div className="flex justify-end">
+          {/* Decomposition in v4 = separate issues plus edges: dependencies become
+              blockedBy, so this issue stays undispatchable until they are done.
+              (The Tasks world used in-session subtasks; Symphony uses the tracker.) */}
+          {(tiles ?? []).length > 0 && (
+            <div>
+              <p className="mb-1 text-[11px] text-foreground/60">{t('kanban.symphony.issueDependsOn')}</p>
+              <div className="flex flex-wrap gap-1.5">
+                {(tiles ?? []).map(tile => {
+                  const selected = draft.dependencies.includes(tile.issueIdentifier)
+                  return (
+                    <button
+                      key={tile.issueIdentifier}
+                      type="button"
+                      onClick={() => setDraft(d => ({
+                        ...d,
+                        dependencies: selected
+                          ? d.dependencies.filter(entry => entry !== tile.issueIdentifier)
+                          : [...d.dependencies, tile.issueIdentifier],
+                      }))}
+                      className={`rounded-md px-1.5 py-0.5 text-[10.5px] font-medium transition-colors ${
+                        selected ? 'bg-foreground text-background' : 'bg-foreground/[0.06] text-foreground/70 hover:bg-foreground/[0.12]'
+                      }`}
+                    >
+                      {tile.issueIdentifier}
+                    </button>
+                  )
+                })}
+              </div>
+            </div>
+          )}
+          <div className="flex items-center justify-end gap-2">
+            {activeProject?.verificationBudget && (
+              <span className="mr-auto text-[10.5px] text-foreground/40">
+                {t('kanban.symphony.issueBudget')}: {activeProject.verificationBudget}
+              </span>
+            )}
             <button
               type="button"
               disabled={creating || !draft.title.trim() || !draft.goal.trim() || !draft.acceptance.trim()}

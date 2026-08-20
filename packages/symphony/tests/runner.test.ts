@@ -276,5 +276,17 @@ describe("contract issue body", () => {
     expect((parsed.acceptance as string[])[1]).toBe("- leading dash");
     expect((parsed.nonGoals as string[]).length).toBeGreaterThan(0);
     expect(parsed.deployAuthority).toBe("none");
+    expect(parsed.dependencies).toBeUndefined();
+
+    const withDeps = contractIssueBody(
+      {
+        title: "t", goal: "g", risk: "low", acceptance: ["a"], nonGoals: [],
+        dependencies: ["razumv/craft-agents#25", " "], verificationBudget: "explicit-budget",
+      },
+      { id: "CRAFT-TEST", model: "pi/gpt-5.6-sol", verificationBudget: "config-budget" },
+    );
+    const depYaml = Bun.YAML.parse(/```yaml\n([\s\S]*?)```/.exec(withDeps)![1]!) as Record<string, unknown>;
+    expect(depYaml.dependencies).toEqual(["razumv/craft-agents#25"]);
+    expect(depYaml.verificationBudget).toBe("explicit-budget");
   });
 });

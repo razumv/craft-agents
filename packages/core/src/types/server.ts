@@ -71,6 +71,10 @@ export interface SymphonyProjectServiceStatus {
   ownerSessionId: string | null
   /** Craft project id from the runner config — lets UI surfaces filter Symphony work by Craft project. */
   craftProjectId: string | null
+  /** Model profiles the project's policy accepts (issue-intake model picker). */
+  allowedProfiles: string[]
+  /** Default verification budget from the runner config (issue-intake default). */
+  verificationBudget: string | null
 }
 
 export interface SymphonyServiceStatus {
