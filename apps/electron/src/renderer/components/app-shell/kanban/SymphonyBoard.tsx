@@ -343,6 +343,12 @@ export function SymphonyBoard({ onSendMessage, projectFilter = [] }: { onSendMes
   const { t } = useTranslation()
   const [tiles, setTiles] = React.useState<SymphonyTile[] | null>(null)
   const [loopInfo, setLoopInfo] = React.useState<SymphonyLoopInfo | null>(null)
+  const [projectErrors, setProjectErrors] = React.useState<{ projectId: string; error: string }[]>([])
+  // Terminal columns (done/attention) start collapsed — finished/failed work
+  // shouldn't crowd out the active pipeline. Session-local, not persisted.
+  const [expandedTerminal, setExpandedTerminal] = React.useState<Set<string>>(() => new Set())
+  // Previous tile states, for owner-attention transition toasts (notify-lite).
+  const prevStatesRef = React.useRef<Map<string, string>>(new Map())
   const [error, setError] = React.useState<string | null>(null)
   const [refreshing, setRefreshing] = React.useState(false)
   const [composerOpen, setComposerOpen] = React.useState(false)
@@ -352,13 +358,38 @@ export function SymphonyBoard({ onSendMessage, projectFilter = [] }: { onSendMes
   const loadFromStatus = React.useCallback(async () => {
     try {
       const status = await window.electronAPI.symphony.status()
-      setTiles(tilesFromServiceStatus(status as unknown as { projects: Array<Record<string, unknown>> }))
-      setLoopInfo((status as unknown as { loop: SymphonyLoopInfo | null }).loop ?? null)
+      const raw = status as unknown as { projects: Array<Record<string, unknown>>; loop: SymphonyLoopInfo | null }
+      const nextTiles = tilesFromServiceStatus(raw)
+
+      // Surface project-level failures loudly instead of a silent stub tile.
+      setProjectErrors(raw.projects
+        .filter(project => asString(project.lastError) || project.phase === 'error')
+        .map(project => ({
+          projectId: asString(project.projectId) ?? 'unknown',
+          error: asString(project.lastError) ?? 'error',
+        })))
+
+      // Notify-lite: toast when an issue TRANSITIONS into a state that needs
+      // the owner (owner-gate) or their attention (failed). Only transitions —
+      // a tile that was already there on first load stays quiet.
+      const prev = prevStatesRef.current
+      if (prev.size > 0) {
+        for (const tile of nextTiles) {
+          const before = prev.get(tile.issueIdentifier)
+          if (before !== tile.state && (tile.state === 'owner-gate' || tile.state === 'failed')) {
+            toast.warning(t('kanban.symphony.stateAlert', { issue: tile.issueIdentifier, state: tile.state }))
+          }
+        }
+      }
+      prevStatesRef.current = new Map(nextTiles.map(tile => [tile.issueIdentifier, tile.state]))
+
+      setTiles(nextTiles)
+      setLoopInfo(raw.loop ?? null)
       setError(null)
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
     }
-  }, [])
+  }, [t])
 
   // Live updates: the server broadcasts after every completed operation
   // (tick, loop shadow cycle, refresh, issue intake) — re-read status then.
@@ -468,6 +499,15 @@ export function SymphonyBoard({ onSendMessage, projectFilter = [] }: { onSendMes
         </button>
         </div>
       </div>
+      {projectErrors.length > 0 && (
+        <div className="space-y-1 border-b border-border/50 bg-red-500/10 px-4 py-2">
+          {projectErrors.map(entry => (
+            <p key={entry.projectId} className="text-[11.5px] font-medium text-red-500">
+              {t('kanban.symphony.projectError', { project: entry.projectId })}: {entry.error}
+            </p>
+          ))}
+        </div>
+      )}
       {composerOpen && (
         <div className="space-y-2 border-b border-border/50 bg-foreground/[0.02] px-4 py-3 text-[12px]">
           <div className="flex gap-2">
@@ -526,12 +566,39 @@ export function SymphonyBoard({ onSendMessage, projectFilter = [] }: { onSendMes
               ? (tiles ?? [])
               : (tiles ?? []).filter(tile => tile.craftProjectId !== null && projectFilter.includes(tile.craftProjectId))
             const columnTiles = visible.filter(tile => columnFor(tile.state).id === column.id)
+            const isTerminal = column.id === 'done' || column.id === 'attention'
+            if (isTerminal && !expandedTerminal.has(column.id)) {
+              return (
+                <button
+                  key={column.id}
+                  type="button"
+                  onClick={() => setExpandedTerminal(prev => new Set(prev).add(column.id))}
+                  className="flex w-10 shrink-0 snap-start flex-col items-center gap-2 rounded-xl bg-foreground/[0.02] py-3 transition-colors hover:bg-foreground/[0.05]"
+                  title={t(column.labelKey)}
+                >
+                  <span className="h-2 w-2 rounded-full" style={{ backgroundColor: column.accent }} />
+                  <span className="text-[11px] font-semibold text-foreground/60 [writing-mode:vertical-rl]">
+                    {t(column.labelKey)}
+                  </span>
+                  <span className="text-[11px] font-semibold text-foreground/40">{columnTiles.length}</span>
+                </button>
+              )
+            }
             return (
               <div key={column.id} className="flex w-64 shrink-0 snap-start flex-col rounded-xl bg-foreground/[0.02] p-2">
                 <div className="flex items-center gap-2 px-1 pb-2">
                   <span className="h-2 w-2 rounded-full" style={{ backgroundColor: column.accent }} />
                   <span className="text-[12px] font-semibold text-foreground/80">{t(column.labelKey)}</span>
                   <span className="ml-auto text-[11px] text-foreground/40">{columnTiles.length}</span>
+                  {isTerminal && (
+                    <button
+                      type="button"
+                      onClick={() => setExpandedTerminal(prev => { const next = new Set(prev); next.delete(column.id); return next })}
+                      className="text-[10.5px] text-foreground/40 hover:text-foreground/70"
+                    >
+                      {t('kanban.symphony.collapse')}
+                    </button>
+                  )}
                 </div>
                 <div className="flex min-h-0 flex-col gap-2 overflow-y-auto">
                   {columnTiles.map(tile => (

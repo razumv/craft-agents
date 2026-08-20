@@ -611,6 +611,9 @@ export function KanbanBoardContainer() {
           )}
         </div>
         <div className="flex items-center gap-2">
+          {/* New Task creates a Craft task (Tasks world) — meaningless in Symphony
+              mode, where work intake is the board's own New Issue composer. */}
+          {!showSymphony && (
           <button
             type="button"
             onClick={() => setEditorTarget({ mode: 'create', initialProjectId: projectFilter[0] })}
@@ -619,6 +622,7 @@ export function KanbanBoardContainer() {
           >
             <Plus className="h-3.5 w-3.5" strokeWidth={2.5} /> {t('kanban.newTask')}
           </button>
+          )}
           <BoardListToggle
             value="board"
             onChange={view => {

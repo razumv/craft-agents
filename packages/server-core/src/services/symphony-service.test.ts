@@ -227,8 +227,14 @@ describe('NativeSymphonyService autonomous loop', () => {
     expect(status.loop).toMatchObject({ enabled: true, mode: 'shadow', droppedProjects: [] })
     expect(status.loop!.cycles).toBeGreaterThan(0)
     expect(status.loop!.lastCycleAt).not.toBeNull()
-    expect(calls.filter((c) => c === 'shadow').length).toBeGreaterThan(0)
+    const shadows = calls.filter((c) => c === 'shadow').length
+    expect(shadows).toBeGreaterThan(0)
     expect(calls).not.toContain('tick')
+    // Every cycle ends with a read-only refresh so the board snapshot stays a
+    // LiveRunnerStatus even though shadow receipts no longer touch it.
+    // readStatus: 1 (reconstruct) + 1 per completed cycle.
+    expect(calls.filter((c) => c === 'status').length).toBeGreaterThanOrEqual(1 + shadows)
+    expect(service.status().projects[0]!.snapshot).toMatchObject({ durable: 'same' })
     await service.stop()
   })
 
