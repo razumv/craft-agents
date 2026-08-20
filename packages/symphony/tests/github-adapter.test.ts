@@ -51,13 +51,13 @@ class MemoryGitHubTransport implements GitHubTransport {
   pageSize = 100;
   #commentId = 1000;
 
-  addIssue(number: number, state: LifecycleState = "ready", dependencies: string[] = []): GitHubIssueRecord {
+  addIssue(number: number, state: LifecycleState = "ready", dependencies: string[] = [], risk: "low" | "medium" | "high" = "low"): GitHubIssueRecord {
     const id = `I_${number}`;
     const record: GitHubIssueRecord = {
       id,
       number,
       title: `Issue ${number}`,
-      body: contract(`WORK-${number}`, dependencies),
+      body: contract(`WORK-${number}`, dependencies, risk),
       url: `https://github.test/acme/repo/issues/${number}`,
       state: state === "done" ? "CLOSED" : "OPEN",
       createdAt: `2026-08-${String(number).padStart(2, "0")}T10:00:00Z`,
@@ -162,16 +162,19 @@ class MemoryGitHubTransport implements GitHubTransport {
   private hit(name: string): void { this.calls.set(name, (this.calls.get(name) ?? 0) + 1); }
 }
 
-function contract(id: string, dependencies: string[]): string {
+function contract(id: string, dependencies: string[], risk: "low" | "medium" | "high" = "low"): string {
+  const budget = risk === "high"
+    ? "security-review-owner-gate-exact-readback"
+    : "targeted-tests-plus-one-simulator-smoke";
   return `## Work contract
 
 \`\`\`yaml
 id: ${id}
 goal: Exercise the GitHub adapter deterministically.
-risk: low
+risk: ${risk}
 deployAuthority: none
 model: pi/gpt-5.6-sol
-verificationBudget: targeted-tests-plus-one-simulator-smoke
+verificationBudget: ${budget}
 requires:${dependencies.length ? `\n${dependencies.map((entry) => `  - ${entry}`).join("\n")}` : " []"}
 nonGoals:
   - live mutations
@@ -595,6 +598,28 @@ describe("v4.2 GitHub Issues and Projects adapter", () => {
 
     const snapshot = await adapter.get("I_1");
     expect(snapshot.issue.state).toBe("ready");
+  });
+
+  test("a high-risk merge that skipped its owner gate blocks for the owner instead of reading as delivered", async () => {
+    const { transport, adapter } = setup();
+    transport.addIssue(1, "ready", [], "high");
+    const before = await adapter.get("I_1");
+    const claim = await proposedClaim(adapter, "I_1");
+    await adapter.tryClaim("I_1", before.version, claim, 1_000);
+    await adapter.markRunning(claim.fence, 1_100);
+    attachPr(transport, "I_1");
+    await adapter.advanceByEvidence(1_150);
+    expect((await adapter.get("I_1")).issue.state).toBe("pr-open");
+
+    // Auto-merge never merges high risk, so a merge here is a person's doing.
+    // It must not be recorded as `merged` — for high-risk work that asserts the
+    // gate was honoured — and it must not sit in pr-open holding WIP either.
+    attachPr(transport, "I_1", true);
+    const advanced = await adapter.advanceByEvidence(1_300);
+    expect(advanced[0]).toMatchObject({ reason: "high-risk work merged without passing its owner gate" });
+    const settled = await adapter.get("I_1");
+    expect(settled.issue.state).toBe("blocked");
+    expect(settled.claim).toBeNull();
   });
 
   test("work that merged after its attempt failed stops being reported as a failure", async () => {

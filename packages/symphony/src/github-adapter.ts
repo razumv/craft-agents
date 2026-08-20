@@ -811,8 +811,19 @@ function nextEvidenceStep(snapshot: TrackerIssueSnapshot): { to: LifecycleState;
   const evidence = snapshot.evidence;
   if (state === "running" && evidence.prUrl) return { to: "pr-open", reason: "pull request evidence" };
   if (["pr-open", "review", "owner-gate"].includes(state) && evidence.mergedAt && evidence.mergeCommitSha) {
-    // High-risk work must pass through owner-gate before merged; leave it be.
-    if (snapshot.contract.risk === "high" && state !== "owner-gate") return undefined;
+    // A high-risk contract owes an owner gate BEFORE it merges. Auto-merge refuses
+    // high risk on its own, so a merge here was performed by a person — and the
+    // ledger must not record it as `merged`, because `merged` for high-risk work
+    // asserts the gate was honoured. Weakening that to tidy up after a bypass
+    // would turn the gate into a note.
+    //
+    // Nor may the issue sit in pr-open forever: its work landed and its WIP slot
+    // is held. So it goes to `blocked`, which says exactly what is true — the work
+    // is in, the gate it owed was skipped, and only the owner can settle that. The
+    // claim is released with the transition, so the lane keeps moving.
+    if (snapshot.contract.risk === "high" && state !== "owner-gate") {
+      return { to: "blocked", reason: "high-risk work merged without passing its owner gate" };
+    }
     return { to: "merged", reason: "merge evidence" };
   }
   // The gate that a high-risk contract owes is a gate before merging. Once the
