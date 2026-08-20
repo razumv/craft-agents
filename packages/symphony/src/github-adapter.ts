@@ -399,9 +399,23 @@ export class GitHubIssuesProjectsAdapter implements TrackerAdapter {
     // attempt stays in the ledger history, where a failure belongs.
     for (const entry of [...(await this.loadAll(false)).values()].sort((a, b) => a.snapshot.issue.id.localeCompare(b.snapshot.issue.id))) {
       const snapshot = entry.snapshot;
-      if (snapshot.claim) continue;
-      if (!landedWithoutSaying(snapshot)) continue;
-      results.push(...await this.advanceClaimByEvidence(snapshot, nowMs));
+      if (landedWithoutSaying(snapshot)) {
+        if (snapshot.claim) continue;
+        results.push(...await this.advanceClaimByEvidence(snapshot, nowMs));
+        continue;
+      }
+      // A person closing an issue is a decision the lane has to respect. It can
+      // never be dispatched again — closed is not dispatchable — so an in-flight
+      // label on it is a badge that will never change on its own, which is how
+      // razumv/lineage2-classic-ue#783 sat closed and labelled retry-wait. There
+      // is no merge, so the honest terminal state is cancelled, not done.
+      if (!closedWhileInFlight(snapshot)) continue;
+      const claim = snapshot.claim;
+      await this.transition(snapshot.issue.id, "cancelled", nowMs, {
+        ...(claim ? { fence: claim.fence } : {}),
+        message: "issue was closed with no merge evidence while its lifecycle state was still in flight",
+      });
+      results.push({ issueId: snapshot.issue.id, action: "advanced", reason: "closed by hand without a merge" });
     }
     return results;
   }
@@ -754,6 +768,17 @@ export class GitHubIssuesProjectsAdapter implements TrackerAdapter {
 function landedWithoutSaying(snapshot: TrackerIssueSnapshot): boolean {
   if (!["failed", "cancelled"].includes(snapshot.issue.state)) return false;
   return Boolean(snapshot.evidence.mergedAt && snapshot.evidence.mergeCommitSha);
+}
+
+/**
+ * An issue a person closed while the ledger still had it in flight, with nothing
+ * merged. Not a failure of the run and not a delivery — a decision taken outside
+ * the lane, which the lane must record rather than wait on forever.
+ */
+function closedWhileInFlight(snapshot: TrackerIssueSnapshot): boolean {
+  if (!snapshot.issue.closed) return false;
+  if (snapshot.evidence.mergedAt) return false;
+  return ["ready", "claimed", "running", "pr-open", "review", "owner-gate", "retry-wait"].includes(snapshot.issue.state);
 }
 
 function nextEvidenceStep(snapshot: TrackerIssueSnapshot): { to: LifecycleState; reason: string } | undefined {

@@ -628,6 +628,46 @@ describe("v4.2 GitHub Issues and Projects adapter", () => {
     expect(done.events.some((event) => event.kind === "failure")).toBeTrue();
   });
 
+  test("an issue closed by hand while in flight is recorded as cancelled", async () => {
+    const { transport, adapter } = setup();
+    transport.addIssue(1);
+    const before = await adapter.get("I_1");
+    const claim = await proposedClaim(adapter, "I_1");
+    await adapter.tryClaim("I_1", before.version, claim, 1_000);
+    await adapter.markRunning(claim.fence, 1_100);
+
+    // Someone closes it. The lane can never dispatch a closed issue, so leaving
+    // the label in flight leaves a badge that would never change again.
+    transport.issues.find((issue) => issue.id === "I_1")!.state = "CLOSED";
+
+    expect(await adapter.advanceByEvidence(1_200)).toEqual([
+      { issueId: "I_1", action: "advanced", reason: "closed by hand without a merge" },
+    ]);
+    const settled = await adapter.get("I_1");
+    expect(settled.issue.state).toBe("cancelled");
+    // Cancelled, not done: nothing merged, so nothing was delivered.
+    expect(settled.evidence.mergedAt).toBeUndefined();
+    expect(settled.claim).toBeNull();
+  });
+
+  test("a closed issue whose work merged is recorded as delivered, not cancelled", async () => {
+    const { transport, adapter } = setup();
+    transport.addIssue(1);
+    const before = await adapter.get("I_1");
+    const claim = await proposedClaim(adapter, "I_1");
+    await adapter.tryClaim("I_1", before.version, claim, 1_000);
+    await adapter.markRunning(claim.fence, 1_100);
+    attachPr(transport, "I_1");
+    await adapter.advanceByEvidence(1_150);
+    attachPr(transport, "I_1", true);
+    transport.branches.delete("v4/acme-repo-1");
+    transport.issues.find((issue) => issue.id === "I_1")!.state = "CLOSED";
+
+    // Closed AND merged must take the delivery path, never the cancelled one.
+    await adapter.advanceByEvidence(1_200);
+    expect((await adapter.get("I_1")).issue.state).toBe("done");
+  });
+
   test("a failed attempt with no merge stays failed", async () => {
     const { transport, adapter } = setup();
     transport.addIssue(1);
