@@ -402,6 +402,57 @@ describe("v4.2 GitHub Issues and Projects adapter", () => {
     expect(merged.evidence.mergeCommitSha).toBe("c".repeat(40));
   });
 
+  test("ordinary reconcile advances running to done on durable evidence without a live session", async () => {
+    const { transport, adapter } = setup();
+    transport.addIssue(1);
+    const before = await adapter.get("I_1");
+    const claim = await proposedClaim(adapter, "I_1");
+    await adapter.tryClaim("I_1", before.version, claim, 1_000);
+    await adapter.markRunning(claim.fence, 1_100);
+
+    expect(await adapter.advanceByEvidence(1_150)).toEqual([]);
+    expect((await adapter.get("I_1")).issue.state).toBe("running");
+
+    attachPr(transport, "I_1");
+    expect(await adapter.advanceByEvidence(1_200)).toEqual([
+      { issueId: "I_1", action: "advanced", reason: "pull request evidence" },
+    ]);
+    expect((await adapter.get("I_1")).issue.state).toBe("pr-open");
+
+    attachPr(transport, "I_1", true);
+    transport.branches.delete("v4/acme-repo-1");
+    expect(await adapter.advanceByEvidence(1_300)).toEqual([
+      { issueId: "I_1", action: "advanced", reason: "merge evidence" },
+      { issueId: "I_1", action: "advanced", reason: "merge evidence with no deployment authority" },
+    ]);
+
+    const done = await adapter.get("I_1");
+    expect(done.issue.state).toBe("done");
+    expect(done.claim).toBeNull();
+    expect(done.evidence.mergeCommitSha).toBe("c".repeat(40));
+    expect(await adapter.activeClaims()).toEqual([]);
+    expect(transport.comments.get("FENCE")!.at(-1)!.body).toContain("\"operation\":\"release\"");
+  });
+
+  test("evidence advancement is idempotent and terminal once the ledger settles", async () => {
+    const { transport, adapter } = setup();
+    transport.addIssue(1);
+    const before = await adapter.get("I_1");
+    const claim = await proposedClaim(adapter, "I_1");
+    await adapter.tryClaim("I_1", before.version, claim, 1_000);
+    await adapter.markRunning(claim.fence, 1_100);
+    attachPr(transport, "I_1", true);
+
+    expect(await adapter.advanceByEvidence(1_200)).toHaveLength(3);
+    const settled = await adapter.get("I_1");
+    expect(settled.issue.state).toBe("done");
+
+    expect(await adapter.advanceByEvidence(1_300)).toEqual([]);
+    const again = await adapter.get("I_1");
+    expect(again.version).toBe(settled.version);
+    expect(transport.comments.get("I_1")).toHaveLength(settled.events.length - 1);
+  });
+
   test("owner gate preserves and validates the exact immutable Gate field ID", async () => {
     const { transport, adapter } = setup();
     transport.addIssue(1, "pr-open");

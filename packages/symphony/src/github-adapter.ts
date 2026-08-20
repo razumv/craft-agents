@@ -322,6 +322,43 @@ export class GitHubIssuesProjectsAdapter implements TrackerAdapter {
     return results;
   }
 
+  /**
+   * Advances every active claim as far as its durable evidence exactly proves,
+   * without consulting the executing session. A dead Craft session used to
+   * strand an issue in `pr-open` forever even though the ledger already carried
+   * `mergedAt`/`mergeCommitSha`; this runs on every ordinary reconcile instead
+   * of once per scheduler lifetime. Fail-closed and idempotent: the hop table
+   * only fires on exact evidence, so a second pass is a no-op.
+   */
+  async advanceByEvidence(nowMs: number): Promise<readonly StartupReconciliation[]> {
+    const results: StartupReconciliation[] = [];
+    const active = await this.activeClaims();
+    for (const snapshot of active.sort((a, b) => a.issue.id.localeCompare(b.issue.id))) {
+      results.push(...await this.advanceClaimByEvidence(snapshot, nowMs));
+    }
+    return results;
+  }
+
+  private async advanceClaimByEvidence(start: TrackerIssueSnapshot, nowMs: number): Promise<StartupReconciliation[]> {
+    const results: StartupReconciliation[] = [];
+    let snapshot = start;
+    // Bounded so a hypothetical evidence cycle can never spin the tick.
+    for (let hop = 0; hop < lifecycleStates.length; hop += 1) {
+      const claim = snapshot.claim;
+      if (!claim) break;
+      const step = nextEvidenceStep(snapshot);
+      if (!step) break;
+      const from = snapshot.issue.state;
+      snapshot = await this.transition(snapshot.issue.id, step.to, nowMs, {
+        fence: claim.fence,
+        message: `durable ${step.reason} advanced ${from} to ${step.to}`,
+        evidence: snapshot.evidence,
+      });
+      results.push({ issueId: snapshot.issue.id, action: "advanced", reason: step.reason });
+    }
+    return results;
+  }
+
   private async requiredCommit(current: Hydrated, event: LedgerEvent): Promise<TrackerIssueSnapshot> {
     const result = await this.commit(current, event, false);
     if (!result) throw new Error("GitHub compare-and-set conflict");
@@ -578,6 +615,27 @@ export class GitHubIssuesProjectsAdapter implements TrackerAdapter {
     snapshot.evidence = { ...snapshot.evidence, ...providerEvidence };
     return { snapshot, providerEvidence, record, item, labels, acceptedCommentIds, projectionDrift, contract, nativeBlockers };
   }
+}
+
+/**
+ * The exact evidence hops. `undefined` means "no proof, stay put" — never a
+ * guess. `merged` -> `done` fires only when the contract itself declares no
+ * deployment authority; anything deployable stays in `merged` for the real
+ * deployment to prove.
+ */
+function nextEvidenceStep(snapshot: TrackerIssueSnapshot): { to: LifecycleState; reason: string } | undefined {
+  const state = snapshot.issue.state;
+  const evidence = snapshot.evidence;
+  if (state === "running" && evidence.prUrl) return { to: "pr-open", reason: "pull request evidence" };
+  if (["pr-open", "review", "owner-gate"].includes(state) && evidence.mergedAt && evidence.mergeCommitSha) {
+    // High-risk work must pass through owner-gate before merged; leave it be.
+    if (snapshot.contract.risk === "high" && state !== "owner-gate") return undefined;
+    return { to: "merged", reason: "merge evidence" };
+  }
+  if (state === "merged" && snapshot.contract.deployAuthority === "none") {
+    return { to: "done", reason: "merge evidence with no deployment authority" };
+  }
+  return undefined;
 }
 
 function nextEvent(
