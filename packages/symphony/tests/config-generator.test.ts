@@ -98,6 +98,54 @@ describe("connection failover chain", () => {
     expect(connectionForAttempt({ connection: "solo", connections: [] }, 2)).toBe("solo");
   });
 
+  test("balanced spreads the starting account across issues and still rotates on retry", async () => {
+    const { connectionForAttempt } = await import("../src/identity");
+    const chain = {
+      connection: "chatgpt-plus",
+      connections: ["chatgpt-plus", "chatgpt-plus-2", "chatgpt-plus-3"],
+      connectionStrategy: "balanced" as const,
+    };
+    const ids = Array.from({ length: 60 }, (_, index) => `I_kwDO${index}`);
+    const firstAttempt = ids.map((id) => connectionForAttempt(chain, 1, id));
+
+    // Every account takes real first-attempt work, which failover never does.
+    for (const connection of chain.connections) {
+      expect(firstAttempt).toContain(connection);
+    }
+
+    // Same inputs, same answer: a restart must reconstruct the binding it claimed.
+    for (const id of ids) {
+      expect(connectionForAttempt(chain, 1, id)).toBe(connectionForAttempt(chain, 1, id));
+    }
+
+    // A retry always leaves the account that just failed, and a full rotation
+    // visits every account exactly once before repeating.
+    const id = ids[0]!;
+    const rotation = [1, 2, 3].map((attempt) => connectionForAttempt(chain, attempt, id));
+    expect(new Set(rotation).size).toBe(3);
+    expect(connectionForAttempt(chain, 4, id)).toBe(rotation[0]);
+  });
+
+  test("balanced without an issue id degrades to failover rather than guessing", async () => {
+    const { connectionForAttempt } = await import("../src/identity");
+    const chain = {
+      connection: "chatgpt-plus",
+      connections: ["chatgpt-plus", "chatgpt-plus-2", "chatgpt-plus-3"],
+      connectionStrategy: "balanced" as const,
+    };
+    expect(connectionForAttempt(chain, 1)).toBe("chatgpt-plus");
+    expect(connectionForAttempt(chain, 2)).toBe("chatgpt-plus-2");
+  });
+
+  test("the default strategy is unchanged failover", async () => {
+    const { connectionForAttempt } = await import("../src/identity");
+    const chain = { connection: "chatgpt-plus", connections: ["chatgpt-plus", "chatgpt-plus-2"] };
+    // No strategy configured: an issue id must not change the pick.
+    expect(connectionForAttempt(chain, 1, "I_anything")).toBe("chatgpt-plus");
+    expect(connectionForAttempt(chain, 2, "I_anything")).toBe("chatgpt-plus-2");
+    expect(connectionForAttempt({ ...chain, connectionStrategy: "failover" }, 1, "I_anything")).toBe("chatgpt-plus");
+  });
+
   test("policy allows every chain connection and dedupes the primary", async () => {
     const { ModelPolicy } = await import("../src/policy");
     const policy = new ModelPolicy({

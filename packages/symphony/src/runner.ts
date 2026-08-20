@@ -64,8 +64,10 @@ export interface LiveRunnerConfig {
   git: { executable: string };
   model?: {
     connection: string;
-    /** Failover chain: attempt N runs on connections[N-1] (clamped). */
+    /** Account chain. How it is consumed depends on connectionStrategy. */
     connections?: string[];
+    /** `failover` (default) or `balanced` — see ConnectionStrategy. */
+    connectionStrategy?: "failover" | "balanced";
     defaultProfile: string;
     allowedProfiles: string[];
   };
@@ -349,6 +351,9 @@ export async function createLiveRunner(config: LiveRunnerConfig): Promise<LiveV4
       throw new Error("live runner model.connections must be an array of non-empty connection slugs");
     }
   }
+  if (model.connectionStrategy !== undefined && model.connectionStrategy !== "failover" && model.connectionStrategy !== "balanced") {
+    throw new Error('live runner model.connectionStrategy must be "failover" or "balanced"');
+  }
   if (!model.allowedProfiles.includes(model.defaultProfile)) {
     throw new Error("live runner model.defaultProfile must be one of model.allowedProfiles");
   }
@@ -365,6 +370,7 @@ export async function createLiveRunner(config: LiveRunnerConfig): Promise<LiveV4
     model: {
       connection: model.connection,
       ...(model.connections?.length ? { connections: [...model.connections] } : {}),
+      ...(model.connectionStrategy ? { connectionStrategy: model.connectionStrategy } : {}),
       defaultProfile: model.defaultProfile,
       allowedProfiles: [...model.allowedProfiles],
     },

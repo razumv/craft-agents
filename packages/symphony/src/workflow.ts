@@ -101,6 +101,12 @@ export function parseWorkflow(content: string, workflowPath = resolve("WORKFLOW.
   const modelConnections = model.connections === undefined
     ? undefined
     : stringArray(model.connections, "model.connections");
+  const modelConnectionStrategy = model.connection_strategy === undefined
+    ? undefined
+    : string(model.connection_strategy, "model.connection_strategy");
+  if (modelConnectionStrategy !== undefined && modelConnectionStrategy !== "failover" && modelConnectionStrategy !== "balanced") {
+    throw new Error('model.connection_strategy must be "failover" or "balanced"');
+  }
   if (!allowedProfiles.includes(defaultProfile)) throw new Error("model.default_profile must be allowed");
 
   const rootPath = string(workspace.root, "workspace.root");
@@ -135,6 +141,7 @@ export function parseWorkflow(content: string, workflowPath = resolve("WORKFLOW.
     model: {
       connection: modelConnection,
       ...(modelConnections?.length ? { connections: modelConnections } : {}),
+      ...(modelConnectionStrategy ? { connectionStrategy: modelConnectionStrategy } : {}),
       defaultProfile,
       allowedProfiles,
     },
