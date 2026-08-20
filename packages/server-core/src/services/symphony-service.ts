@@ -160,6 +160,13 @@ export class NativeSymphonyService implements SymphonyServiceControl {
     readonly config: SymphonyServerConfig,
     readonly configPath: string | null,
     readonly runnerFactory: SymphonyRunnerFactory = createLiveRunner,
+    /**
+     * Optional: wakes the owner's phone when a project reaches a state only
+     * they can answer. Absent → the service behaves exactly as before.
+     */
+    readonly ownerPush?: {
+      notify(notification: { title: string; body: string; url?: string; tag?: string }, nowMs: number): Promise<unknown>
+    },
   ) {
     this.#phase = config.projects.length === 0 ? 'disabled' : 'reconstructing'
     const now = Date.now()
@@ -417,6 +424,43 @@ export class NativeSymphonyService implements SymphonyServiceControl {
     return () => this.#listeners.delete(listener)
   }
 
+  /**
+   * Wake the owner only for work that has stopped on their answer.
+   *
+   * Read from the snapshot the operation just produced, so no extra provider
+   * call is made. The push service debounces per tag, which matters because a
+   * loop tick re-reads the same unanswered gate every cycle — notifying each
+   * time would teach the owner to ignore the notification.
+   */
+  async #pushDecisionsNeeded(projectId: string, snapshot: unknown): Promise<void> {
+    if (!this.ownerPush) return
+    const { needsOwnerDecision } = await import('./owner-push')
+    const statuses = (snapshot as { statuses?: unknown[]; status?: unknown } | null)?.statuses
+      ?? (snapshot as { status?: unknown } | null)?.status
+    const list = Array.isArray(statuses) ? statuses : statuses ? [statuses] : []
+    for (const entry of list) {
+      const status = entry as { state?: unknown; issueIdentifier?: unknown; objective?: unknown; blocker?: unknown; ownerGate?: { id?: unknown } | null }
+      if (!needsOwnerDecision(status.state)) continue
+      const identifier = typeof status.issueIdentifier === 'string' ? status.issueIdentifier : projectId
+      const detail = typeof status.blocker === 'string' && status.blocker
+        ? status.blocker
+        : typeof status.objective === 'string' ? status.objective : ''
+      try {
+        await this.ownerPush.notify({
+          title: `${identifier} — ${String(status.state)}`,
+          body: detail ? `${detail}` : 'This run is waiting for your decision.',
+          url: '/',
+          // One tag per issue and state, so an unanswered gate notifies once
+          // rather than once per tick, and a NEW state on the same issue does
+          // reach the owner.
+          tag: `owner-decision:${identifier}:${String(status.state)}`,
+        }, Date.now())
+      } catch {
+        // A push failure must never affect the operation that triggered it.
+      }
+    }
+  }
+
   #notify(projectId: string, operation: SymphonyOperationResult['operation']): void {
     for (const listener of this.#listeners) {
       try { listener(projectId, operation) } catch { /* listeners must not break operations */ }
@@ -465,6 +509,7 @@ export class NativeSymphonyService implements SymphonyServiceControl {
           lastError: null,
           ...(updatesSnapshot ? { snapshot: result } : {}),
         }
+        if (updatesSnapshot) void this.#pushDecisionsNeeded(projectId, result)
         this.#notify(projectId, operation)
         return { projectId, operation, completedAt, result }
       } catch (error) {
@@ -547,6 +592,9 @@ export function createDisabledSymphonyService(): NativeSymphonyService {
   return new NativeSymphonyService({ version: 1, enabled: false, stopTimeoutMs: 5_000, projects: [] }, null)
 }
 
-export async function createSymphonyServiceFromConfig(path: string): Promise<NativeSymphonyService> {
-  return new NativeSymphonyService(await loadSymphonyServerConfig(path), resolve(path))
+export async function createSymphonyServiceFromConfig(
+  path: string,
+  ownerPush?: ConstructorParameters<typeof NativeSymphonyService>[3],
+): Promise<NativeSymphonyService> {
+  return new NativeSymphonyService(await loadSymphonyServerConfig(path), resolve(path), createLiveRunner, ownerPush)
 }

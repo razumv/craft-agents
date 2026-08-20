@@ -50,6 +50,7 @@ import { SessionManager, setSessionPlatform, setSessionRuntimeHooks } from '@cra
 import { initModelRefreshService, setFetcherPlatform } from '@craft-agent/server-core/model-fetchers'
 import {
   createDisabledSymphonyService,
+  OwnerPushService,
   createSymphonyServiceFromConfig,
   loadReleaseManifest,
   setSearchPlatform,
@@ -174,8 +175,15 @@ let messagingHandle: MessagingBootstrapHandle | null = null
 const releaseManifest = process.env.CRAFT_RELEASE_MANIFEST
   ? loadReleaseManifest(process.env.CRAFT_RELEASE_MANIFEST)
   : null
+// Owner push. Constructed unconditionally: it sends nothing until a device
+// subscribes, and it generates no key material until asked for one, so an
+// install that never subscribes pays nothing for it.
+const ownerPush = new OwnerPushService(
+  join(homedir(), '.craft-agent'),
+  (message) => console.error(`[push] ${message}`),
+)
 const symphonyService = process.env.CRAFT_SYMPHONY_CONFIG
-  ? await createSymphonyServiceFromConfig(process.env.CRAFT_SYMPHONY_CONFIG)
+  ? await createSymphonyServiceFromConfig(process.env.CRAFT_SYMPHONY_CONFIG, ownerPush)
   : createDisabledSymphonyService()
 const runtimeVersion = releaseManifest?.buildIdentity.buildId ?? process.env.CRAFT_VERSION ?? packageVersion
 
@@ -242,6 +250,7 @@ const instance = await (async () => {
           oauthFlowStore,
           messagingRegistry: messagingHandle.registry,
           symphonyService,
+          ownerPush,
           buildIdentity: releaseManifest?.buildIdentity,
         }
       },

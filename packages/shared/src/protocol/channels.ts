@@ -17,6 +17,13 @@ export const RPC_CHANNELS = {
     STATUS_CHANGED: 'server:statusChanged',
     HOME_DIR: 'server:homeDir',
   },
+  /** Web Push for decisions only the owner can take. */
+  ownerPush: {
+    PUBLIC_KEY: 'ownerPush:publicKey',
+    SUBSCRIBE: 'ownerPush:subscribe',
+    UNSUBSCRIBE: 'ownerPush:unsubscribe',
+    TEST: 'ownerPush:test',
+  },
   symphony: {
     VALIDATE: 'symphony:validate',
     SHADOW: 'symphony:shadow',

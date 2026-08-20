@@ -21,6 +21,7 @@ import { registerSkillsHandlers } from './skills'
 import { registerSourcesHandlers } from './sources'
 import { registerStatusesHandlers } from './statuses'
 import { registerSystemCoreHandlers } from './system'
+import { registerOwnerPushHandlers } from './owner-push'
 import { registerSymphonyHandlers } from './symphony'
 import { registerTasksHandlers } from './tasks'
 import { registerTransferHandlers } from './transfer'
@@ -49,6 +50,7 @@ export function registerCoreRpcHandlers(
   registerStatusesHandlers(server, deps)
   registerSystemCoreHandlers(server, deps)
   registerSymphonyHandlers(server, deps)
+  registerOwnerPushHandlers(server, deps)
   registerTasksHandlers(server, deps)
   registerTransferHandlers(server)
   registerWorkspaceCoreHandlers(server, deps)
