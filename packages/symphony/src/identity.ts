@@ -14,14 +14,39 @@ function workspaceKey(identifier: string): string {
   return sanitized === identifier ? sanitized : `${sanitized}-${digest(identifier)}`;
 }
 
-/** Deterministic failover pick: attempt N → connections[N-1], clamped to the last. */
+/**
+ * Which account a run uses. Both strategies are pure functions of durable claim
+ * inputs, which is the actual requirement — a restart must reconstruct the same
+ * binding it claimed — and neither reads a clock or any process state.
+ *
+ * `failover` (default): attempt N → connections[N-1], clamped to the last. The
+ * first attempt always lands on the configured primary, so later accounts are
+ * pure reserve. With several projects running concurrently every attempt-1 run
+ * piles onto one account while the rest idle.
+ *
+ * `balanced`: the starting account is chosen by hashing the issue id, and each
+ * further attempt steps to the next account. Steady-state work spreads across
+ * accounts per issue, retries still move off the account that just failed, and
+ * with a full rotation an issue visits every account before repeating — which
+ * `failover` never does, since it clamps on the last entry.
+ */
+export type ConnectionStrategy = "failover" | "balanced";
+
 export function connectionForAttempt(
-  model: { connection: string; connections?: string[] },
+  model: { connection: string; connections?: string[]; connectionStrategy?: ConnectionStrategy },
   attempt: number,
+  issueId?: string,
 ): string {
   const chain = model.connections?.filter((entry) => entry.trim()) ?? [];
   if (chain.length === 0) return model.connection;
-  return chain[Math.min(Math.max(attempt, 1), chain.length) - 1]!;
+  const step = Math.max(attempt, 1) - 1;
+  // Balanced needs an issue id to spread by. Without one it degrades to
+  // failover rather than picking something non-deterministic.
+  if (model.connectionStrategy === "balanced" && issueId) {
+    const offset = Number.parseInt(digest(issueId, 8), 16) % chain.length;
+    return chain[(offset + step) % chain.length]!;
+  }
+  return chain[Math.min(step, chain.length - 1)]!;
 }
 
 export class IdentityFactory {
@@ -65,9 +90,9 @@ export class IdentityFactory {
       ...identity,
       fence: `claim-${digest(`${issue.id}\n${attempt}\n${version}\n${baseSha}`, 32)}`,
       baseSha,
-      // Attempt N → connections[N-1] (clamped): deterministic, so a restart
-      // reconstructs the exact same binding it claimed.
-      modelConnection: connectionForAttempt(model, attempt),
+      // A pure function of the issue and the attempt, so a restart reconstructs
+      // the exact same binding it claimed. See ConnectionStrategy.
+      modelConnection: connectionForAttempt(model, attempt, issue.id),
       modelProfile: model.defaultProfile,
       claimedAtMs: nowMs,
       heartbeatAtMs: nowMs,

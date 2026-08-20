@@ -104,6 +104,13 @@ export interface WorkflowConfig {
      * attempt uses `connection`.
      */
     connections?: string[];
+    /**
+     * How the chain is used. `failover` (default) keeps attempt 1 on the
+     * primary and treats the rest as reserve; `balanced` spreads the starting
+     * account across issues so concurrent work does not pile onto one account.
+     * Both are pure functions of durable claim inputs.
+     */
+    connectionStrategy?: "failover" | "balanced";
     defaultProfile: string;
     allowedProfiles: string[];
   };
