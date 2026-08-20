@@ -739,15 +739,28 @@ export class GitHubIssuesProjectsAdapter implements TrackerAdapter {
       : durableHeadSha
         ? { branchUrl: snapshot.evidence.branchUrl, branchSha: durableHeadSha }
         : {};
-    // Identity of the pull request is pinned by its head commit, which must be
-    // the exact commit the ledger recorded, on top of the branch/base name
-    // filter above. The base ref's oid is deliberately NOT compared: it is a
-    // moving pointer to the tip of the base branch, so the first commit landing
-    // after the claim — including this pull request's own merge — makes it
-    // differ from the claim's base forever. That comparison stranded
+    // Identity of the pull request comes from the exact deterministic branch and
+    // base NAMES filtered above, plus its head commit matching the one the ledger
+    // recorded. Two deliberate exclusions:
+    //
+    // The base ref's oid is never compared: it points at the tip of the base
+    // branch, so the first commit landing after the claim — including this pull
+    // request's own merge — differs from the claim's base forever. That stranded
     // Dirty-play/general#76 in pr-open with its work merged, holding the lane's
-    // single WIP slot against every later issue.
-    if (matchingPr && durableHeadSha && matchingPr.headRefOid === durableHeadSha) {
+    // only WIP slot against every later issue.
+    //
+    // And when the ledger holds no branch SHA at all, the head commit cannot be
+    // required: a run that died before recording branch evidence has none to
+    // offer, while its pull request may still have merged afterwards. There is
+    // nothing to contradict, and the branch name is derived from this issue, so
+    // whatever merged on it is this issue's outcome. razumv/craft-agents#15 read
+    // as failed for a day with its work in main because of that. A ledger SHA
+    // that EXISTS and disagrees still refuses — that is a different commit, not
+    // a missing one.
+    const headMatchesLedger = durableHeadSha
+      ? matchingPr?.headRefOid === durableHeadSha
+      : !snapshot.evidence.branchSha;
+    if (matchingPr && headMatchesLedger) {
       Object.assign(providerEvidence, prEvidence(matchingPr));
     }
     snapshot.evidence = { ...snapshot.evidence, ...providerEvidence };
