@@ -14,6 +14,16 @@ function workspaceKey(identifier: string): string {
   return sanitized === identifier ? sanitized : `${sanitized}-${digest(identifier)}`;
 }
 
+/** Deterministic failover pick: attempt N → connections[N-1], clamped to the last. */
+export function connectionForAttempt(
+  model: { connection: string; connections?: string[] },
+  attempt: number,
+): string {
+  const chain = model.connections?.filter((entry) => entry.trim()) ?? [];
+  if (chain.length === 0) return model.connection;
+  return chain[Math.min(Math.max(attempt, 1), chain.length) - 1]!;
+}
+
 export class IdentityFactory {
   readonly #root: string;
 
@@ -55,7 +65,9 @@ export class IdentityFactory {
       ...identity,
       fence: `claim-${digest(`${issue.id}\n${attempt}\n${version}\n${baseSha}`, 32)}`,
       baseSha,
-      modelConnection: model.connection,
+      // Attempt N → connections[N-1] (clamped): deterministic, so a restart
+      // reconstructs the exact same binding it claimed.
+      modelConnection: connectionForAttempt(model, attempt),
       modelProfile: model.defaultProfile,
       claimedAtMs: nowMs,
       heartbeatAtMs: nowMs,

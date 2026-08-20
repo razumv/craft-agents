@@ -64,6 +64,8 @@ export interface LiveRunnerConfig {
   git: { executable: string };
   model?: {
     connection: string;
+    /** Failover chain: attempt N runs on connections[N-1] (clamped). */
+    connections?: string[];
     defaultProfile: string;
     allowedProfiles: string[];
   };
@@ -337,6 +339,11 @@ export async function createLiveRunner(config: LiveRunnerConfig): Promise<LiveV4
     allowedProfiles: ["pi/gpt-5.6-sol"],
   };
   if (!model.connection.trim()) throw new Error("live runner model.connection must be configured");
+  if (model.connections !== undefined) {
+    if (!Array.isArray(model.connections) || model.connections.some((entry) => typeof entry !== "string" || !entry.trim())) {
+      throw new Error("live runner model.connections must be an array of non-empty connection slugs");
+    }
+  }
   if (!model.allowedProfiles.includes(model.defaultProfile)) {
     throw new Error("live runner model.defaultProfile must be one of model.allowedProfiles");
   }
@@ -352,6 +359,7 @@ export async function createLiveRunner(config: LiveRunnerConfig): Promise<LiveV4
     workspace: { root: resolve(config.workspaceRoot) },
     model: {
       connection: model.connection,
+      ...(model.connections?.length ? { connections: [...model.connections] } : {}),
       defaultProfile: model.defaultProfile,
       allowedProfiles: [...model.allowedProfiles],
     },
@@ -413,7 +421,7 @@ export async function createLiveRunner(config: LiveRunnerConfig): Promise<LiveV4
     issueLabelId: config.craft.issueLabelId,
     runLabelId: config.craft.runLabelId,
     promptLabelId: config.craft.promptLabelId,
-    model: { connection: model.connection, allowedProfiles: [model.defaultProfile, ...model.allowedProfiles.filter((p) => p !== model.defaultProfile)] },
+    model: { connection: model.connection, ...(model.connections?.length ? { connections: [...model.connections] } : {}), allowedProfiles: [model.defaultProfile, ...model.allowedProfiles.filter((p) => p !== model.defaultProfile)] },
     expectedRuntime: config.craft.cli.expected,
     deadlines: config.craft.deadlines,
     maxHandoffChars: config.craft.maxHandoffChars,

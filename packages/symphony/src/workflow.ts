@@ -98,6 +98,9 @@ export function parseWorkflow(content: string, workflowPath = resolve("WORKFLOW.
   const allowedProfiles = stringArray(model.allowed_profiles, "model.allowed_profiles");
   const defaultProfile = string(model.default_profile, "model.default_profile");
   const modelConnection = string(model.connection, "model.connection");
+  const modelConnections = model.connections === undefined
+    ? undefined
+    : stringArray(model.connections, "model.connections");
   if (!allowedProfiles.includes(defaultProfile)) throw new Error("model.default_profile must be allowed");
 
   const rootPath = string(workspace.root, "workspace.root");
@@ -131,6 +134,7 @@ export function parseWorkflow(content: string, workflowPath = resolve("WORKFLOW.
     workspace: { root: workspaceRoot },
     model: {
       connection: modelConnection,
+      ...(modelConnections?.length ? { connections: modelConnections } : {}),
       defaultProfile,
       allowedProfiles,
     },
