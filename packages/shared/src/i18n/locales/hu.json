@@ -538,6 +538,7 @@
   "kanban.symphony.issueGoal": "Cél (egy mondat)",
   "kanban.symphony.issueModel": "Modell",
   "kanban.symphony.issueModelDefault": "policy szerinti alapérték",
+  "kanban.symphony.issueNoTarget": "Nincs discovery projekt beállítva — új issue-hoz repository szintű projekt kell",
   "kanban.symphony.issueNonGoals": "Nem célok — soronként egy (opcionális)",
   "kanban.symphony.issueProject": "Projekt",
   "kanban.symphony.issueRisk": "Kockázat",

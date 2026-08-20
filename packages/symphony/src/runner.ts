@@ -207,6 +207,11 @@ export class LiveV4Runner {
   async createContractIssue(input: ContractIssueInput): Promise<{ id: string; number: number; url: string }> {
     const intake = this.intake;
     if (!intake) throw new Error("this runner has no GitHub intake transport configured");
+    // A single-issue runner is pinned to one authorized issue and would never
+    // discover the new one — creating it here would orphan the work.
+    if (this.config.mode !== "discovery") {
+      throw new Error("issue intake requires a discovery-mode project (a pinned single-issue runner would never dispatch it)");
+    }
     if (!input.title.trim() || !input.goal.trim()) throw new Error("issue title and goal are required");
     if (input.acceptance.filter((item) => item.trim()).length === 0) throw new Error("at least one acceptance criterion is required");
     if (input.model) new ModelPolicy(this.workflow.model).assertAllowed(input.model);

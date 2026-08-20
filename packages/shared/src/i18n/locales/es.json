@@ -538,6 +538,7 @@
   "kanban.symphony.issueGoal": "Objetivo (una frase)",
   "kanban.symphony.issueModel": "Modelo",
   "kanban.symphony.issueModelDefault": "valor por política",
+  "kanban.symphony.issueNoTarget": "Sin proyecto discovery configurado — los issues nuevos requieren un proyecto de todo el repositorio",
   "kanban.symphony.issueNonGoals": "No-objetivos — uno por línea (opcional)",
   "kanban.symphony.issueProject": "Proyecto",
   "kanban.symphony.issueRisk": "Riesgo",

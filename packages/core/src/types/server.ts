@@ -71,6 +71,14 @@ export interface SymphonyProjectServiceStatus {
   ownerSessionId: string | null
   /** Craft project id from the runner config — lets UI surfaces filter Symphony work by Craft project. */
   craftProjectId: string | null
+  /**
+   * `discovery` scans a whole repository (new issues get picked up);
+   * `issue` is pinned to one authorized issue and will never see a new one,
+   * so it must not be offered as an intake target.
+   */
+  mode: 'issue' | 'discovery'
+  /** owner/name the project works in — the human-readable intake label. */
+  repository: string | null
   /** Model profiles the project's policy accepts (issue-intake model picker). */
   allowedProfiles: string[]
   /** Default verification budget from the runner config (issue-intake default). */

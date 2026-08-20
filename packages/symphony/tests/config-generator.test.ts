@@ -109,3 +109,15 @@ describe("connection failover chain", () => {
     expect(policy.allowedConnections()).toEqual(["chatgpt-plus", "chatgpt-plus-2"]);
   });
 });
+
+describe("issue intake is discovery-only", () => {
+  test("a pinned single-issue runner refuses intake instead of orphaning the issue", async () => {
+    const { LiveV4Runner } = await import("../src/runner");
+    const runner = Object.create(LiveV4Runner.prototype) as InstanceType<typeof LiveV4Runner>;
+    Object.defineProperty(runner, "config", { value: { mode: "issue" }, writable: false });
+    Object.defineProperty(runner, "intake", { value: {}, writable: false });
+    await expect(runner.createContractIssue({
+      title: "t", goal: "g", risk: "low", acceptance: ["a"], nonGoals: [],
+    })).rejects.toThrow("discovery-mode project");
+  });
+});

@@ -538,6 +538,7 @@
   "kanban.symphony.issueGoal": "ゴール（1 文）",
   "kanban.symphony.issueModel": "モデル",
   "kanban.symphony.issueModelDefault": "ポリシー既定",
+  "kanban.symphony.issueNoTarget": "discovery プロジェクトが未設定です — 新規 Issue にはリポジトリ全体のプロジェクトが必要です",
   "kanban.symphony.issueNonGoals": "対象外 — 1 行に 1 つ（任意）",
   "kanban.symphony.issueProject": "プロジェクト",
   "kanban.symphony.issueRisk": "リスク",

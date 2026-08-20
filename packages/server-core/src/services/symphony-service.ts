@@ -162,6 +162,8 @@ export class NativeSymphonyService implements SymphonyServiceControl {
           snapshot: null,
           ownerSessionId: null,
           craftProjectId: null,
+          mode: 'issue',
+          repository: null,
           allowedProfiles: [],
           verificationBudget: null,
         },
@@ -199,6 +201,8 @@ export class NativeSymphonyService implements SymphonyServiceControl {
           snapshot,
           ownerSessionId: runnerConfig.craft?.ownerSessionId ?? null,
           craftProjectId: runnerConfig.craft?.projectId ?? null,
+          mode: runnerConfig.mode === 'discovery' ? 'discovery' : 'issue',
+          repository: runnerConfig.github?.repository ?? null,
           allowedProfiles: [...(runnerConfig.model?.allowedProfiles ?? [])],
           verificationBudget: runnerConfig.verificationBudget ?? null,
         }

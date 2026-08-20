@@ -25,6 +25,8 @@ interface SymphonyLoopInfo {
 /** Per-project intake options surfaced by the service (model policy + defaults). */
 interface SymphonyProjectOption {
   projectId: string
+  /** owner/name — what the owner actually recognises in the picker. */
+  repository: string | null
   allowedProfiles: string[]
   verificationBudget: string | null
 }
@@ -372,6 +374,14 @@ export function SymphonyBoard({ onSendMessage, projectFilter = [] }: { onSendMes
     dependencies: [] as string[],
   })
   const activeProject = projectOptions.find(option => option.projectId === draft.projectId) ?? projectOptions[0]
+  // Dependencies must live in the same project (cross-project blockedBy cannot
+  // be resolved by that project's tracker) and exclude terminal work.
+  const dependencyCandidates = React.useMemo(
+    () => (tiles ?? []).filter(tile =>
+      tile.projectId === activeProject?.projectId
+      && !['done', 'cancelled'].includes(tile.state)),
+    [tiles, activeProject],
+  )
 
   const loadFromStatus = React.useCallback(async () => {
     try {
@@ -379,11 +389,17 @@ export function SymphonyBoard({ onSendMessage, projectFilter = [] }: { onSendMes
       const raw = status as unknown as { projects: Array<Record<string, unknown>>; loop: SymphonyLoopInfo | null }
       const nextTiles = tilesFromServiceStatus(raw)
 
-      setProjectOptions(raw.projects.map(project => ({
-        projectId: asString(project.projectId) ?? 'unknown',
-        allowedProfiles: Array.isArray(project.allowedProfiles) ? (project.allowedProfiles as string[]) : [],
-        verificationBudget: asString(project.verificationBudget),
-      })))
+      // Intake targets are discovery projects only: a pinned single-issue
+      // project can never dispatch a newly created issue, so offering it would
+      // silently orphan the work (the server refuses it too).
+      setProjectOptions(raw.projects
+        .filter(project => project.mode === 'discovery')
+        .map(project => ({
+          projectId: asString(project.projectId) ?? 'unknown',
+          repository: asString(project.repository),
+          allowedProfiles: Array.isArray(project.allowedProfiles) ? (project.allowedProfiles as string[]) : [],
+          verificationBudget: asString(project.verificationBudget),
+        })))
 
       // Surface project-level failures loudly instead of a silent stub tile.
       setProjectErrors(raw.projects
@@ -511,7 +527,9 @@ export function SymphonyBoard({ onSendMessage, projectFilter = [] }: { onSendMes
         <button
           type="button"
           onClick={() => setComposerOpen(open => !open)}
-          className="inline-flex h-7 items-center gap-1.5 rounded-lg border border-border bg-card px-2 text-[11.5px] font-medium text-foreground transition-colors hover:bg-foreground/[0.03]"
+          disabled={projectOptions.length === 0}
+          title={projectOptions.length === 0 ? t('kanban.symphony.issueNoTarget') : undefined}
+          className="inline-flex h-7 items-center gap-1.5 rounded-lg border border-border bg-card px-2 text-[11.5px] font-medium text-foreground transition-colors hover:bg-foreground/[0.03] disabled:opacity-40"
         >
           <Plus className="h-3 w-3" /> {t('kanban.symphony.newIssue')}
         </button>
@@ -549,7 +567,9 @@ export function SymphonyBoard({ onSendMessage, projectFilter = [] }: { onSendMes
                 onChange={e => setDraft(d => ({ ...d, projectId: e.target.value, model: '' }))}
               >
                 {projectOptions.map(option => (
-                  <option key={option.projectId} value={option.projectId}>{option.projectId}</option>
+                  <option key={option.projectId} value={option.projectId}>
+                    {option.repository ? `${option.repository} · ${option.projectId}` : option.projectId}
+                  </option>
                 ))}
               </select>
             </label>
@@ -608,11 +628,11 @@ export function SymphonyBoard({ onSendMessage, projectFilter = [] }: { onSendMes
           {/* Decomposition in v4 = separate issues plus edges: dependencies become
               blockedBy, so this issue stays undispatchable until they are done.
               (The Tasks world used in-session subtasks; Symphony uses the tracker.) */}
-          {(tiles ?? []).length > 0 && (
+          {dependencyCandidates.length > 0 && (
             <div>
               <p className="mb-1 text-[11px] text-foreground/60">{t('kanban.symphony.issueDependsOn')}</p>
               <div className="flex flex-wrap gap-1.5">
-                {(tiles ?? []).map(tile => {
+                {dependencyCandidates.map(tile => {
                   const selected = draft.dependencies.includes(tile.issueIdentifier)
                   return (
                     <button
