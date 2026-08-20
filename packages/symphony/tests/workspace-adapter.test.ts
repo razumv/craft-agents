@@ -11,7 +11,9 @@ afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
 
-async function fixture() {
+type PreservedInfo = { issueId: string; attempt: number; branch: string; preservedBranch: string; commit: string };
+
+async function fixture(options: { onPreserved?: (info: PreservedInfo) => void } = {}) {
   const root = await mkdtemp(resolve(tmpdir(), "craft-v4-worktree-"));
   roots.push(root);
   await git(root, ["init", "-b", "main"]);
@@ -66,7 +68,10 @@ async function fixture() {
     expiresAtMs: 61_000,
   };
   const context: CraftStartContext = { claim, issue, contract };
-  const adapter = new GitWorktreeAdapter({ repositoryRoot: root, workspaceRoot, gitExecutable: "/usr/bin/git" });
+  const adapter = new GitWorktreeAdapter({
+    repositoryRoot: root, workspaceRoot, gitExecutable: "/usr/bin/git",
+    ...(options.onPreserved ? { onPreserved: options.onPreserved } : {}),
+  });
   return { root, workspaceRoot, issue, identity, claim, context, adapter };
 }
 
@@ -148,11 +153,11 @@ describe("v4 live git worktree adapter", () => {
     expect(JSON.parse(await readFile(resolve(secondIdentity.workspacePath, claimBindingFile), "utf8")).attempt).toBe(2);
   });
 
-  test("the probe refuses a branch held by work, and agrees with what ensure would do", async () => {
+  test("the probe allows a branch held by work, saying the work will be preserved", async () => {
     const { root, claim, context, adapter } = await fixture();
     const first = await adapter.ensure(claim, context);
     // The first attempt does real work and never commits it — exactly the state
-    // that jammed a live contract today.
+    // that jammed two live contracts when a deploy restart killed their turns.
     await Bun.write(resolve(first.workspacePath, "in-progress.txt"), "uncommitted work\n");
 
     // forAttempt supplies `attempt` itself; setting it here too would be overwritten.
@@ -160,10 +165,26 @@ describe("v4 live git worktree adapter", () => {
       { id: claim.issueId, identifier: claim.issueIdentifier }, 2) };
 
     const probe = await adapter.probeBranch(retry, "v4/razumv-craft-protocol-52");
+    expect(probe.claimable).toBeTrue();
+    expect(probe.reason).toContain("preserved");
+
+    // And the probe told the truth: ensure proceeds on the same branch.
+    await adapter.ensure(retry, { ...context, claim: retry });
+  });
+
+  test("the probe still refuses a branch whose holder cannot be identified", async () => {
+    const { root, claim, context, adapter } = await fixture();
+    const first = await adapter.ensure(claim, context);
+    // Without its claim binding the worktree proves nothing about which issue or
+    // attempt it belongs to, so releasing it could destroy unrelated work.
+    await rm(resolve(first.workspacePath, claimBindingFile), { force: true });
+
+    const retry: Claim = { ...claim, ...new IdentityFactory(resolve(root, ".worktrees", "v4-runs")).forAttempt(
+      { id: claim.issueId, identifier: claim.issueIdentifier }, 2) };
+
+    const probe = await adapter.probeBranch(retry, "v4/razumv-craft-protocol-52");
     expect(probe.claimable).toBeFalse();
     expect(probe.reason).toContain("a retry cannot reclaim");
-
-    // And the probe told the truth: ensure refuses the same branch.
     await expect(adapter.ensure(retry, { ...context, claim: retry })).rejects.toThrow(/already exists/);
   });
 
@@ -181,20 +202,58 @@ describe("v4 live git worktree adapter", () => {
     expect(await adapter.probeBranch(retry, "v4/razumv-craft-protocol-52")).toMatchObject({ claimable: true });
   });
 
-  test("a retry does NOT release the previous attempt's worktree when it holds work", async () => {
-    const first = await fixture();
+  test("a retry preserves the previous attempt's uncommitted work before taking the branch", async () => {
+    const preserved: { preservedBranch: string; commit: string; attempt: number }[] = [];
+    const first = await fixture({ onPreserved: (info) => preserved.push(info) });
     const created = await first.adapter.ensure(first.identity, first.context);
     await writeFile(resolve(created.workspacePath, "worker-output.txt"), "uncommitted work\n", "utf8");
 
     const secondIdentity = new IdentityFactory(first.workspaceRoot).forAttempt(first.issue, 2);
     const secondClaim: Claim = { ...first.claim, ...secondIdentity, attempt: 2, fence: "claim-52-a2" };
-    await expect(first.adapter.ensure(secondIdentity, { ...first.context, claim: secondClaim }))
-      .rejects.toThrow("already exists without its bound worktree");
+    const retry = await first.adapter.ensure(secondIdentity, { ...first.context, claim: secondClaim });
+
+    // The retry got the deterministic branch, clean, from the base.
+    expect(retry.branch).toBe("v4/razumv-craft-protocol-52");
+    expect((await git(retry.workspacePath, ["status", "--porcelain"])).trim()).toBe("");
+
+    // And the killed attempt's work is still in the repository, on its own branch.
+    expect(preserved).toHaveLength(1);
+    const info = preserved[0]!;
+    expect(info.attempt).toBe(1);
+    expect(info.preservedBranch).toStartWith("v4-preserved/v4-razumv-craft-protocol-52-a1-");
+    const files = await git(first.root, ["show", "--name-only", "--format=", info.commit]);
+    expect(files).toContain("worker-output.txt");
+    const content = await git(first.root, ["show", `${info.commit}:worker-output.txt`]);
+    expect(content).toBe("uncommitted work\n");
+  });
+
+  test("a retry releases an earlier attempt that committed, preserving those commits", async () => {
+    const preserved: { preservedBranch: string; commit: string }[] = [];
+    const first = await fixture({ onPreserved: (info) => preserved.push(info) });
+    const created = await first.adapter.ensure(first.identity, first.context);
+    await writeFile(resolve(created.workspacePath, "committed.txt"), "committed work\n", "utf8");
+    await git(created.workspacePath, ["add", "-A"]);
+    await git(created.workspacePath, ["commit", "-m", "work the attempt did commit"]);
+    const head = (await git(created.workspacePath, ["rev-parse", "HEAD"])).trim();
+
+    const secondIdentity = new IdentityFactory(first.workspaceRoot).forAttempt(first.issue, 2);
+    const secondClaim: Claim = { ...first.claim, ...secondIdentity, attempt: 2, fence: "claim-52-a2" };
+    await first.adapter.ensure(secondIdentity, { ...first.context, claim: secondClaim });
+
+    // A commit that already exists needs no rescue commit — it needs a ref that
+    // outlives the worktree, pointing at exactly what the attempt built.
+    expect(preserved).toHaveLength(1);
+    expect(preserved[0]!.commit).toBe(head);
+    expect((await git(first.root, ["rev-parse", preserved[0]!.preservedBranch])).trim()).toBe(head);
   });
 });
 
 async function git(cwd: string, args: string[]): Promise<string> {
-  const processHandle = Bun.spawn(["/usr/bin/git", "-C", cwd, ...args], { stdout: "pipe", stderr: "pipe" });
+  const processHandle = Bun.spawn(["/usr/bin/git", "-C", cwd, ...args], {
+    stdout: "pipe", stderr: "pipe",
+    env: { ...process.env, GIT_AUTHOR_NAME: "Craft Agent Tests", GIT_AUTHOR_EMAIL: "tests@example.invalid",
+           GIT_COMMITTER_NAME: "Craft Agent Tests", GIT_COMMITTER_EMAIL: "tests@example.invalid" },
+  });
   const [exitCode, stdout, stderr] = await Promise.all([
     processHandle.exited,
     new Response(processHandle.stdout).text(),

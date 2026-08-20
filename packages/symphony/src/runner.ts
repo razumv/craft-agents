@@ -524,6 +524,12 @@ export async function createLiveRunner(config: LiveRunnerConfig): Promise<LiveV4
     repositoryRoot: config.repositoryRoot,
     workspaceRoot: config.workspaceRoot,
     gitExecutable: config.git.executable,
+    // Rescued work that nobody is told about is only marginally better than
+    // rescued work that was deleted, so the branch name goes where every other
+    // scheduler diagnostic goes.
+    onPreserved: ({ issueId, attempt, preservedBranch, commit }) => console.warn(
+      `[symphony] preserved interrupted work from ${issueId} attempt ${attempt} on ${preservedBranch} (${commit.slice(0, 7)}) before releasing its branch`,
+    ),
   });
   const scheduler = new DeterministicScheduler(
     workflow,
