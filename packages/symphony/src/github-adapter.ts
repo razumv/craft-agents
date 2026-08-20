@@ -595,6 +595,7 @@ export class GitHubIssuesProjectsAdapter implements TrackerAdapter {
       labels: [...new Set(labels.map(normalizeLabel).filter(Boolean))],
       blockedBy: [],
       dispatchable: record.state === "OPEN" && this.config.requiredLabels.every((required) => issueHasLabel(labels, required)),
+      closed: record.state === "CLOSED",
       createdAt: isoTimestamp(record.createdAt),
       updatedAt: isoTimestamp(record.updatedAt),
     };

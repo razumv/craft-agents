@@ -42,6 +42,13 @@ export interface NormalizedIssue {
   labels: string[];
   blockedBy: BlockerRef[];
   dispatchable: boolean;
+  /**
+   * Whether the tracker itself considers the issue closed. Distinct from the
+   * lifecycle state: a run can end `failed` on an issue a merge then closed,
+   * and a surface that cannot tell those apart keeps asking for attention that
+   * nobody can act on.
+   */
+  closed: boolean;
   createdAt: string | null;
   updatedAt: string | null;
 }
@@ -195,6 +202,13 @@ export interface ProjectStatus {
   issueIdentifier: string;
   objective: string;
   state: LifecycleState;
+  /**
+   * Whether the tracker closed the issue. A terminal `failed` on a closed issue
+   * is history — the work was resolved some other way — while the same state on
+   * an open issue is still someone's decision to make. Surfaces need the two
+   * apart to stop asking for attention nobody can give.
+   */
+  issueClosed: boolean;
   /** Current attempt (from durable claim or retry metadata); null before the first claim. */
   attempt: number | null;
   /** When the next bounded retry becomes due; only set in retry-wait. */

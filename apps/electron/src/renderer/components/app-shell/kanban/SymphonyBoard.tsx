@@ -40,6 +40,8 @@ interface SymphonyTile {
   issueIdentifier: string
   objective: string
   state: string
+  /** Tracker closed the issue. A terminal state on a closed issue is history, not a request. */
+  issueClosed: boolean
   prUrl: string | null
   branchUrl: string | null
   blocker: string | null
@@ -74,7 +76,19 @@ const SYMPHONY_COLUMNS: readonly SymphonyColumn[] = [
   },
 ]
 
-function columnFor(state: string): SymphonyColumn {
+/**
+ * Attention is for work a person can still act on. A terminal run on an issue
+ * the tracker has closed is a record, not a request — it was resolved, whether
+ * by a merge, by hand, or by a decision to drop it — and leaving it in an alarm
+ * column forever is how an alarm column stops being read. Those tiles join the
+ * collapsed Done strip instead; the state on the tile still says `failed`.
+ */
+const TERMINAL_ATTENTION_STATES: readonly string[] = ['failed', 'cancelled']
+
+function columnFor(state: string, issueClosed = false): SymphonyColumn {
+  if (issueClosed && TERMINAL_ATTENTION_STATES.includes(state)) {
+    return SYMPHONY_COLUMNS.find(c => c.id === 'done')!
+  }
   return SYMPHONY_COLUMNS.find(c => c.states.includes(state)) ?? SYMPHONY_COLUMNS[SYMPHONY_COLUMNS.length - 1]!
 }
 
@@ -93,6 +107,7 @@ function tileFromStatus(projectId: string, status: Record<string, unknown>, owne
     issueIdentifier: asString(status.issueIdentifier) ?? projectId,
     objective: asString(status.objective) ?? '',
     state: asString(status.state) ?? 'preservation-unknown',
+    issueClosed: status.issueClosed === true,
     prUrl: asString(status.prUrl),
     branchUrl: asString(status.branchUrl),
     blocker: asString(status.blocker),
@@ -127,6 +142,7 @@ function tileFromDesk(projectId: string, desk: Record<string, unknown>, ownerSes
     issueIdentifier: asString(issue.identifier) ?? projectId,
     objective: asString(issue.objective) ?? '',
     state: asString(issue.state) ?? 'preservation-unknown',
+    issueClosed: issue.closed === true,
     prUrl: asString(links.pullRequest),
     branchUrl: asString(links.branch),
     blocker: asString(desk.blocker),
@@ -154,6 +170,7 @@ function errorTile(projectId: string, error: string): SymphonyTile {
     issueIdentifier: projectId,
     objective: '',
     state: 'preservation-unknown',
+    issueClosed: false,
     prUrl: null,
     branchUrl: null,
     blocker: null,
@@ -678,7 +695,7 @@ export function SymphonyBoard({ onSendMessage, projectFilter = [] }: { onSendMes
             const visible = projectFilter.length === 0
               ? (tiles ?? [])
               : (tiles ?? []).filter(tile => tile.craftProjectId !== null && projectFilter.includes(tile.craftProjectId))
-            const columnTiles = visible.filter(tile => columnFor(tile.state).id === column.id)
+            const columnTiles = visible.filter(tile => columnFor(tile.state, tile.issueClosed).id === column.id)
             const isTerminal = column.id === 'done' || column.id === 'attention'
             if (isTerminal && !expandedTerminal.has(column.id)) {
               return (

@@ -38,6 +38,7 @@ export function projectStatus(snapshot: TrackerIssueSnapshot): ProjectStatus {
     issueIdentifier: snapshot.issue.identifier,
     objective: snapshot.contract.goal,
     state: snapshot.issue.state,
+    issueClosed: snapshot.issue.closed,
     attempt: snapshot.claim?.attempt ?? snapshot.retry?.attempt ?? null,
     retryDueAtMs: snapshot.issue.state === "retry-wait" ? snapshot.retry?.dueAtMs ?? null : null,
     recentEvents: material.slice(-RECENT_EVENT_LIMIT).map((event) => ({ ...event })),
