@@ -462,8 +462,8 @@ export class NativeSymphonyService implements SymphonyServiceControl {
       ?? (snapshot as { status?: unknown } | null)?.status
     const list = Array.isArray(statuses) ? statuses : statuses ? [statuses] : []
     for (const entry of list) {
-      const status = entry as { state?: unknown; issueIdentifier?: unknown; objective?: unknown; blocker?: unknown; ownerGate?: { id?: unknown } | null }
-      if (!needsOwnerDecision(status.state)) continue
+      const status = entry as { state?: unknown; issueClosed?: unknown; issueIdentifier?: unknown; objective?: unknown; blocker?: unknown; ownerGate?: { id?: unknown } | null }
+      if (!needsOwnerDecision(status.state, status.issueClosed)) continue
       const identifier = typeof status.issueIdentifier === 'string' ? status.issueIdentifier : projectId
       const detail = typeof status.blocker === 'string' && status.blocker
         ? status.blocker

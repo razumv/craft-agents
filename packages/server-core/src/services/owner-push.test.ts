@@ -24,6 +24,20 @@ describe('needsOwnerDecision', () => {
     expect(needsOwnerDecision('done')).toBe(false)
     expect(needsOwnerDecision(undefined)).toBe(false)
   })
+
+  test('a closed issue is history, not a decision, in every one of those states', () => {
+    // razumv/lineage2-server#94 merged and closed yesterday, and every server
+    // restart re-read its reconciliation and pushed `blocked` again. Both of its
+    // blockers were closed too, so there was nothing the owner could have done.
+    expect(needsOwnerDecision('blocked', true)).toBe(false)
+    expect(needsOwnerDecision('owner-gate', true)).toBe(false)
+    expect(needsOwnerDecision('preservation-unknown', true)).toBe(false)
+    // An open issue in the same state still has to reach the owner, and an
+    // absent or non-true flag must not be read as closed.
+    expect(needsOwnerDecision('blocked', false)).toBe(true)
+    expect(needsOwnerDecision('blocked', undefined)).toBe(true)
+    expect(needsOwnerDecision('blocked', 'true')).toBe(true)
+  })
 })
 
 describe('OwnerPushService subscriptions', () => {

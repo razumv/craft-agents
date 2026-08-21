@@ -58,8 +58,20 @@ const DEFAULT_SUBJECT = process.env.CRAFT_PUSH_SUBJECT?.trim() || 'mailto:owner@
 
 const STATES_NEEDING_A_DECISION = new Set(['owner-gate', 'blocked', 'preservation-unknown'])
 
-/** Whether a lifecycle state is one the owner has to answer. */
-export function needsOwnerDecision(state: unknown): boolean {
+/**
+ * Whether a lifecycle state is one the owner has to answer.
+ *
+ * A closed issue is never one of them. The same distinction the board already
+ * makes — a terminal state on a closed issue is history, while the same state on
+ * an open issue is still someone's decision — has to hold here, or every server
+ * restart re-reads an old reconciliation and wakes the owner about work that
+ * merged yesterday. That happened: `razumv/lineage2-server#94`, closed and
+ * merged, notified as `blocked` again on restart, with both of its blockers
+ * closed too. A notification nobody can act on teaches the owner to ignore the
+ * ones they can.
+ */
+export function needsOwnerDecision(state: unknown, issueClosed?: unknown): boolean {
+  if (issueClosed === true) return false
   return typeof state === 'string' && STATES_NEEDING_A_DECISION.has(state)
 }
 
