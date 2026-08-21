@@ -7,6 +7,7 @@ import {
   ReadScopeGitHubTransport,
   lifecycleStates,
   loadWorkflow,
+  proposeBacklogGrooming,
   type LifecycleState,
   type WorkspaceTruthReader,
 } from "../src";
@@ -73,19 +74,36 @@ async function tick(label: string) {
     adapter.fetchBacklog(),
   ]);
   return {
-    label,
-    // Each provider request carries its own `rateLimit.cost`; summing those
-    // values cannot be contaminated by another process sharing this credential.
-    providerCost: measuredCost,
-    providerQueries: measuredQueries,
-    managedIssues: managed.length,
-    backlogIssues: backlog.length,
+    measurement: {
+      label,
+      // Each provider request carries its own `rateLimit.cost`; summing those
+      // values cannot be contaminated by another process sharing this credential.
+      providerCost: measuredCost,
+      providerQueries: measuredQueries,
+      managedIssues: managed.length,
+      backlogIssues: backlog.length,
+    },
+    backlog,
   };
 }
+
+const cold = await tick("before / cold full scan");
+const warm = await tick("after / incremental scan");
+const beforeGroomingCost = measuredCost;
+const beforeGroomingQueries = measuredQueries;
+// This is the loop's exact decision path: the post-dispatch status already
+// carries backlog, so selecting/proposing one candidate is pure local work.
+const grooming = proposeBacklogGrooming(repository, warm.backlog, { ...workflow, project: { ...workflow.project, repository } });
 
 console.log(JSON.stringify({
   repository,
   issueCount: await issueCount(),
-  cold: await tick("before / cold full scan"),
-  warm: await tick("after / incremental scan"),
+  cold: cold.measurement,
+  warm: warm.measurement,
+  idleGroomingDecision: {
+    outcome: grooming.outcome,
+    candidate: grooming.candidate?.identifier ?? null,
+    additionalProviderCost: measuredCost - beforeGroomingCost,
+    additionalProviderQueries: measuredQueries - beforeGroomingQueries,
+  },
 }, null, 2));

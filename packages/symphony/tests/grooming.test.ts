@@ -21,9 +21,12 @@ import {
   type GitHubProjectFieldValue,
   type GitHubProjectItem,
   type GitHubTransport,
+  type GroomingProposal,
   type LifecycleState,
   type LiveRunnerConfig,
+  type LiveRunnerStatus,
   type Page,
+  type ProjectStatus,
   type TrackerBacklogIssue,
   type WorkflowConfig,
   type WorkspaceTruthReader,
@@ -284,6 +287,77 @@ describe("grooming apply", () => {
       if (step !== "body") expect(parseIssueContract(transport.record.body, proposed.candidate.identifier, workflow)).toEqual(proposed.contract);
       expect((await adapter.fetchBacklog()).map((entry) => entry.identifier)).toEqual([proposed.candidate.identifier]);
     }
+  });
+});
+
+describe("idle-lane grooming cycle", () => {
+  function cycleRunner(applied: GroomingProposal[] = []) {
+    const tracker = {
+      applyGrooming: async (candidate: GroomingProposal) => {
+        applied.push(candidate);
+        return candidate.outcome === "refused"
+          ? { outcome: "refused" as const, writes: 0 as const, reason: candidate.refusal.message }
+          : { outcome: "applied" as const, writes: 4 as const, issueIdentifier: candidate.candidate.identifier, baselineSha: "b".repeat(40) };
+      },
+    } as unknown as GitHubIssuesProjectsAdapter;
+    return new LiveV4Runner(
+      { mode: "discovery", github: { repository: "acme/repo" } } as LiveRunnerConfig,
+      workflow,
+      tracker,
+      {} as CraftMobileControlPlaneAdapter,
+      {} as CraftCliRpcTransport,
+      {} as DeterministicScheduler,
+    );
+  }
+
+  function idleStatus(backlog: TrackerBacklogIssue[], overrides: Partial<LiveRunnerStatus> = {}): LiveRunnerStatus {
+    return { snapshot: null, status: null, execution: null, statuses: [], backlog, ...overrides };
+  }
+
+  test("a lane with ready work grooms nothing", async () => {
+    const applied: GroomingProposal[] = [];
+    const runner = cycleRunner(applied);
+
+    const report = await runner.groomAfterDispatch(idleStatus([issue()], {
+      statuses: [{ state: "ready" } as ProjectStatus],
+    }));
+
+    expect(report).toEqual({ outcome: "skipped", writes: 0, reason: "ready-work" });
+    expect(applied).toEqual([]);
+  });
+
+  test("several eligible candidates still produce exactly one apply", async () => {
+    const applied: GroomingProposal[] = [];
+    const runner = cycleRunner(applied);
+    const candidates = [
+      issue({ id: "I_3", identifier: "acme/repo#3", number: 3, priority: 3 }),
+      issue({ id: "I_2", identifier: "acme/repo#2", number: 2, priority: 2 }),
+      issue({ id: "I_1", identifier: "acme/repo#1", number: 1, priority: 1 }),
+    ];
+
+    const report = await runner.groomAfterDispatch(idleStatus(candidates));
+
+    expect(report).toMatchObject({ outcome: "applied", issueIdentifier: "acme/repo#1" });
+    expect(applied).toHaveLength(1);
+    expect(applied[0]).toMatchObject({ outcome: "proposed", candidate: { identifier: "acme/repo#1" } });
+  });
+
+  test("an unchanged refusal is recorded once and reconsidered only after the issue changes", async () => {
+    const applied: GroomingProposal[] = [];
+    const runner = cycleRunner(applied);
+    const unroundable = issue({
+      description: "## Acceptance Criteria\n- Improve it better.\n\n## Non-goals\n- Changing dispatch.",
+    });
+
+    const first = await runner.groomAfterDispatch(idleStatus([unroundable]));
+    const second = await runner.groomAfterDispatch(idleStatus([structuredClone(unroundable)]));
+    const changed = { ...unroundable, updatedAt: "2026-08-03T00:00:00Z" };
+    const third = await runner.groomAfterDispatch(idleStatus([changed]));
+
+    expect(first).toMatchObject({ outcome: "refused", writes: 0 });
+    expect(second).toEqual({ outcome: "skipped", writes: 0, reason: "unchanged-refusal", issueIdentifier: "acme/repo#1" });
+    expect(third).toMatchObject({ outcome: "refused", writes: 0 });
+    expect(applied).toHaveLength(2);
   });
 });
 

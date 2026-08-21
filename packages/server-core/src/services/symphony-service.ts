@@ -58,6 +58,8 @@ export interface SymphonyRunnerLike {
    */
   shadowWithPreflight?(): Promise<unknown>
   tick(): Promise<LiveRunnerStatus | unknown>
+  /** One bounded idle-lane grooming attempt, always invoked after tick. */
+  groomAfterDispatch?(status: LiveRunnerStatus | unknown): Promise<unknown>
 }
 
 export type SymphonyRunnerFactory = (config: LiveRunnerConfig) => Promise<SymphonyRunnerLike>
@@ -170,6 +172,7 @@ export class NativeSymphonyService implements SymphonyServiceControl {
     readonly ownerPush?: {
       notify(notification: { title: string; body: string; url?: string; tag?: string }, nowMs: number): Promise<unknown>
     },
+    readonly onDiagnostic: (message: string) => void = (message) => console.warn(`[symphony] ${message}`),
   ) {
     this.#phase = config.projects.length === 0 ? 'disabled' : 'reconstructing'
     const now = Date.now()
@@ -494,7 +497,25 @@ export class NativeSymphonyService implements SymphonyServiceControl {
     if (!this.config.enabled) {
       throw new Error('Symphony live tick is disabled; set enabled=true in the explicit server config')
     }
-    return this.#operate(projectId, 'tick', async (runner) => runner.tick())
+    return this.#operate(projectId, 'tick', async (runner) => {
+      // Dispatch always gets first refusal: a lane that can claim existing work
+      // does so before grooming is even considered in this cycle.
+      const status = await runner.tick()
+      if (runner.groomAfterDispatch) {
+        try {
+          const report = await runner.groomAfterDispatch(status)
+          const outcome = (report as { outcome?: unknown } | null)?.outcome
+          if (outcome === 'failed' || outcome === 'refused') {
+            this.onDiagnostic(`grooming ${projectId} ${String(outcome)}: ${JSON.stringify(report)}`)
+          }
+        } catch (error) {
+          // Grooming is refill work, never cycle-critical work. Dispatch has
+          // already completed; one bad repository must not stop later projects.
+          this.onDiagnostic(`grooming ${projectId} failed: ${error instanceof Error ? error.message : String(error)}`)
+        }
+      }
+      return status
+    })
   }
 
   async #operate(

@@ -115,6 +115,10 @@ export interface LiveRunnerStatus {
   backlog?: TrackerBacklogIssue[];
 }
 
+export type GroomingCycleReport =
+  | GroomingApplyReport
+  | { outcome: "skipped"; writes: 0; reason: "not-discovery" | "active-claim" | "ready-work" | "no-candidate" | "unchanged-refusal"; issueIdentifier?: string };
+
 export const SHADOW_RECEIPT_SCHEMA = "craft-agent/symphony-shadow@1" as const;
 
 export interface LiveShadowReceipt {
@@ -134,6 +138,9 @@ class SystemClock implements Clock {
 
 /** One explicitly scoped live composition. No provider is touched until a method is called. */
 export class LiveV4Runner {
+  /** Refusals are reconsidered only after the exact source issue changes. */
+  readonly #groomingRefusals = new Map<string, string>();
+
   constructor(
     readonly config: LiveRunnerConfig,
     readonly workflow: WorkflowConfig,
@@ -305,6 +312,40 @@ export class LiveV4Runner {
   /** Apply only the exact proposal returned by grooming; refusals remain read-only. */
   async applyGrooming(proposal: GroomingProposal): Promise<GroomingApplyReport> {
     this.#beginOperation();
+    return this.tracker.applyGrooming(proposal);
+  }
+
+  /**
+   * Make at most one grooming attempt from the status produced after dispatch.
+   * Reusing that observation is deliberate: an idle-lane decision adds no
+   * repository scan of its own. The service calls this only after runner.tick.
+   */
+  async groomAfterDispatch(status: LiveRunnerStatus): Promise<GroomingCycleReport> {
+    if (this.config.mode !== "discovery") return { outcome: "skipped", writes: 0, reason: "not-discovery" };
+    if (status.snapshot?.claim) return { outcome: "skipped", writes: 0, reason: "active-claim" };
+    if (status.statuses?.some((entry) => entry.state === "ready")) {
+      return { outcome: "skipped", writes: 0, reason: "ready-work" };
+    }
+
+    const candidate = (status.backlog ?? [])
+      .map((issue) => ({ issue }))
+      .sort(compareForDispatch)[0]?.issue;
+    if (!candidate) return { outcome: "skipped", writes: 0, reason: "no-candidate" };
+
+    // Include every proposal input, not just updatedAt: provider timestamps are
+    // the normal change token, while the full fingerprint keeps test doubles
+    // and partial providers fail-safe if they omit or reuse one.
+    const fingerprint = canonicalJson(candidate);
+    if (this.#groomingRefusals.get(candidate.id) === fingerprint) {
+      return { outcome: "skipped", writes: 0, reason: "unchanged-refusal", issueIdentifier: candidate.identifier };
+    }
+
+    const proposal = proposeBacklogGrooming(this.config.github.repository, [candidate], this.workflow);
+    if (proposal.outcome === "refused") {
+      this.#groomingRefusals.set(candidate.id, fingerprint);
+      return this.tracker.applyGrooming(proposal);
+    }
+    this.#groomingRefusals.delete(candidate.id);
     return this.tracker.applyGrooming(proposal);
   }
 

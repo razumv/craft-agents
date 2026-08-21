@@ -343,6 +343,47 @@ describe('NativeSymphonyService autonomous loop', () => {
     await service.stop()
   })
 
+  it('dispatches before grooming and one project grooming failure does not stop the next project', async () => {
+    const alphaPath = await runnerConfigPath()
+    const betaPath = await runnerConfigPath()
+    const calls: string[] = []
+    const diagnostics: string[] = []
+    const runner = (id: string): SymphonyRunnerLike => ({
+      async preflight() { return {} },
+      async readStatus() { return { statuses: [] } },
+      async projectDesk() { return {} },
+      async shadow() { return shadowReceipt },
+      async tick() { calls.push(`dispatch:${id}`); return { statuses: [], backlog: [] } },
+      async groomAfterDispatch() {
+        calls.push(`groom:${id}`)
+        if (id === 'alpha') throw new Error('baseline unavailable')
+        return { outcome: 'skipped', writes: 0, reason: 'no-candidate' }
+      },
+    })
+    let created = 0
+    const service = new NativeSymphonyService({
+      version: 1,
+      enabled: true,
+      stopTimeoutMs: 25,
+      projects: [{ id: 'alpha', configPath: alphaPath }, { id: 'beta', configPath: betaPath }],
+      loop: { enabled: true, mode: 'tick', intervalMs: 5, maxConsecutiveErrors: 3 },
+    }, alphaPath, async () => runner(created++ === 0 ? 'alpha' : 'beta'), undefined, (message) => diagnostics.push(message))
+
+    await service.start()
+    await new Promise((resolve) => setTimeout(resolve, 45))
+    await service.stop()
+
+    const firstAlphaDispatch = calls.indexOf('dispatch:alpha')
+    const firstAlphaGroom = calls.indexOf('groom:alpha')
+    const firstBetaDispatch = calls.indexOf('dispatch:beta')
+    expect(firstAlphaDispatch).toBeGreaterThanOrEqual(0)
+    expect(firstAlphaGroom).toBeGreaterThan(firstAlphaDispatch)
+    expect(firstBetaDispatch).toBeGreaterThan(firstAlphaGroom)
+    expect(diagnostics.some((message) => message.includes('grooming alpha failed: baseline unavailable'))).toBeTrue()
+    expect(service.status().projects.find((project) => project.projectId === 'alpha')).toMatchObject({ phase: 'ready', lastError: null })
+    expect(service.status().projects.find((project) => project.projectId === 'beta')).toMatchObject({ phase: 'ready', lastError: null })
+  })
+
   it('clears the drop as soon as one retry succeeds', async () => {
     const path = await runnerConfigPath()
     let shadows = 0
