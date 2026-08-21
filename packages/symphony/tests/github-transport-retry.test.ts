@@ -71,3 +71,35 @@ describe("gh transport retry", () => {
     expect(Bun.file(countPath).size).toBe(1);
   });
 });
+
+describe("gh transport node-id chunking", () => {
+  test("more than a hundred ids are asked for in chunks, in order", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "gh-nodes-"));
+    const requestLog = join(dir, "requests");
+    const path = join(dir, "gh");
+    writeFileSync(requestLog, "");
+    // The stub echoes back one node per requested id, so the assertion covers
+    // both the chunk sizes and that the answers keep the caller's order.
+    writeFileSync(path, `#!/usr/bin/env node
+const fs = require('fs');
+let body = '';
+process.stdin.on('data', (chunk) => { body += chunk; });
+process.stdin.on('end', () => {
+  const ids = JSON.parse(body).variables.ids;
+  fs.appendFileSync(${JSON.stringify(requestLog)}, ids.length + "\\n");
+  const nodes = ids.map((id) => ({ id, number: Number(id.slice(2)), title: id, body: "", url: "u", state: "OPEN", createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01T00:00:00Z", assignees: { nodes: [] } }));
+  process.stdout.write(JSON.stringify({ data: { nodes } }));
+});
+`);
+    chmodSync(path, 0o755);
+
+    const transport = new GhCliTransport(path);
+    const ids = Array.from({ length: 250 }, (_, index) => `I_${index}`);
+    const answers = await transport.getIssuesByNodeIds(ids);
+
+    expect(answers).toHaveLength(250);
+    expect(answers.map((entry) => entry?.id)).toEqual(ids);
+    // 100 + 100 + 50: asking for all 250 at once is what GitHub rejected.
+    expect(Bun.file(requestLog).text().then((text) => text.trim().split("\n"))).resolves.toEqual(["100", "100", "50"]);
+  });
+});
