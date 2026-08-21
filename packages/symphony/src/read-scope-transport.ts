@@ -102,8 +102,11 @@ export class ReadScopeGitHubTransport implements GitHubTransport {
 
   // ---------------------------------------------------------------- reads
 
-  listIssues(repository: string, cursor: string | null): Promise<Page<GitHubIssueRecord>> {
-    return this.#memo(`listIssues\n${repository}\n${cursor ?? ""}`, () => this.inner.listIssues(repository, cursor));
+  listIssues(repository: string, cursor: string | null, updatedSince: string | null = null): Promise<Page<GitHubIssueRecord>> {
+    return this.#memo(
+      `listIssues\n${repository}\n${updatedSince ?? "<cold>"}\n${cursor ?? ""}`,
+      () => this.inner.listIssues(repository, cursor, updatedSince),
+    );
   }
 
   getIssuesByNodeIds(ids: readonly string[]): Promise<(GitHubIssueRecord | null)[]> {

@@ -99,6 +99,10 @@ interface CoreHydrated extends Hydrated {
 
 export class GitHubIssuesProjectsAdapter implements TrackerAdapter {
   readonly #managedLabels: Set<string>;
+  #watermark: string | null = null;
+  #records = new Map<string, GitHubIssueRecord>();
+  #cores = new Map<string, CoreHydrated>();
+  #pendingRecords = new Map<string, GitHubIssueRecord>();
 
   constructor(
     readonly config: GitHubAdapterConfig,
@@ -134,8 +138,14 @@ export class GitHubIssuesProjectsAdapter implements TrackerAdapter {
    * guessed at, so a managed issue can never be mistaken for backlog.
    */
   async fetchBacklog(): Promise<TrackerBacklogIssue[]> {
-    const records = await collectPages((cursor) => this.transport.listIssues(this.config.repository, cursor));
-    const candidates = records.filter((record) => (
+    // Refresh only the shared listing cache. Changed managed records remain
+    // pending for the next lifecycle read; grooming must not buy their expensive
+    // contract/Project hydration merely to describe unmanaged backlog.
+    const listing = await this.scanListing();
+    this.#records = listing.records;
+    this.#pendingRecords = listing.pending;
+    this.#watermark = listing.watermark;
+    const candidates = [...listing.records.values()].filter((record) => (
       record.id !== this.config.claimFenceIssueId
       && record.state === "OPEN"
       && this.#listingHasNoLifecycleLabel(record)
@@ -555,19 +565,68 @@ export class GitHubIssuesProjectsAdapter implements TrackerAdapter {
     return found;
   }
 
+  private async scanListing(): Promise<{
+    records: Map<string, GitHubIssueRecord>;
+    pending: Map<string, GitHubIssueRecord>;
+    watermark: string | null;
+  }> {
+    const priorWatermark = this.#watermark;
+    const listed = await collectPages((cursor) => this.transport.listIssues(
+      this.config.repository,
+      cursor,
+      priorWatermark,
+    ));
+    const records = priorWatermark === null
+      ? new Map<string, GitHubIssueRecord>()
+      : new Map(this.#records);
+    const pending = priorWatermark === null
+      ? new Map<string, GitHubIssueRecord>()
+      : new Map(this.#pendingRecords);
+    for (const record of listed) {
+      const merged = mergeListingRecord(records.get(record.id), record);
+      records.set(record.id, merged);
+      pending.set(record.id, merged);
+    }
+    return { records, pending, watermark: providerWatermark(priorWatermark, listed) };
+  }
+
   private async loadAll(strict: boolean, requested = new Set<string>()): Promise<Map<string, Hydrated>> {
-    const records = await collectPages((cursor) => this.transport.listIssues(this.config.repository, cursor));
-    const cores = new Map<string, CoreHydrated>();
+    // Null means the adapter has no state (including after restart), so the first
+    // read still walks the complete issues connection. Later reads ask GitHub for
+    // the exact inclusive updatedAt boundary GitHub itself returned last time.
+    const listing = await this.scanListing();
+    const records = listing.records;
+    const cores = this.#watermark === null
+      ? new Map<string, CoreHydrated>()
+      : new Map(this.#cores);
+    const refresh = new Map(listing.pending);
+
+    // Pull-request merges and check rollups do not change the issue node. Claims
+    // therefore bypass the watermark on every read, as do explicit get-by-id
+    // callers. Node reads are batched and merged with the changed listing.
+    const claimIds = [...cores.values()]
+      .filter((entry) => entry.snapshot.claim !== null)
+      .map((entry) => entry.snapshot.issue.id);
+    const directIds = [...new Set([...claimIds, ...requested])];
+    if (this.#watermark !== null && directIds.length > 0) {
+      const direct = await this.transport.getIssuesByNodeIds(directIds);
+      for (let index = 0; index < directIds.length; index += 1) {
+        const id = directIds[index]!;
+        const record = direct[index];
+        if (!record) throw new Error(`GitHub ID refresh omitted requested or claimed issue ${id}`);
+        const merged = mergeListingRecord(records.get(id), record);
+        records.set(id, merged);
+        refresh.set(id, merged);
+      }
+    }
+
     let skippedUnmanaged = 0;
-    for (const record of records) {
+    for (const record of refresh.values()) {
       if (record.id === this.config.claimFenceIssueId) continue;
-      // Hydration costs six further queries per issue, and an issue with no
-      // lifecycle label is discarded either way — it cannot hold a claim, so it
-      // cannot affect WIP. When the listing already told us its labels, decide
-      // here and pay nothing. Unknown labels (a truncated page, or a transport
-      // that cannot supply them) fall through to hydration as before.
-      // Never skip an explicitly requested id: fetchIssuesByIds treats a missing
-      // requested issue as an error, and the caller asked for that issue by name.
+      // A changed issue replaces its cached interpretation atomically. If it lost
+      // its lifecycle label, remove the old managed snapshot rather than serving
+      // stale state from before the watermark.
+      cores.delete(record.id);
       if (!requested.has(record.id) && this.#listingHasNoLifecycleLabel(record)) {
         skippedUnmanaged += 1;
         continue;
@@ -588,10 +647,9 @@ export class GitHubIssuesProjectsAdapter implements TrackerAdapter {
       }
     }
     if (skippedUnmanaged > 0) {
-      // Say what was skipped: a silent narrowing of a repository-wide scan is
-      // indistinguishable from a scan that found nothing.
       this.config.onDiagnostic?.(`skipped ${skippedUnmanaged} GitHub issues with no lifecycle label from the listing`);
     }
+
     const byContract = indexUnique(cores, (entry) => entry.contract.id);
     const byIdentifier = indexUnique(cores, (entry) => entry.snapshot.issue.identifier);
     const output = new Map<string, Hydrated>();
@@ -607,7 +665,11 @@ export class GitHubIssuesProjectsAdapter implements TrackerAdapter {
           };
         });
         core.snapshot.issue.blockedBy = dedupeBlockers([...native, ...dependencies]);
-        core.snapshot.issue.dispatchable = core.snapshot.issue.dispatchable
+        // Recompute from provider facts before applying blockers. The cached
+        // value may have been false only because a dependency was blocked on the
+        // previous read and must be allowed to become true again.
+        core.snapshot.issue.dispatchable = core.record.state === "OPEN"
+          && this.config.requiredLabels.every((required) => issueHasLabel(core.labels, required))
           && !core.snapshot.issue.blockedBy.some((blocker) => blocker.state !== "done");
         output.set(id, core);
       } catch (error) {
@@ -615,6 +677,14 @@ export class GitHubIssuesProjectsAdapter implements TrackerAdapter {
         this.config.onDiagnostic?.(`omitting GitHub issue ${id} with ambiguous dependencies: ${errorMessage(error)}`);
       }
     }
+
+    // Commit the cache and watermark only after every required provider read and
+    // strict hydration succeeds. A rejected read leaves the old boundary intact,
+    // so the next call retries the same window instead of stepping over it.
+    this.#records = records;
+    this.#cores = cores;
+    this.#pendingRecords = new Map();
+    this.#watermark = listing.watermark;
     return output;
   }
 
@@ -777,6 +847,31 @@ export class GitHubIssuesProjectsAdapter implements TrackerAdapter {
     snapshot.evidence = { ...snapshot.evidence, ...providerEvidence };
     return { snapshot, providerEvidence, record, item, labels, acceptedCommentIds, projectionDrift, contract, nativeBlockers };
   }
+}
+
+function providerWatermark(current: string | null, records: readonly GitHubIssueRecord[]): string | null {
+  let latest = current;
+  let latestMs = latest === null ? Number.NEGATIVE_INFINITY : Date.parse(latest);
+  for (const record of records) {
+    const candidateMs = Date.parse(record.updatedAt);
+    if (!Number.isFinite(candidateMs)) throw new Error(`GitHub issue ${record.id} has invalid provider updatedAt`);
+    if (candidateMs > latestMs) {
+      latest = record.updatedAt;
+      latestMs = candidateMs;
+    }
+  }
+  return latest;
+}
+
+/** Preserve listing-only metadata when a direct node refresh omits it. */
+function mergeListingRecord(previous: GitHubIssueRecord | undefined, next: GitHubIssueRecord): GitHubIssueRecord {
+  return {
+    ...previous,
+    ...next,
+    labelNames: next.labelNames ?? previous?.labelNames ?? null,
+    priority: next.priority ?? previous?.priority ?? null,
+    parent: next.parent ?? previous?.parent ?? null,
+  };
 }
 
 /**

@@ -48,6 +48,8 @@ class MemoryGitHubTransport implements GitHubTransport {
   readonly prs = new Map<string, GitHubPullRequestEvidence[]>();
   readonly branches = new Map<string, GitHubBranchEvidence>();
   readonly calls = new Map<string, number>();
+  readonly issueBounds: (string | null)[] = [];
+  failNextListIssues = false;
   pageSize = 100;
   #commentId = 1000;
 
@@ -77,8 +79,17 @@ class MemoryGitHubTransport implements GitHubTransport {
     return record;
   }
 
-  listIssues(_repository: string, cursor: string | null): Promise<Page<GitHubIssueRecord>> {
-    return Promise.resolve(this.paged("issues", this.issues, cursor));
+  listIssues(_repository: string, cursor: string | null, updatedSince: string | null): Promise<Page<GitHubIssueRecord>> {
+    this.issueBounds.push(updatedSince);
+    if (this.failNextListIssues) {
+      this.failNextListIssues = false;
+      this.hit("issues");
+      return Promise.reject(new Error("provider read failed"));
+    }
+    const issues = updatedSince === null
+      ? this.issues
+      : this.issues.filter((issue) => Date.parse(issue.updatedAt) >= Date.parse(updatedSince));
+    return Promise.resolve(this.paged("issues", issues, cursor));
   }
   getIssuesByNodeIds(ids: readonly string[]): Promise<(GitHubIssueRecord | null)[]> {
     this.hit("issue-nodes");
@@ -283,6 +294,68 @@ describe("v4.2 GitHub Issues and Projects adapter", () => {
     expect(candidate?.issue.dispatchable).toBeTrue();
     expect(transport.calls.get("issues")).toBe(2);
     expect((transport.calls.get("field-values") ?? 0) >= 4).toBeTrue();
+  });
+
+  test("cold start reads every issue, then asks the provider with its reported watermark", async () => {
+    const { transport, adapter } = setup();
+    transport.pageSize = 1;
+    const first = transport.addIssue(1, "ready");
+    const second = transport.addIssue(2, "ready");
+
+    expect((await adapter.fetchIssuesByStates(["ready"])).map((entry) => entry.issue.id)).toEqual(["I_1", "I_2"]);
+    // A one-item page proves the cold read walked the complete connection rather
+    // than treating the first page as a snapshot.
+    expect(transport.issueBounds).toEqual([null, null]);
+
+    transport.pageSize = 100;
+    transport.issueBounds.length = 0;
+    // This provider timestamp is intentionally far ahead of the host clock. The
+    // next bound must still be exactly what GitHub reported, never Date.now().
+    second.updatedAt = "2099-01-01T00:00:00Z";
+    first.updatedAt = "2099-01-02T00:00:00Z";
+    first.title = "Issue 1 changed upstream";
+    const refreshed = await adapter.fetchIssuesByStates(["ready"]);
+
+    expect(transport.issueBounds).toEqual(["2026-08-02T10:00:00Z"]);
+    expect(refreshed.find((entry) => entry.issue.id === "I_1")?.issue.title).toBe("Issue 1 changed upstream");
+
+    transport.issueBounds.length = 0;
+    await adapter.fetchIssuesByStates(["ready"]);
+    expect(transport.issueBounds).toEqual(["2099-01-02T00:00:00Z"]);
+  });
+
+  test("a failed incremental read leaves the provider watermark unchanged", async () => {
+    const { transport, adapter } = setup();
+    transport.addIssue(1, "ready").updatedAt = "2035-04-05T06:07:08Z";
+    await adapter.fetchIssuesByStates(["ready"]);
+
+    transport.issueBounds.length = 0;
+    transport.failNextListIssues = true;
+    await expect(adapter.fetchIssuesByStates(["ready"])).rejects.toThrow("provider read failed");
+    await adapter.fetchIssuesByStates(["ready"]);
+
+    expect(transport.issueBounds).toEqual([
+      "2035-04-05T06:07:08Z",
+      "2035-04-05T06:07:08Z",
+    ]);
+  });
+
+  test("an active claim is node-refreshed even when its issue is behind the watermark", async () => {
+    const { transport, adapter } = setup();
+    transport.addIssue(1, "ready");
+    // A later unrelated issue moves the repository watermark past the claim.
+    transport.addIssue(2, "ready");
+    const claim = await proposedClaim(adapter, "I_1");
+    expect(await adapter.tryClaim("I_1", 1, claim, 1_000)).not.toBeNull();
+
+    const nodeReads = transport.calls.get("issue-nodes") ?? 0;
+    attachPr(transport, "I_1");
+    const [active] = await adapter.activeClaims();
+
+    expect((transport.calls.get("issue-nodes") ?? 0)).toBeGreaterThan(nodeReads);
+    expect(active?.issue.id).toBe("I_1");
+    expect(active?.evidence.prUrl).toBe("https://github.test/acme/repo/pull/1");
+    expect(transport.issueBounds.at(-1)).toBe("2026-08-02T10:00:00Z");
   });
 
   test("listing labels let discovery skip unmanaged issues without hydrating them", async () => {

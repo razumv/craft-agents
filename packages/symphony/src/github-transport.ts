@@ -87,7 +87,11 @@ export interface GitHubBranchEvidence {
 
 /** All provider I/O is injected through this boundary; adapter tests never invoke gh. */
 export interface GitHubTransport {
-  listIssues(repository: string, cursor: string | null): Promise<Page<GitHubIssueRecord>>;
+  /**
+   * List repository issues, optionally bounded by the provider's own updatedAt
+   * timestamp from a previous listing. A null bound is the cold-start full read.
+   */
+  listIssues(repository: string, cursor: string | null, updatedSince: string | null): Promise<Page<GitHubIssueRecord>>;
   getIssuesByNodeIds(ids: readonly string[]): Promise<(GitHubIssueRecord | null)[]>;
   listLabels(issueId: string, cursor: string | null): Promise<Page<string>>;
   listBlockedBy(issueId: string, cursor: string | null): Promise<Page<GitHubIssueLink>>;
@@ -157,16 +161,34 @@ function priorityFromLabels(labels: readonly string[]): number | null {
 export class GhCliTransport implements GitHubTransport {
   constructor(readonly executable = "gh") {}
 
-  async listIssues(repository: string, cursor: string | null): Promise<Page<GitHubIssueRecord>> {
+  async listIssues(repository: string, cursor: string | null, updatedSince: string | null = null): Promise<Page<GitHubIssueRecord>> {
     const [owner, name] = splitRepository(repository);
     // Labels ride along with the listing: hydrating an issue costs six further
     // queries, and an issue with no lifecycle label is never hydrated. Asking
     // for them here turns a repository-wide scan from O(issues) round trips
     // into O(pages) for everything the lane does not manage.
-    const data = await this.graphql<{ repository: { issues: GraphPage<GitHubIssueRecord> } }>(`query Issues($owner:String!,$name:String!,$cursor:String){repository(owner:$owner,name:$name){issues(first:100,after:$cursor,orderBy:{field:CREATED_AT,direction:ASC}){nodes{id number title body url state createdAt updatedAt assignees(first:1){nodes{id}}labels(first:LABEL_PAGE){nodes{name}totalCount}parent{id number title state url}}pageInfo{hasNextPage endCursor}}}}`.replace("LABEL_PAGE", String(LISTING_LABEL_PAGE_SIZE)), { owner, name, cursor });
+    //
+    // GitHub's repository issues connection has no updated-since filter. After
+    // the cold read, stay on GraphQL but use issue search, sorted oldest update
+    // first. The inclusive bound deliberately repeats the boundary issue: GitHub
+    // timestamps have finite precision, and adding local time would risk skipping
+    // another issue updated in the same instant.
+    const fields = `id number title body url state createdAt updatedAt assignees(first:1){nodes{id}}labels(first:LABEL_PAGE){nodes{name}totalCount}parent{id number title state url}`.replace("LABEL_PAGE", String(LISTING_LABEL_PAGE_SIZE));
+    let connection: GraphPage<GitHubIssueRecord>;
+    if (updatedSince === null) {
+      const data = await this.graphql<{ repository: { issues: GraphPage<GitHubIssueRecord> } }>(`query Issues($owner:String!,$name:String!,$cursor:String){repository(owner:$owner,name:$name){issues(first:100,after:$cursor,orderBy:{field:CREATED_AT,direction:ASC}){nodes{${fields}}pageInfo{hasNextPage endCursor}}}}`, { owner, name, cursor });
+      connection = data.repository.issues;
+    } else {
+      if (!Number.isFinite(Date.parse(updatedSince))) throw new Error("updatedSince must be a provider ISO timestamp");
+      const data = await this.graphql<{ search: GraphPage<GitHubIssueRecord> }>(`query UpdatedIssues($query:String!,$cursor:String){search(type:ISSUE,query:$query,first:100,after:$cursor){nodes{... on Issue{${fields}}}pageInfo{hasNextPage endCursor}}}`, {
+        query: `repo:${repository} is:issue updated:>=${updatedSince} sort:updated-asc`,
+        cursor,
+      });
+      connection = data.search;
+    }
     return page({
-      ...data.repository.issues,
-      nodes: data.repository.issues.nodes.map((issue) => {
+      ...connection,
+      nodes: connection.nodes.map((issue) => {
         const raw = issue as GitHubIssueRecord & {
           assignees?: { nodes: { id: string }[] };
           labels?: { nodes: { name: string }[]; totalCount: number };
