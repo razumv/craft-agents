@@ -44,7 +44,33 @@ describe("gh transport retry", () => {
     expect(Bun.file(countPath).size).toBe(3);
   });
 
-  test("a rate limit is not retried, because it is an answer", async () => {
+  test("a secondary rate limit is retried, because the burst guard clears on its own", async () => {
+    const { path, countPath } = stubGh({ failures: 1, diagnostic: "gh: You have exceeded a secondary rate limit", payload: PAYLOAD });
+    const transport = new GhCliTransport(path);
+
+    // This is what a repository-wide scan of 580 issues actually trips, and it
+    // clears in tens of seconds — unlike the hourly budget, which does not.
+    const page = await transport.listIssues("acme/repo", null);
+    expect(page.nodes).toEqual([]);
+    expect(Bun.file(countPath).size).toBe(2);
+  }, 60_000);
+
+  test("the 400 whose own text asks to resubmit is treated as the burst guard it is", async () => {
+    const { path, countPath } = stubGh({
+      failures: 1,
+      diagnostic: "gh: We received a malformed request from your client. Please try resubmitting your request (HTTP 400)",
+      payload: PAYLOAD,
+    });
+    const transport = new GhCliTransport(path);
+
+    // lineage-client reported exactly this for hours and looked like it was
+    // sending a bad query; it was only asking too fast.
+    const page = await transport.listIssues("acme/repo", null);
+    expect(page.nodes).toEqual([]);
+    expect(Bun.file(countPath).size).toBe(2);
+  }, 60_000);
+
+  test("the hourly rate limit is not retried, because it is an answer", async () => {
     const { path, countPath } = stubGh({ failures: 99, diagnostic: "gh: API rate limit already exceeded", payload: PAYLOAD });
     const transport = new GhCliTransport(path);
 
