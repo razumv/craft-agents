@@ -39,6 +39,7 @@ function fakeDelegate(calls: string[]): GitHubTransport {
     async listProjectFieldValues() { return page([]); },
     async listComments() { return page([]); },
     async listClosingPullRequests() { return page([]); },
+    async listFailedCheckDetails(_repository, headSha) { calls.push(`failed-checks:${headSha}`); return []; },
     async getBranch() { return null; },
     async getBaseSha() { return "a".repeat(40); },
     async appendComment(issueId) { calls.push(`comment:${issueId}`); return { id: "C_1", body: "", authorLogin: "x", createdAt: "" } as never; },

@@ -256,6 +256,84 @@ describe("v4 live runner mutation scope", () => {
     expect(serialized).not.toContain("SECRET FINAL RESPONSE");
     expect(mutations).toBe(0);
   });
+
+  test("keeps a failing rollup read-only when the provider supplies no exact detail", async () => {
+    const base = transitionFixture("settled").runner;
+    const status = await base.readStatus();
+    const snapshot = structuredClone(status.snapshot!);
+    snapshot.issue.state = "pr-open";
+    let transitions = 0;
+    const tracker = {
+      get: async () => structuredClone(snapshot),
+      ciFailure: async () => null,
+      ciRepairAttempts: async () => [],
+      transition: async () => { transitions += 1; return structuredClone(snapshot); },
+    } as unknown as GitHubIssuesProjectsAdapter;
+    const runner = new LiveV4Runner(
+      { issueId: "I_52" } as LiveRunnerConfig,
+      {} as WorkflowConfig,
+      tracker,
+      {} as CraftMobileControlPlaneAdapter,
+      {} as CraftCliRpcTransport,
+      {} as DeterministicScheduler,
+    );
+
+    expect(await runner.prepareCiRepair("I_52", null)).toMatchObject({ action: "handover", evidence: null });
+    expect(transitions).toBe(0);
+  });
+
+  test("hands a third red result over with exact output and both durable diagnoses", async () => {
+    const base = transitionFixture("settled").runner;
+    const status = await base.readStatus();
+    const snapshot = structuredClone(status.snapshot!);
+    snapshot.issue.state = "pr-open";
+    const failure = {
+      pullRequestId: "PR_52",
+      pullRequestUrl: "https://github.test/pull/52",
+      headBranch: snapshot.contract.requiredBranch,
+      headSha: "d".repeat(40),
+      checkName: "validate / test",
+      checkUrl: "https://github.test/actions/runs/52",
+      command: "bun test",
+      output: "AssertionError: still red",
+    };
+    const attempts = [1, 2].map((attempt) => ({
+      attempt: attempt as 1 | 2,
+      headSha: attempt === 1 ? "b".repeat(40) : "c".repeat(40),
+      checkName: failure.checkName,
+      command: failure.command,
+      output: failure.output,
+      cause: "contract-work" as const,
+      diagnosis: attempt === 1 ? "first diagnosis" : "second diagnosis",
+      touchedPaths: ["src/widget.ts"],
+      previousMistake: attempt === 1 ? null : "first targeted the wrong layer",
+    }));
+    let handover: { to: string; message: string; blocker: string | undefined } | null = null;
+    const tracker = {
+      get: async () => structuredClone(snapshot),
+      ciFailure: async () => structuredClone(failure),
+      ciRepairAttempts: async () => structuredClone(attempts),
+      transition: async (_issueId: string, to: string, _now: number, options: { message: string; evidence: { blocker?: string } }) => {
+        handover = { to, message: options.message, blocker: options.evidence.blocker };
+        return structuredClone(snapshot);
+      },
+    } as unknown as GitHubIssuesProjectsAdapter;
+    const runner = new LiveV4Runner(
+      { issueId: "I_52" } as LiveRunnerConfig,
+      {} as WorkflowConfig,
+      tracker,
+      {} as CraftMobileControlPlaneAdapter,
+      {} as CraftCliRpcTransport,
+      {} as DeterministicScheduler,
+    );
+
+    const decision = await runner.prepareCiRepair("I_52", null);
+    expect(decision).toMatchObject({ action: "handover", diagnoses: ["first diagnosis", "second diagnosis"] });
+    expect(handover).toMatchObject({ to: "blocked", blocker: "two CI repair attempts were already consumed" });
+    expect(handover!.message).toContain(failure.command);
+    expect(handover!.message).toContain(failure.output);
+    expect(handover!.message).toContain("first diagnosis\nsecond diagnosis");
+  });
 });
 
 describe("contract issue body", () => {

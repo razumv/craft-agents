@@ -85,6 +85,13 @@ export interface GitHubBranchEvidence {
   oid: string;
 }
 
+export interface GitHubFailedCheckDetail {
+  checkName: string;
+  checkUrl: string;
+  command: string;
+  output: string;
+}
+
 /** All provider I/O is injected through this boundary; adapter tests never invoke gh. */
 export interface GitHubTransport {
   /**
@@ -99,6 +106,8 @@ export interface GitHubTransport {
   listProjectFieldValues(itemId: string, cursor: string | null): Promise<Page<GitHubProjectFieldValue>>;
   listComments(issueId: string, cursor: string | null): Promise<Page<GitHubComment>>;
   listClosingPullRequests(issueId: string, cursor: string | null): Promise<Page<GitHubPullRequestEvidence>>;
+  /** Exact failed-step command and log output for the named head commit. */
+  listFailedCheckDetails(repository: string, headSha: string): Promise<GitHubFailedCheckDetail[]>;
   /** Squash-merge one pull request by node id. A mutation: callers gate it. */
   /**
    * Required, not optional. As an optional member every wrapper that forgot to
@@ -150,6 +159,21 @@ function rollupState(raw: Record<string, unknown>): string | null {
 function rollupCount(raw: Record<string, unknown>): number {
   const contexts = headRollup(raw)?.contexts as { totalCount?: unknown } | undefined;
   return typeof contexts?.totalCount === "number" ? contexts.totalCount : 0;
+}
+
+export function failedStepLog(output: string, stepName: string): string {
+  return output.split(/\r?\n/).filter((line) => line.split("\t")[1] === stepName).join("\n");
+}
+
+export function extractFailedLogCommand(output: string): string | null {
+  for (const line of output.split(/\r?\n/)) {
+    const marker = line.indexOf("##[group]Run ");
+    if (marker >= 0) {
+      const command = line.slice(marker + "##[group]Run ".length).trim();
+      if (command) return command;
+    }
+  }
+  return null;
 }
 
 function splitRepository(repository: string): [string, string] {
@@ -284,6 +308,65 @@ export class GhCliTransport implements GitHubTransport {
       })),
       nextCursor: result.nextCursor,
     };
+  }
+
+  async listFailedCheckDetails(repository: string, headSha: string): Promise<GitHubFailedCheckDetail[]> {
+    if (!/^[0-9a-f]{40}$/i.test(headSha)) throw new Error("check head SHA must be a full commit SHA");
+    const raw = await this.run([
+      "run", "list", "--repo", repository, "--commit", headSha, "--limit", "100",
+      "--json", "databaseId,name,workflowName,conclusion,status,url",
+    ]);
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) throw new Error("GitHub workflow-run response is not an array");
+    const failures = parsed.flatMap((value) => {
+      if (!value || typeof value !== "object") return [];
+      const run = value as Record<string, unknown>;
+      if (run.conclusion !== "failure") return [];
+      if (typeof run.databaseId !== "number" || typeof run.url !== "string") return [];
+      return [{
+        databaseId: run.databaseId,
+        name: typeof run.name === "string" ? run.name : "unnamed workflow",
+        workflowName: typeof run.workflowName === "string" ? run.workflowName : "unnamed workflow",
+        url: run.url,
+      }];
+    }).sort((left, right) => left.databaseId - right.databaseId);
+    const details: GitHubFailedCheckDetail[] = [];
+    for (const failure of failures) {
+      const jobsRaw = await this.run([
+        "run", "view", String(failure.databaseId), "--repo", repository, "--json", "jobs",
+      ]);
+      const jobsValue: unknown = JSON.parse(jobsRaw);
+      const jobs = jobsValue && typeof jobsValue === "object" && Array.isArray((jobsValue as { jobs?: unknown }).jobs)
+        ? (jobsValue as { jobs: unknown[] }).jobs
+        : [];
+      for (const value of jobs) {
+        if (!value || typeof value !== "object") continue;
+        const job = value as Record<string, unknown>;
+        if (job.conclusion !== "failure" || typeof job.databaseId !== "number" || typeof job.name !== "string") continue;
+        const log = await this.run([
+          "run", "view", String(failure.databaseId), "--repo", repository,
+          "--job", String(job.databaseId), "--log",
+        ]);
+        const steps = Array.isArray(job.steps) ? job.steps : [];
+        for (const stepValue of steps) {
+          if (!stepValue || typeof stepValue !== "object") continue;
+          const step = stepValue as Record<string, unknown>;
+          if (step.conclusion !== "failure" || typeof step.name !== "string") continue;
+          const output = failedStepLog(log, step.name);
+          const command = extractFailedLogCommand(output);
+          // A failed rollup without a provider-rendered command is deliberately
+          // not actionable. Guessing it locally violates the evidence-first fence.
+          if (!command || !output.trim()) continue;
+          details.push({
+            checkName: `${failure.workflowName} / ${job.name} / ${step.name}`,
+            checkUrl: typeof job.url === "string" ? job.url : failure.url,
+            command,
+            output,
+          });
+        }
+      }
+    }
+    return details;
   }
 
   async getBranch(repository: string, branchName: string): Promise<GitHubBranchEvidence | null> {

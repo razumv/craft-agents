@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import type { CraftExecutionSession, CraftRpcSession, ProjectDeskReadback } from "./craft-adapter";
+import { decideCiRepair, recordCiRepairAttempt, type CiRepairDecision, type CiRepairProposal } from "./ci-repair";
 import { CraftMobileControlPlaneAdapter } from "./craft-adapter";
 import { CraftCliRpcTransport, type CraftCliTransportConfig } from "./craft-transport";
 import { lifecycleStates, type LifecycleState, type ProjectStatus, type TrackerIssueSnapshot, type WorkflowConfig } from "./domain";
@@ -13,6 +14,7 @@ import {
   GhCliTransport,
   type GitHubBranchEvidence,
   type GitHubComment,
+  type GitHubFailedCheckDetail,
   type GitHubIssueLink,
   type GitHubIssueRecord,
   type GitHubProjectFieldValue,
@@ -343,6 +345,37 @@ export class LiveV4Runner {
    * exact refusal. The only adapter capability reachable here is fetchBacklog;
    * the pure proposal builder has no transport reference and cannot mutate.
    */
+  /**
+   * Provider-backed authorization fence for a repository repair. A successful
+   * decision consumes its attempt durably before the prompt can reach a worker;
+   * restarts therefore cannot reset the two-attempt cap.
+   */
+  async prepareCiRepair(issueId: string, proposal: CiRepairProposal | null): Promise<CiRepairDecision> {
+    this.#beginOperation();
+    const snapshot = await this.tracker.get(issueId);
+    const failure = await this.tracker.ciFailure(issueId);
+    const attempts = await this.tracker.ciRepairAttempts(issueId, failure?.pullRequestId);
+    const decision = decideCiRepair({ contract: snapshot.contract, failure, proposal, attempts });
+    if (decision.action === "repair") {
+      await this.tracker.recordCiRepairAttempt(
+        issueId,
+        decision.evidence.pullRequestId,
+        recordCiRepairAttempt(decision),
+      );
+    } else if (decision.evidence && snapshot.claim && ["pr-open", "review", "owner-gate"].includes(snapshot.issue.state)) {
+      const exactFailure = decision.evidence
+        ? `\ncheck: ${decision.evidence.checkName}\ncommand: ${decision.evidence.command}\noutput:\n${decision.evidence.output}`
+        : "";
+      const diagnoses = decision.diagnoses.length ? `\ndiagnoses:\n${decision.diagnoses.join("\n")}` : "";
+      await this.tracker.transition(issueId, "blocked", Date.now(), {
+        fence: snapshot.claim.fence,
+        evidence: { ...snapshot.evidence, blocker: decision.reason },
+        message: `CI repair handed over: ${decision.reason}${exactFailure}${diagnoses}`,
+      });
+    }
+    return decision;
+  }
+
   async proposeGrooming(): Promise<GroomingProposal> {
     this.#beginOperation();
     const backlog = await this.tracker.fetchBacklog();
@@ -762,6 +795,10 @@ export class DiscoveryGitHubTransport implements GitHubTransport {
   listProjectFieldValues(itemId: string, cursor: string | null): Promise<Page<GitHubProjectFieldValue>> { return this.delegate.listProjectFieldValues(itemId, cursor); }
   async listComments(issueId: string, cursor: string | null): Promise<Page<GitHubComment>> { return this.delegate.listComments(this.assertRead(issueId), cursor); }
   async listClosingPullRequests(issueId: string, cursor: string | null): Promise<Page<GitHubPullRequestEvidence>> { return this.delegate.listClosingPullRequests(this.assertRead(issueId), cursor); }
+  async listFailedCheckDetails(repository: string, headSha: string): Promise<GitHubFailedCheckDetail[]> {
+    if (repository !== this.scope.repository) throw new Error("GitHub request escaped configured repository scope");
+    return this.delegate.listFailedCheckDetails(repository, headSha);
+  }
   async getBranch(repository: string, branchName: string): Promise<GitHubBranchEvidence | null> {
     if (repository !== this.scope.repository) throw new Error("GitHub request escaped configured repository scope");
     return this.delegate.getBranch(repository, branchName);
@@ -850,6 +887,10 @@ export class ScopedGitHubTransport implements GitHubTransport {
     return this.delegate.listComments(issueId, cursor);
   }
   listClosingPullRequests(issueId: string, cursor: string | null): Promise<Page<GitHubPullRequestEvidence>> { return this.delegate.listClosingPullRequests(this.assertIssue(issueId), cursor); }
+  listFailedCheckDetails(repository: string, headSha: string): Promise<GitHubFailedCheckDetail[]> {
+    if (repository !== this.scope.repository) throw new Error("GitHub request escaped configured repository scope");
+    return this.delegate.listFailedCheckDetails(repository, headSha);
+  }
   getBranch(repository: string, branchName: string): Promise<GitHubBranchEvidence | null> { return this.delegate.getBranch(repository, branchName); }
   getBaseSha(repository: string, branchName: string): Promise<string> { return this.delegate.getBaseSha(repository, branchName); }
   appendComment(issueId: string, body: string): Promise<GitHubComment> {
