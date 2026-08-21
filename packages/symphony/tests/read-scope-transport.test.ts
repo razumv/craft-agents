@@ -68,10 +68,11 @@ describe("per-operation read scope", () => {
 
     await scoped.listIssues("acme/repo", null);
     await scoped.listIssues("acme/repo", "cursor-2");
+    await scoped.listIssues("acme/repo", null, "2026-08-20T12:00:00Z");
     await scoped.listComments("I_1", null);
     await scoped.listComments("I_2", null);
 
-    expect(inner.count("listIssues")).toBe(2);
+    expect(inner.count("listIssues")).toBe(3);
     expect(inner.count("listComments")).toBe(2);
   });
 

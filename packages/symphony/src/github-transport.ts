@@ -87,7 +87,11 @@ export interface GitHubBranchEvidence {
 
 /** All provider I/O is injected through this boundary; adapter tests never invoke gh. */
 export interface GitHubTransport {
-  listIssues(repository: string, cursor: string | null): Promise<Page<GitHubIssueRecord>>;
+  /**
+   * List repository issues, optionally restricted to issues updated at or after
+   * a provider-reported timestamp. A null bound is the cold-start full read.
+   */
+  listIssues(repository: string, cursor: string | null, updatedSince?: string | null): Promise<Page<GitHubIssueRecord>>;
   getIssuesByNodeIds(ids: readonly string[]): Promise<(GitHubIssueRecord | null)[]>;
   listLabels(issueId: string, cursor: string | null): Promise<Page<string>>;
   listBlockedBy(issueId: string, cursor: string | null): Promise<Page<GitHubIssueLink>>;
@@ -162,15 +166,24 @@ function priorityFromLabels(labels: readonly string[]): number | null {
 
 /** Authenticated gh CLI implementation. It is inert until a caller invokes an operation. */
 export class GhCliTransport implements GitHubTransport {
-  constructor(readonly executable = "gh") {}
+  constructor(
+    readonly executable = "gh",
+    /** Optional measurement hook; when present, each read asks GitHub for its own exact cost. */
+    readonly onGraphqlCost?: (cost: number) => void,
+  ) {}
 
-  async listIssues(repository: string, cursor: string | null): Promise<Page<GitHubIssueRecord>> {
+  async listIssues(repository: string, cursor: string | null, updatedSince: string | null = null): Promise<Page<GitHubIssueRecord>> {
     const [owner, name] = splitRepository(repository);
+    if (updatedSince !== null && !Number.isFinite(Date.parse(updatedSince))) {
+      throw new Error("updatedSince must be a provider ISO timestamp");
+    }
     // Labels ride along with the listing: hydrating an issue costs six further
     // queries, and an issue with no lifecycle label is never hydrated. Asking
     // for them here turns a repository-wide scan from O(issues) round trips
-    // into O(pages) for everything the lane does not manage.
-    const data = await this.graphql<{ repository: { issues: GraphPage<GitHubIssueRecord> } }>(`query Issues($owner:String!,$name:String!,$cursor:String){repository(owner:$owner,name:$name){issues(first:100,after:$cursor,orderBy:{field:CREATED_AT,direction:ASC}){nodes{id number title body url state createdAt updatedAt assignees(first:1){nodes{id}}labels(first:LABEL_PAGE){nodes{name}totalCount}parent{id number title state url}}pageInfo{hasNextPage endCursor}}}}`.replace("LABEL_PAGE", String(LISTING_LABEL_PAGE_SIZE)), { owner, name, cursor });
+    // into O(pages) for everything the lane does not manage. GitHub's `since`
+    // filter is inclusive, so issues sharing the boundary timestamp are safely
+    // repeated instead of being skipped due to timestamp precision.
+    const data = await this.graphql<{ repository: { issues: GraphPage<GitHubIssueRecord> } }>(`query Issues($owner:String!,$name:String!,$cursor:String,$since:DateTime){repository(owner:$owner,name:$name){issues(first:100,after:$cursor,filterBy:{since:$since},orderBy:{field:UPDATED_AT,direction:ASC}){nodes{id number title body url state createdAt updatedAt assignees(first:1){nodes{id}}labels(first:LABEL_PAGE){nodes{name}totalCount}parent{id number title state url}}pageInfo{hasNextPage endCursor}}}}`.replace("LABEL_PAGE", String(LISTING_LABEL_PAGE_SIZE)), { owner, name, cursor, since: updatedSince });
     return page({
       ...data.repository.issues,
       nodes: data.repository.issues.nodes.map((issue) => {
@@ -386,14 +399,24 @@ export class GhCliTransport implements GitHubTransport {
     // the compare-and-set above would then reject both. Reads have no such
     // hazard, so only reads get another attempt.
     const isMutation = /^\s*mutation\b/.test(query);
+    const measureCost = Boolean(this.onGraphqlCost) && !isMutation;
+    const measuredQuery = measureCost
+      ? query.replace(/}\s*$/, " rateLimit{cost}}")
+      : query;
     const output = await this.run(
       ["api", "graphql", "--input", "-"],
-      JSON.stringify({ query, variables }),
+      JSON.stringify({ query: measuredQuery, variables }),
       !isMutation,
     );
-    const parsed = JSON.parse(output) as { data?: T; errors?: { message: string }[] };
+    const parsed = JSON.parse(output) as { data?: T & { rateLimit?: { cost?: number } }; errors?: { message: string }[] };
     if (parsed.errors?.length) throw new Error(`GitHub GraphQL failed: ${parsed.errors.map((entry) => entry.message).join("; ")}`);
     if (!parsed.data) throw new Error("GitHub GraphQL returned no data");
+    if (measureCost) {
+      const cost = parsed.data.rateLimit?.cost;
+      if (!Number.isFinite(cost)) throw new Error("GitHub GraphQL measurement omitted rateLimit.cost");
+      this.onGraphqlCost!(cost!);
+      delete parsed.data.rateLimit;
+    }
     return parsed.data;
   }
 

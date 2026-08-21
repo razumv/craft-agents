@@ -87,6 +87,22 @@ describe("gh transport retry", () => {
     expect(Bun.file(countPath).size).toBe(1);
   });
 
+  test("the opt-in measurement hook reports the provider's exact query cost", async () => {
+    const payload = JSON.stringify({
+      data: {
+        repository: { issues: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } },
+        rateLimit: { cost: 7 },
+      },
+    });
+    const { path } = stubGh({ failures: 0, diagnostic: "", payload });
+    const costs: number[] = [];
+    const transport = new GhCliTransport(path, (cost) => costs.push(cost));
+
+    await transport.listIssues("acme/repo", null);
+
+    expect(costs).toEqual([7]);
+  });
+
   test("a mutation is never retried, even on a dropped connection", async () => {
     const { path, countPath } = stubGh({ failures: 1, diagnostic: "gh: HTTP 499", payload: JSON.stringify({ data: { addComment: { commentEdge: { node: { databaseId: 1, body: "", createdAt: "", updatedAt: "" } } } } }) });
     const transport = new GhCliTransport(path);
