@@ -66,7 +66,15 @@ export interface GitHubStateProjection {
 export interface GitHubAdapterConfig {
   repository: string;
   projectId: string;
+  /** The only lane fence this adapter may mutate. */
   claimFenceIssueId: string;
+  /**
+   * Every configured lane fence for this repository. The service derives this
+   * at runtime; standalone runners fall back to their own fence. Reading the
+   * set lets a lane distinguish a foreign claim from a genuinely orphaned one
+   * without ever writing another lane's fence.
+   */
+  configuredClaimFenceIssueIds?: readonly string[];
   statusFieldId: string;
   gateFieldId: string;
   requiredLabels: string[];
@@ -148,6 +156,16 @@ export class GitHubIssuesProjectsAdapter implements TrackerAdapter {
       throw new Error("GitHub adapter repository must match workflow project repository");
     }
     if (!config.claimFenceIssueId.trim()) throw new Error("GitHub adapter requires a shared claim-fence issue ID");
+    const configuredFences = config.configuredClaimFenceIssueIds ?? [config.claimFenceIssueId];
+    if (configuredFences.some((fence) => typeof fence !== "string" || !fence.trim())) {
+      throw new Error("configured claim-fence issue IDs must be non-empty strings");
+    }
+    if (!configuredFences.includes(config.claimFenceIssueId)) {
+      throw new Error("configured claim-fence issue IDs must include this lane's fence");
+    }
+    if (new Set(configuredFences).size !== configuredFences.length) {
+      throw new Error("configured claim-fence issue IDs must be unique");
+    }
     const labels = lifecycleStates.map((state) => normalizeLabel(config.states[state]?.label));
     if (labels.some((label) => !label)) {
       throw new Error("every lifecycle state requires a non-empty GitHub label");
@@ -449,20 +467,41 @@ export class GitHubIssuesProjectsAdapter implements TrackerAdapter {
   }
 
   async activeClaims(): Promise<TrackerIssueSnapshot[]> {
-    // Active reconciliation is strict: omitting a malformed active item could release WIP and duplicate a run.
     const wanted = new Set(this.config.workflow.tracker.activeStates);
     const active = [...(await this.loadAll(true)).values()]
       .map((entry) => entry.snapshot)
       .filter((entry) => wanted.has(entry.issue.state));
+    const ownership = await this.configuredFenceOwnership();
+    const owned: TrackerIssueSnapshot[] = [];
     for (const entry of active) {
       if (entry.issue.state === "retry-wait" && !entry.retry) {
         throw new Error(`active GitHub issue ${entry.issue.identifier} lacks durable retry metadata`);
       }
-      if (!["ready", "retry-wait", "done"].includes(entry.issue.state) && !entry.claim) {
-        throw new Error(`active GitHub issue ${entry.issue.identifier} lacks a durable claim binding`);
+      if (!entry.claim) {
+        if (!["ready", "retry-wait", "done"].includes(entry.issue.state)) {
+          this.config.onDiagnostic?.(
+            `orphaned active claim projection ${entry.issue.identifier}: state ${entry.issue.state} has no durable claim binding`,
+          );
+        }
+        continue;
       }
+      const key = claimOwnershipKey(entry.claim.issueId, entry.claim.fence);
+      const owners = ownership.get(key) ?? [];
+      if (owners.length === 0) {
+        this.config.onDiagnostic?.(
+          `orphaned claim ${entry.issue.identifier} (${entry.claim.fence}) is held by no configured lane fence`,
+        );
+        continue;
+      }
+      if (owners.length > 1) {
+        this.config.onDiagnostic?.(
+          `ambiguous claim ${entry.issue.identifier} (${entry.claim.fence}) is held by multiple configured lane fences: ${owners.join(", ")}`,
+        );
+        continue;
+      }
+      if (owners[0] === this.config.claimFenceIssueId) owned.push(entry);
     }
-    return active.filter((entry) => entry.claim !== null);
+    return owned;
   }
 
   async get(issueId: string): Promise<TrackerIssueSnapshot> {
@@ -732,6 +771,7 @@ export class GitHubIssuesProjectsAdapter implements TrackerAdapter {
   async advanceByEvidence(nowMs: number): Promise<readonly StartupReconciliation[]> {
     const results: StartupReconciliation[] = [];
     const active = await this.activeClaims();
+    const ownedIssueIds = new Set(active.map((snapshot) => snapshot.issue.id));
     for (const snapshot of active.sort((a, b) => a.issue.id.localeCompare(b.issue.id))) {
       results.push(...await this.advanceClaimByEvidence(snapshot, nowMs));
     }
@@ -755,6 +795,11 @@ export class GitHubIssuesProjectsAdapter implements TrackerAdapter {
       // is no merge, so the honest terminal state is cancelled, not done.
       if (!closedWhileInFlight(snapshot)) continue;
       const claim = snapshot.claim;
+      // A foreign active claim may be closed while this lane is observing the
+      // repository. Only its owning lane may render that verdict and release
+      // its fence; claimless historical states remain safe for any lane's
+      // compare-and-set evidence reconciliation.
+      if (claim && !ownedIssueIds.has(snapshot.issue.id)) continue;
       await this.transition(snapshot.issue.id, "cancelled", nowMs, {
         ...(claim ? { fence: claim.fence } : {}),
         message: "issue was closed with no merge evidence while its lifecycle state was still in flight",
@@ -869,9 +914,25 @@ export class GitHubIssuesProjectsAdapter implements TrackerAdapter {
     await this.sharedFenceState();
   }
 
-  private async sharedFenceState(): Promise<SharedFenceState> {
-    const comments = await collectPages((cursor) => this.transport.listComments(this.config.claimFenceIssueId, cursor));
+  private async sharedFenceState(fenceIssueId = this.config.claimFenceIssueId): Promise<SharedFenceState> {
+    const comments = await collectPages((cursor) => this.transport.listComments(fenceIssueId, cursor));
     return reduceSharedFence(comments, this.config.eventAuthorLogin);
+  }
+
+  private async configuredFenceOwnership(): Promise<Map<string, string[]>> {
+    const fenceIds = this.config.configuredClaimFenceIssueIds ?? [this.config.claimFenceIssueId];
+    const states = await Promise.all(fenceIds.map(async (fenceIssueId) => ({
+      fenceIssueId,
+      state: await this.sharedFenceState(fenceIssueId),
+    })));
+    const ownership = new Map<string, string[]>();
+    for (const { fenceIssueId, state } of states) {
+      const lease = state.lease;
+      if (!lease) continue;
+      const key = claimOwnershipKey(lease.issueId, lease.fence);
+      ownership.set(key, [...(ownership.get(key) ?? []), fenceIssueId]);
+    }
+    return ownership;
   }
 
   private async byFence(fence: string): Promise<Hydrated> {
@@ -1433,6 +1494,10 @@ function validateLedgerShape(value: unknown): LedgerEvent {
 
 function serializeEvent(event: LedgerEvent): string {
   return `${eventPrefix}${JSON.stringify(event)}${eventSuffix}`;
+}
+
+function claimOwnershipKey(issueId: string, fence: string): string {
+  return `${issueId}\n${fence}`;
 }
 
 function serializeFenceEvent(event: SharedFenceEvent): string {

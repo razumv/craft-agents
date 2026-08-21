@@ -61,6 +61,8 @@ export interface LiveRunnerConfig {
   issueNumber?: number;
   projectItemId?: string;
   claimFenceIssueId: string;
+  /** Runtime-derived peer fences for lanes configured on the same repository. */
+  configuredClaimFenceIssueIds?: string[];
   verificationBudget: string;
   github: {
     executable: string;
@@ -609,6 +611,15 @@ export async function loadLiveRunnerConfig(path: string): Promise<LiveRunnerConf
   if (parsed.maxAttempts !== undefined && (!Number.isInteger(parsed.maxAttempts) || parsed.maxAttempts < 1 || parsed.maxAttempts > 10)) {
     throw new Error("live runner maxAttempts must be an integer between 1 and 10");
   }
+  if (parsed.configuredClaimFenceIssueIds !== undefined) {
+    const fences = parsed.configuredClaimFenceIssueIds;
+    if (!Array.isArray(fences) || fences.some((entry) => typeof entry !== "string" || !entry.trim())) {
+      throw new Error("live runner configuredClaimFenceIssueIds must be an array of non-empty strings");
+    }
+    if (new Set(fences).size !== fences.length || !fences.includes(parsed.claimFenceIssueId)) {
+      throw new Error("live runner configuredClaimFenceIssueIds must be unique and include claimFenceIssueId");
+    }
+  }
   const required: Record<string, unknown> = {
     workflowPath: parsed.workflowPath,
     repositoryRoot: parsed.repositoryRoot,
@@ -687,6 +698,7 @@ export async function createLiveRunner(config: LiveRunnerConfig): Promise<LiveV4
     github = new DiscoveryGitHubTransport(rawGitHub, {
       repository: config.github.repository,
       fenceIssueId: config.claimFenceIssueId,
+      readableFenceIssueIds: config.configuredClaimFenceIssueIds ?? [config.claimFenceIssueId],
       projectId: config.github.projectId,
       statusFieldId: config.github.statusFieldId,
       gateFieldId: config.github.gateFieldId,
@@ -700,6 +712,7 @@ export async function createLiveRunner(config: LiveRunnerConfig): Promise<LiveV4
       issueId: config.issueId,
       issueNumber: config.issueNumber,
       fenceIssueId: config.claimFenceIssueId,
+      readableFenceIssueIds: config.configuredClaimFenceIssueIds ?? [config.claimFenceIssueId],
       projectId: config.github.projectId,
       projectItemId: config.projectItemId,
       statusFieldId: config.github.statusFieldId,
@@ -711,12 +724,14 @@ export async function createLiveRunner(config: LiveRunnerConfig): Promise<LiveV4
     repository: config.github.repository,
     projectId: config.github.projectId,
     claimFenceIssueId: config.claimFenceIssueId,
+    configuredClaimFenceIssueIds: config.configuredClaimFenceIssueIds ?? [config.claimFenceIssueId],
     statusFieldId: config.github.statusFieldId,
     gateFieldId: config.github.gateFieldId,
     requiredLabels: config.github.requiredLabels,
     states: config.github.states,
     workflow,
     eventAuthorLogin: config.github.eventAuthorLogin,
+    onDiagnostic: (message) => console.warn(`[symphony] ${message}`),
   }, github, truth);
   const craftTransport = new CraftCliRpcTransport(config.craft.cli);
   const craft = new CraftMobileControlPlaneAdapter({
@@ -835,6 +850,8 @@ function canonicalJson(value: unknown): string {
 export interface GitHubDiscoveryScope {
   repository: string;
   fenceIssueId: string;
+  /** Fence issues this lane may inspect; only fenceIssueId remains writable. */
+  readableFenceIssueIds?: readonly string[];
   projectId: string;
   statusFieldId: string;
   gateFieldId: string;
@@ -938,7 +955,8 @@ export class DiscoveryGitHubTransport implements GitHubTransport {
   }
 
   private assertRead(issueId: string): string {
-    if (issueId !== this.scope.fenceIssueId && !this.#issueIds.has(issueId)) {
+    const readableFences = this.scope.readableFenceIssueIds ?? [this.scope.fenceIssueId];
+    if (!readableFences.includes(issueId) && !this.#issueIds.has(issueId)) {
       throw new Error("GitHub read escaped discovered issue/fence scope");
     }
     return issueId;
@@ -951,6 +969,8 @@ export interface GitHubMutationScope {
   issueId: string;
   issueNumber: number;
   fenceIssueId: string;
+  /** Fence issues this lane may inspect; only fenceIssueId remains writable. */
+  readableFenceIssueIds?: readonly string[];
   projectId: string;
   projectItemId: string;
   statusFieldId: string;
@@ -981,7 +1001,8 @@ export class ScopedGitHubTransport implements GitHubTransport {
   listProjectItems(issueId: string, cursor: string | null): Promise<Page<GitHubProjectItem>> { return this.delegate.listProjectItems(this.assertIssue(issueId), cursor); }
   listProjectFieldValues(itemId: string, cursor: string | null): Promise<Page<GitHubProjectFieldValue>> { return this.delegate.listProjectFieldValues(itemId, cursor); }
   listComments(issueId: string, cursor: string | null): Promise<Page<GitHubComment>> {
-    if (issueId !== this.scope.issueId && issueId !== this.scope.fenceIssueId) throw new Error("GitHub comment request escaped configured issue/fence scope");
+    const readableFences = this.scope.readableFenceIssueIds ?? [this.scope.fenceIssueId];
+    if (issueId !== this.scope.issueId && !readableFences.includes(issueId)) throw new Error("GitHub comment request escaped configured issue/fence scope");
     return this.delegate.listComments(issueId, cursor);
   }
   listClosingPullRequests(issueId: string, cursor: string | null): Promise<Page<GitHubPullRequestEvidence>> { return this.delegate.listClosingPullRequests(this.assertIssue(issueId), cursor); }
