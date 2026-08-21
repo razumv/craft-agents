@@ -6,7 +6,7 @@ import { createLiveRunner, loadLiveRunnerConfig } from "./runner";
 import type { CrashPoint } from "./scheduler";
 
 const [configPath, command = "status", ...args] = process.argv.slice(2);
-if (!configPath) fail("usage: bun run src/cli.ts <absolute-config.json> <preflight|tick|status|project|transition-pr-open|archive|watch> [options]");
+if (!configPath) fail("usage: bun run src/cli.ts <absolute-config.json> <preflight|tick|status|propose-deadline-successor|project|transition-pr-open|archive|watch> [options]");
 
 const config = await loadLiveRunnerConfig(configPath);
 const runner = await createLiveRunner(config);
@@ -24,6 +24,9 @@ switch (command) {
   }
   case "status":
     process.stdout.write(formatStatusOutput(await runner.readStatus(), args.includes("--compact")));
+    break;
+  case "propose-deadline-successor":
+    output(await runner.proposeDeadlineSuccessor());
     break;
   case "project":
     output(await runner.project());
