@@ -747,6 +747,138 @@ describe("v4.2 GitHub Issues and Projects adapter", () => {
     expect(done.events.some((event) => event.kind === "failure")).toBeTrue();
   });
 
+  test("revival requires a named change, persists it, and renews attempt one without erasing failure history", async () => {
+    const { transport, adapter } = setup();
+    transport.addIssue(1);
+    const before = await adapter.get("I_1");
+    const firstClaim = await proposedClaim(adapter, "I_1");
+    await adapter.tryClaim("I_1", before.version, firstClaim, 1_000);
+    await adapter.markRunning(firstClaim.fence, 1_100);
+    await adapter.failClaim(firstClaim.fence, "runtime", "provider quota exhausted", 1_200, {
+      maxAttempts: 1, retryBaseMs: 1, retryMaxMs: 1, claimTtlMs: 60_000, staleRunMs: 60_000,
+    } as never);
+
+    const writesBeforeRefusal = transport.comments.get("I_1")!.length;
+    const unnamed = await adapter.reviveFailed("I_1", "   ", 1_300);
+    expect(unnamed).toMatchObject({ accepted: false, reason: "revival refused: a named change is required" });
+    expect(transport.comments.get("I_1")!).toHaveLength(writesBeforeRefusal);
+
+    const revived = await adapter.reviveFailed("I_1", "quota reset ticket OPS-42", 1_400);
+    expect(revived).toMatchObject({ accepted: true, snapshot: { issue: { state: "ready" }, retry: null } });
+    expect(revived.snapshot.events.at(-1)).toMatchObject({
+      kind: "revival",
+      state: "ready",
+      justification: "quota reset ticket OPS-42",
+    });
+
+    // No scheduler branch exists for revival. Once projected to ordinary ready,
+    // the ordinary claim path grants attempt one of the new budget.
+    const newClaim = await proposedClaim(adapter, "I_1", 1_500);
+    expect(newClaim.attempt).toBe(1);
+    const claimed = await adapter.tryClaim("I_1", revived.snapshot.version, newClaim, 1_500);
+    expect(claimed?.claim?.attempt).toBe(1);
+    expect(claimed?.events.filter((event) => event.kind === "failure")).toHaveLength(1);
+    expect(claimed?.events.map((event) => event.message)).toContain("attempt 1 atomically claimed");
+  });
+
+  test("a justification is single-use and the configured revival bound leaves the issue failed with a reason", async () => {
+    const { transport, adapter } = setup();
+    transport.addIssue(1);
+
+    const exhaust = async (atMs: number): Promise<void> => {
+      const ready = await adapter.get("I_1");
+      const claim = await proposedClaim(adapter, "I_1", atMs);
+      await adapter.tryClaim("I_1", ready.version, claim, atMs);
+      await adapter.markRunning(claim.fence, atMs + 1);
+      await adapter.failClaim(claim.fence, "runtime", "attempt exhausted", atMs + 2, {
+        maxAttempts: 1, retryBaseMs: 1, retryMaxMs: 1, claimTtlMs: 60_000, staleRunMs: 60_000,
+      } as never);
+    };
+
+    await exhaust(2_000);
+    expect((await adapter.reviveFailed("I_1", "dependency release v2", 2_100)).accepted).toBeTrue();
+    await exhaust(2_200);
+
+    const writesBeforeDuplicate = transport.comments.get("I_1")!.length;
+    const duplicate = await adapter.reviveFailed("I_1", "dependency release v2", 2_300);
+    expect(duplicate).toMatchObject({ accepted: false, reason: "revival refused: change already used: dependency release v2" });
+    expect(duplicate.snapshot.issue.state).toBe("failed");
+    expect(transport.comments.get("I_1")!).toHaveLength(writesBeforeDuplicate);
+
+    expect((await adapter.reviveFailed("I_1", "dependency release v3", 2_400)).accepted).toBeTrue();
+    await exhaust(2_500);
+    const bounded = await adapter.reviveFailed("I_1", "dependency release v4", 2_600);
+    expect(bounded).toMatchObject({
+      accepted: false,
+      reason: "revival refused: configured limit of 2 reached; issue remains failed",
+      snapshot: { issue: { state: "failed" } },
+    });
+  });
+
+  test("supersession requires a successor and records cancelled work without inventing delivery", async () => {
+    const { transport, adapter } = setup();
+    transport.addIssue(1);
+    const ready = await adapter.get("I_1");
+    const claim = await proposedClaim(adapter, "I_1");
+    await adapter.tryClaim("I_1", ready.version, claim, 3_000);
+    await adapter.markRunning(claim.fence, 3_100);
+    await adapter.failClaim(claim.fence, "contract", "scope no longer belongs here", 3_200, workflow.config.scheduler);
+
+    const writesBeforeRefusal = transport.comments.get("I_1")!.length;
+    const missing = await adapter.supersedeFailed("I_1", "", 3_300);
+    expect(missing).toMatchObject({ accepted: false, reason: "supersession refused: a successor reference is required" });
+    expect(transport.comments.get("I_1")!).toHaveLength(writesBeforeRefusal);
+
+    const superseded = await adapter.supersedeFailed("I_1", "acme/repo#99", 3_400);
+    expect(superseded).toMatchObject({ accepted: true, snapshot: { issue: { state: "cancelled" } } });
+    expect(superseded.snapshot.events.at(-1)).toMatchObject({
+      kind: "supersession",
+      successor: "acme/repo#99",
+      message: "cancelled because work continued at acme/repo#99",
+    });
+    expect(superseded.snapshot.evidence.mergedAt).toBeUndefined();
+    expect(superseded.snapshot.evidence.deploymentUrl).toBeUndefined();
+    await expect(adapter.transition("I_1", "merged", 3_500)).rejects.toThrow("merged requires exact provider PR evidence");
+  });
+
+  test("closing a failed issue remains an owner decision and refuses later lifecycle rewrites", async () => {
+    const { transport, adapter } = setup();
+    transport.addIssue(1);
+    const ready = await adapter.get("I_1");
+    const claim = await proposedClaim(adapter, "I_1");
+    await adapter.tryClaim("I_1", ready.version, claim, 3_600);
+    await adapter.markRunning(claim.fence, 3_700);
+    await adapter.failClaim(claim.fence, "contract", "owner decision required", 3_800, workflow.config.scheduler);
+    transport.issues[0]!.state = "CLOSED";
+
+    const revival = await adapter.reviveFailed("I_1", "new dependency release", 3_900);
+    const supersession = await adapter.supersedeFailed("I_1", "acme/repo#99", 3_900);
+    expect(revival).toMatchObject({ accepted: false, reason: "revival refused: issue is closed" });
+    expect(supersession).toMatchObject({ accepted: false, reason: "supersession refused: issue is closed" });
+    expect(revival.snapshot).toMatchObject({ issue: { state: "failed", closed: true } });
+  });
+
+  test("provider merge evidence refuses both failed-work decisions because delivery owns the outcome", async () => {
+    const { transport, adapter } = setup();
+    transport.addIssue(1);
+    const ready = await adapter.get("I_1");
+    const claim = await proposedClaim(adapter, "I_1");
+    await adapter.tryClaim("I_1", ready.version, claim, 4_000);
+    await adapter.markRunning(claim.fence, 4_100);
+    await adapter.failClaim(claim.fence, "runtime", "attempt died", 4_200, {
+      maxAttempts: 1, retryBaseMs: 1, retryMaxMs: 1, claimTtlMs: 60_000, staleRunMs: 60_000,
+    } as never);
+    attachPr(transport, "I_1", true);
+    transport.branches.delete("v4/acme-repo-1");
+
+    const revival = await adapter.reviveFailed("I_1", "runner repaired", 4_300);
+    const supersession = await adapter.supersedeFailed("I_1", "acme/repo#99", 4_300);
+    expect(revival).toMatchObject({ accepted: false, reason: "revival refused: provider merge evidence already records delivery" });
+    expect(supersession).toMatchObject({ accepted: false, reason: "supersession refused: provider merge evidence already records delivery" });
+    expect(revival.snapshot.issue.state).toBe("failed");
+    expect(revival.snapshot.evidence.mergeCommitSha).toBe("c".repeat(40));
+  });
+
   test("a run that died before recording a branch still gets credit when its pull request merged", async () => {
     const { transport, adapter } = setup();
     transport.addIssue(1);

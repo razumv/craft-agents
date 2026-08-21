@@ -14,7 +14,7 @@ const nextPoint: Record<LifecycleState, string> = {
   done: "complete",
   blocked: "blocker resolution",
   "retry-wait": "bounded retry due time",
-  failed: "owner handoff",
+  failed: "owner revival, supersession, or closure decision",
   cancelled: "none",
   "preservation-unknown": "preservation proof",
 };

@@ -33,7 +33,13 @@ import type {
   GitHubTransport,
   Page,
 } from "./github-transport";
-import type { StartupReconciliation, TrackerAdapter, TrackerBacklogIssue, TrackerTransitionOptions } from "./tracker";
+import type {
+  LifecycleDecisionResult,
+  StartupReconciliation,
+  TrackerAdapter,
+  TrackerBacklogIssue,
+  TrackerTransitionOptions,
+} from "./tracker";
 import { claimBindingsEqual, type WorkspaceTruthReader } from "./workspace-truth";
 
 const eventPrefix = "<!-- craft-protocol-v4:event\n";
@@ -64,7 +70,7 @@ interface LedgerEvent {
   schema: typeof ledgerSchema;
   issueId: string;
   expectedVersion: number;
-  operation: "claim" | "running" | "heartbeat" | "failure" | "transition";
+  operation: "claim" | "running" | "heartbeat" | "failure" | "transition" | "revival" | "supersession";
   from: LifecycleState;
   to: LifecycleState;
   atMs: number;
@@ -73,6 +79,10 @@ interface LedgerEvent {
   retry: RetryMetadata | null;
   evidence: MaterialEvidence;
   message: string;
+  /** Null on ordinary events and on pre-revival ledgers. */
+  justification?: string | null;
+  /** Null on ordinary events and on pre-supersession ledgers. */
+  successor?: string | null;
 }
 
 interface SharedFenceEvent {
@@ -451,6 +461,93 @@ export class GitHubIssuesProjectsAdapter implements TrackerAdapter {
     return failed;
   }
 
+  async reviveFailed(issueId: string, justification: string, nowMs: number): Promise<LifecycleDecisionResult> {
+    const current = await this.detailed(issueId);
+    const namedChange = decisionReference(justification);
+    if (!namedChange) {
+      return { accepted: false, snapshot: current.snapshot, reason: "revival refused: a named change is required" };
+    }
+    if (current.snapshot.evidence.mergedAt && current.snapshot.evidence.mergeCommitSha) {
+      return {
+        accepted: false,
+        snapshot: current.snapshot,
+        reason: "revival refused: provider merge evidence already records delivery",
+      };
+    }
+    const revivals = current.snapshot.events.filter((event) => event.kind === "revival");
+    if (revivals.some((event) => event.justification === namedChange)) {
+      return {
+        accepted: false,
+        snapshot: current.snapshot,
+        reason: `revival refused: change already used: ${namedChange}`,
+      };
+    }
+    if (current.snapshot.issue.state !== "failed") {
+      return {
+        accepted: false,
+        snapshot: current.snapshot,
+        reason: `revival refused: issue is ${current.snapshot.issue.state}, not failed`,
+      };
+    }
+    if (current.snapshot.issue.closed) {
+      return { accepted: false, snapshot: current.snapshot, reason: "revival refused: issue is closed" };
+    }
+    if (revivals.length >= this.config.workflow.scheduler.maxRevivals) {
+      return {
+        accepted: false,
+        snapshot: current.snapshot,
+        reason: `revival refused: configured limit of ${this.config.workflow.scheduler.maxRevivals} reached; issue remains failed`,
+      };
+    }
+    const message = `revived with a fresh attempt budget because ${namedChange}`;
+    const event = nextEvent(current.snapshot, "revival", "ready", nowMs, null, {
+      claim: null,
+      retry: null,
+      evidence: current.snapshot.evidence,
+      message,
+      justification: namedChange,
+    });
+    return { accepted: true, snapshot: await this.requiredCommit(current, event), reason: message };
+  }
+
+  async supersedeFailed(issueId: string, successor: string, nowMs: number): Promise<LifecycleDecisionResult> {
+    const current = await this.detailed(issueId);
+    const successorRef = decisionReference(successor);
+    if (!successorRef) {
+      return {
+        accepted: false,
+        snapshot: current.snapshot,
+        reason: "supersession refused: a successor reference is required",
+      };
+    }
+    if (current.snapshot.evidence.mergedAt && current.snapshot.evidence.mergeCommitSha) {
+      return {
+        accepted: false,
+        snapshot: current.snapshot,
+        reason: "supersession refused: provider merge evidence already records delivery",
+      };
+    }
+    if (current.snapshot.issue.state !== "failed") {
+      return {
+        accepted: false,
+        snapshot: current.snapshot,
+        reason: `supersession refused: issue is ${current.snapshot.issue.state}, not failed`,
+      };
+    }
+    if (current.snapshot.issue.closed) {
+      return { accepted: false, snapshot: current.snapshot, reason: "supersession refused: issue is closed" };
+    }
+    const message = `cancelled because work continued at ${successorRef}`;
+    const event = nextEvent(current.snapshot, "supersession", "cancelled", nowMs, null, {
+      claim: null,
+      retry: null,
+      evidence: current.snapshot.evidence,
+      message,
+      successor: successorRef,
+    });
+    return { accepted: true, snapshot: await this.requiredCommit(current, event), reason: message };
+  }
+
   async transition(
     issueId: string,
     to: LifecycleState,
@@ -458,6 +555,9 @@ export class GitHubIssuesProjectsAdapter implements TrackerAdapter {
     options: TrackerTransitionOptions = {},
   ): Promise<TrackerIssueSnapshot> {
     const current = await this.detailed(issueId);
+    if (current.snapshot.issue.state === "failed" && (to === "ready" || to === "cancelled")) {
+      throw new Error(`failed -> ${to} requires the explicit revival or supersession decision API`);
+    }
     const priorClaim = current.snapshot.claim;
     if (priorClaim && options.fence !== priorClaim.fence) throw new Error("claim fence mismatch");
     const callerEvidence = structuredClone(options.evidence ?? {});
@@ -1087,7 +1187,8 @@ function nextEvent(
   to: LifecycleState,
   atMs: number,
   fence: string | null,
-  next: Pick<LedgerEvent, "claim" | "retry" | "evidence" | "message">,
+  next: Pick<LedgerEvent, "claim" | "retry" | "evidence" | "message">
+    & Partial<Pick<LedgerEvent, "justification" | "successor">>,
 ): LedgerEvent {
   return {
     schema: ledgerSchema,
@@ -1102,6 +1203,8 @@ function nextEvent(
     retry: structuredClone(next.retry),
     evidence: structuredClone(next.evidence),
     message: next.message,
+    justification: next.justification ?? null,
+    successor: next.successor ?? null,
   };
 }
 
@@ -1133,12 +1236,30 @@ function reduceLedgerEvent(snapshot: TrackerIssueSnapshot, event: LedgerEvent, s
       break;
     case "transition":
       if (claim && event.fence !== claim.fence) throw new Error("transition claim fence mismatch");
+      if (snapshot.issue.state === "failed" && (event.to === "ready" || event.to === "cancelled")) {
+        throw new Error("failed lifecycle decision used a generic transition");
+      }
       assertLifecycleTransition(snapshot.issue.state, event.to);
       validateTransitionEvidence(snapshot, event.to, event.evidence);
       break;
-  }
-  if (event.operation !== "heartbeat" && event.operation !== "running" && event.operation !== "failure" && event.operation !== "transition" && event.operation !== "claim") {
-    throw new Error("unsupported ledger operation");
+    case "revival": {
+      if (claim || snapshot.issue.state !== "failed" || event.to !== "ready" || event.fence !== null || event.claim !== null || event.retry !== null) {
+        throw new Error("invalid revival ledger event");
+      }
+      const justification = decisionReference(event.justification ?? "");
+      if (!justification || justification !== event.justification) throw new Error("revival requires an exact named change");
+      const prior = snapshot.events.filter((entry) => entry.kind === "revival");
+      if (prior.some((entry) => entry.justification === justification)) throw new Error("revival change was already used");
+      break;
+    }
+    case "supersession": {
+      if (claim || snapshot.issue.state !== "failed" || event.to !== "cancelled" || event.fence !== null || event.claim !== null || event.retry !== null) {
+        throw new Error("invalid supersession ledger event");
+      }
+      const successor = decisionReference(event.successor ?? "");
+      if (!successor || successor !== event.successor) throw new Error("supersession requires an exact successor reference");
+      break;
+    }
   }
   return {
     ...snapshot,
@@ -1155,6 +1276,8 @@ function reduceLedgerEvent(snapshot: TrackerIssueSnapshot, event: LedgerEvent, s
           state: event.to,
           message: event.message,
           kind: event.operation,
+          ...(event.justification ? { justification: event.justification } : {}),
+          ...(event.successor ? { successor: event.successor } : {}),
         }],
   };
 }
@@ -1199,11 +1322,17 @@ function validateLedgerShape(value: unknown): LedgerEvent {
   const raw = value as Record<string, unknown>;
   if (raw.schema !== ledgerSchema) throw new Error("unsupported ledger event schema");
   if (typeof raw.issueId !== "string" || !raw.issueId || !Number.isInteger(raw.expectedVersion)) throw new Error("ledger binding/version is invalid");
-  if (!["claim", "running", "heartbeat", "failure", "transition"].includes(String(raw.operation))) throw new Error("ledger operation is invalid");
+  if (!["claim", "running", "heartbeat", "failure", "transition", "revival", "supersession"].includes(String(raw.operation))) throw new Error("ledger operation is invalid");
   if (!lifecycleStates.includes(raw.from as LifecycleState) || !lifecycleStates.includes(raw.to as LifecycleState)) throw new Error("ledger lifecycle state is invalid");
   if (typeof raw.atMs !== "number" || typeof raw.message !== "string" || !raw.message) throw new Error("ledger event metadata is invalid");
   if (raw.fence !== null && typeof raw.fence !== "string") throw new Error("ledger fence is invalid");
   if (!raw.evidence || typeof raw.evidence !== "object" || Array.isArray(raw.evidence)) throw new Error("ledger evidence is invalid");
+  if (raw.justification !== undefined && raw.justification !== null && typeof raw.justification !== "string") {
+    throw new Error("ledger revival justification is invalid");
+  }
+  if (raw.successor !== undefined && raw.successor !== null && typeof raw.successor !== "string") {
+    throw new Error("ledger successor reference is invalid");
+  }
   return raw as unknown as LedgerEvent;
 }
 
@@ -1355,6 +1484,10 @@ function isoTimestamp(value: string): string {
 
 function normalizeLabel(value: string): string {
   return value.trim().toLowerCase();
+}
+
+function decisionReference(value: string): string {
+  return value.trim();
 }
 
 function issueHasLabel(labels: string[], required: string): boolean {
