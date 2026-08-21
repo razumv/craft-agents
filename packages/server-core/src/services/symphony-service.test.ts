@@ -121,6 +121,44 @@ describe('NativeSymphonyService', () => {
     expect(calls).toEqual(['status', 'preflight', 'preflight', 'shadow', 'desk'])
   })
 
+  it('derives each repository lane fence registry without changing runner JSON', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'craft-symphony-lanes-'))
+    tempDirs.push(dir)
+    const make = async (name: string, repository: string, fence: string) => {
+      const path = join(dir, `${name}.json`)
+      await writeFile(path, JSON.stringify({
+        workflowPath: '/tmp/WORKFLOW.md', repositoryRoot: '/tmp/repository', workspaceRoot: '/tmp/worktrees',
+        issueId: `ISSUE_${name}`, claimFenceIssueId: fence, verificationBudget: 'focused',
+        github: { repository },
+      }))
+      return path
+    }
+    const paths = {
+      alpha: await make('alpha', 'acme/shared', 'FENCE_A'),
+      beta: await make('beta', 'acme/shared', 'FENCE_B'),
+      gamma: await make('gamma', 'acme/other', 'FENCE_C'),
+    }
+    const received = new Map<string, string[] | undefined>()
+    const runner: SymphonyRunnerLike = {
+      async preflight() { return {} }, async readStatus() { return {} }, async projectDesk() { return {} },
+      async shadow() { return {} }, async tick() { return {} },
+    }
+    const service = new NativeSymphonyService({
+      version: 1, enabled: false, stopTimeoutMs: 25,
+      projects: Object.entries(paths).map(([id, configPath]) => ({ id, configPath })),
+    }, null, async (runnerConfig) => {
+      received.set(runnerConfig.claimFenceIssueId, runnerConfig.configuredClaimFenceIssueIds)
+      return runner
+    })
+
+    await service.start()
+
+    expect(received.get('FENCE_A')).toEqual(['FENCE_A', 'FENCE_B'])
+    expect(received.get('FENCE_B')).toEqual(['FENCE_A', 'FENCE_B'])
+    expect(received.get('FENCE_C')).toEqual(['FENCE_C'])
+    expect(JSON.parse(await Bun.file(paths.alpha).text()).configuredClaimFenceIssueIds).toBeUndefined()
+  })
+
   it('reconstructs identical durable status after a server restart without ticking', async () => {
     const path = await runnerConfigPath()
     let ticks = 0

@@ -3,8 +3,12 @@
 import { beforeAll, describe, expect, test } from "bun:test";
 import { resolve } from "node:path";
 import {
+  DeterministicScheduler,
+  FakeCraftAdapter,
+  FakeWorkspaceAdapter,
   GitHubIssuesProjectsAdapter,
   IdentityFactory,
+  ManualClock,
   lifecycleStates,
   loadWorkflow,
   type Claim,
@@ -214,7 +218,11 @@ acceptance:
 `;
 }
 
-function config(): GitHubAdapterConfig {
+function config(
+  claimFenceIssueId = "FENCE",
+  configuredClaimFenceIssueIds: readonly string[] = [claimFenceIssueId],
+  onDiagnostic?: (message: string) => void,
+): GitHubAdapterConfig {
   const states = Object.fromEntries(lifecycleStates.map((state) => [state, {
     label: `state:${state}`,
     projectStatusOptionId: `opt-${state}`,
@@ -222,7 +230,8 @@ function config(): GitHubAdapterConfig {
   return {
     repository: "acme/repo",
     projectId: "PROJECT",
-    claimFenceIssueId: "FENCE",
+    claimFenceIssueId,
+    configuredClaimFenceIssueIds,
     statusFieldId: "STATUS",
     gateFieldId: "GATE",
     requiredLabels: [" V4 "],
@@ -233,6 +242,7 @@ function config(): GitHubAdapterConfig {
       tracker: { ...workflow.config.tracker, kind: "github" },
     },
     eventAuthorLogin: "craft-bot",
+    ...(onDiagnostic ? { onDiagnostic } : {}),
   };
 }
 
@@ -1235,11 +1245,18 @@ describe("v4.2 GitHub Issues and Projects adapter", () => {
     await expect(adapter.get("I_1")).rejects.toThrow("does not exactly match GATE-I_1-7");
   });
 
-  test("claimless active projections fail closed instead of releasing scheduler WIP", async () => {
-    const { transport, adapter } = setup();
+  test("claimless active projections are reported as orphaned rather than adopted", async () => {
+    const diagnostics: string[] = [];
+    const transport = new MemoryGitHubTransport();
+    transport.branches.set("main", { name: "main", url: "https://github.test/acme/repo/tree/main", oid: "b".repeat(40) });
+    transport.comments.set("FENCE", []);
+    const adapter = new GitHubIssuesProjectsAdapter(config("FENCE", ["FENCE"], (message) => diagnostics.push(message)), transport, new MemoryWorkspaceTruth());
     transport.addIssue(1, "running");
 
-    await expect(adapter.activeClaims()).rejects.toThrow("lacks a durable claim binding");
+    expect(await adapter.activeClaims()).toEqual([]);
+    expect(diagnostics).toEqual([
+      "orphaned active claim projection acme/repo#1: state running has no durable claim binding",
+    ]);
   });
 
   test("ambiguous filesystem truth transitions a running claim to preservation-unknown", async () => {
@@ -1277,6 +1294,130 @@ describe("v4.2 GitHub Issues and Projects adapter", () => {
     expect(done.claim).toBeNull();
     expect(done.evidence.prUrl).toBe("https://github.test/acme/repo/pull/1");
     expect(transport.comments.get("I_1")).toHaveLength(6);
+  });
+});
+
+describe("lane-scoped WIP and reconciliation", () => {
+  function lanes(onDiagnostic?: (message: string) => void) {
+    const transport = new MemoryGitHubTransport();
+    transport.branches.set("main", { name: "main", url: "https://github.test/acme/repo/tree/main", oid: "b".repeat(40) });
+    transport.comments.set("FENCE_A", []);
+    transport.comments.set("FENCE_B", []);
+    const truth = new MemoryWorkspaceTruth();
+    const fences = ["FENCE_A", "FENCE_B"];
+    return {
+      transport,
+      truth,
+      laneA: new GitHubIssuesProjectsAdapter(config("FENCE_A", fences, onDiagnostic), transport, truth),
+      laneB: new GitHubIssuesProjectsAdapter(config("FENCE_B", fences, onDiagnostic), transport, truth),
+    };
+  }
+
+  test("WIP counts only the claim held on this lane's own fence", async () => {
+    const { transport, laneA, laneB } = lanes();
+    transport.addIssue(1);
+    transport.addIssue(2);
+    const first = await laneA.get("I_1");
+    const claimA = await proposedClaim(laneA, "I_1");
+    expect(await laneA.tryClaim("I_1", first.version, claimA, 1_000)).not.toBeNull();
+
+    expect((await laneA.activeClaims()).map((entry) => entry.issue.id)).toEqual(["I_1"]);
+    expect(await laneB.activeClaims()).toEqual([]);
+
+    const second = await laneB.get("I_2");
+    const claimB = await proposedClaim(laneB, "I_2");
+    expect(await laneB.tryClaim("I_2", second.version, claimB, 1_000)).not.toBeNull();
+    expect((await laneB.activeClaims()).map((entry) => entry.issue.id)).toEqual(["I_2"]);
+  });
+
+  test("startup and ordinary reconciliation leave a foreign claim completely untouched", async () => {
+    const { transport, laneA, laneB } = lanes();
+    transport.addIssue(1);
+    const ready = await laneA.get("I_1");
+    const claim = await proposedClaim(laneA, "I_1");
+    await laneA.tryClaim("I_1", ready.version, claim, 1_000);
+    await laneA.markRunning(claim.fence, 1_100);
+    const issueComments = structuredClone(transport.comments.get("I_1"));
+    const fenceComments = structuredClone(transport.comments.get("FENCE_A"));
+    let craftReads = 0;
+    const scheduler = new DeterministicScheduler(
+      config("FENCE_B", ["FENCE_A", "FENCE_B"]).workflow,
+      {
+        github: laneB,
+        craft: {
+          ensure: async () => { throw new Error("foreign session must not start"); },
+          get: async () => { craftReads += 1; return null; },
+        },
+        workspaces: { ensure: async () => { throw new Error("foreign workspace must not start"); } },
+      },
+      new ManualClock(1_000_000),
+    );
+
+    await scheduler.tick();
+
+    expect(craftReads).toBe(0);
+    expect(await laneB.activeClaims()).toEqual([]);
+    expect((await laneA.get("I_1")).issue.state).toBe("running");
+    expect(transport.comments.get("I_1")).toEqual(issueComments);
+    expect(transport.comments.get("FENCE_A")).toEqual(fenceComments);
+    expect(transport.comments.get("FENCE_B")).toEqual([]);
+  });
+
+  test("two lanes racing the same issue leave one claim there and the loser claims the next candidate", async () => {
+    const { transport, laneA, laneB } = lanes();
+    transport.addIssue(1);
+    transport.addIssue(2);
+    const craft = new FakeCraftAdapter();
+    const workspaces = new FakeWorkspaceAdapter();
+    const starts: { issueId: string; workspacePath: string; branch: string }[] = [];
+    const workspaceAdapter = {
+      ensure: async (identity: Parameters<FakeWorkspaceAdapter["ensure"]>[0], context?: { contract: { requiredBranch: string } }) => {
+        starts.push({ issueId: identity.issueId, workspacePath: identity.workspacePath, branch: context!.contract.requiredBranch });
+        return workspaces.ensure(identity);
+      },
+    };
+    const clock = new ManualClock(1_000);
+    const workflowConfig = config("FENCE_A", ["FENCE_A", "FENCE_B"]).workflow;
+    const schedulerA = new DeterministicScheduler(workflowConfig, { github: laneA, craft, workspaces: workspaceAdapter }, clock);
+    const schedulerB = new DeterministicScheduler(workflowConfig, { github: laneB, craft, workspaces: workspaceAdapter }, clock);
+
+    await Promise.all([schedulerA.tick(), schedulerB.tick()]);
+
+    const snapshots = await laneA.fetchIssuesByStates(["running"]);
+    expect(snapshots.map((entry) => entry.issue.id).sort()).toEqual(["I_1", "I_2"]);
+    expect(snapshots.map((entry) => entry.claim?.attempt)).toEqual([1, 1]);
+    expect(snapshots.map((entry) => entry.events.filter((event) => event.kind === "claim").length)).toEqual([1, 1]);
+    expect((await laneA.activeClaims()).length + (await laneB.activeClaims()).length).toBe(2);
+    expect(new Set(starts.map((start) => start.workspacePath)).size).toBe(2);
+    expect(new Set(starts.map((start) => start.branch)).size).toBe(2);
+  });
+
+  test("a claim held by no configured lane fence is reported and never adopted", async () => {
+    const diagnostics: string[] = [];
+    const transport = new MemoryGitHubTransport();
+    transport.branches.set("main", { name: "main", url: "https://github.test/acme/repo/tree/main", oid: "b".repeat(40) });
+    transport.comments.set("FENCE_OLD", []);
+    transport.comments.set("FENCE_A", []);
+    transport.comments.set("FENCE_B", []);
+    const truth = new MemoryWorkspaceTruth();
+    const oldLane = new GitHubIssuesProjectsAdapter(config("FENCE_OLD"), transport, truth);
+    transport.addIssue(1);
+    const ready = await oldLane.get("I_1");
+    const claim = await proposedClaim(oldLane, "I_1");
+    await oldLane.tryClaim("I_1", ready.version, claim, 1_000);
+    await oldLane.markRunning(claim.fence, 1_100);
+    const currentLane = new GitHubIssuesProjectsAdapter(
+      config("FENCE_A", ["FENCE_A", "FENCE_B"], (message) => diagnostics.push(message)),
+      transport,
+      truth,
+    );
+    const issueComments = structuredClone(transport.comments.get("I_1"));
+
+    expect(await currentLane.activeClaims()).toEqual([]);
+    expect(diagnostics).toEqual([
+      `orphaned claim acme/repo#1 (${claim.fence}) is held by no configured lane fence`,
+    ]);
+    expect(transport.comments.get("I_1")).toEqual(issueComments);
   });
 });
 

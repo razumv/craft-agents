@@ -64,6 +64,7 @@ export type SymphonyRunnerFactory = (config: LiveRunnerConfig) => Promise<Sympho
 
 interface ProjectRuntime {
   config: SymphonyProjectConfig
+  runnerConfig: LiveRunnerConfig | null
   runner: SymphonyRunnerLike | null
   status: SymphonyProjectServiceStatus
 }
@@ -176,6 +177,7 @@ export class NativeSymphonyService implements SymphonyServiceControl {
     for (const project of config.projects) {
       this.#projects.set(project.id, {
         config: project,
+        runnerConfig: null,
         runner: null,
         status: {
           projectId: project.id,
@@ -212,9 +214,29 @@ export class NativeSymphonyService implements SymphonyServiceControl {
     this.#phase = 'reconstructing'
     let reconstructed = 0
     let failed = 0
+    // Load every valid config before constructing any runner. Lanes sharing a
+    // repository need the complete configured fence set to classify claims as
+    // own, foreign, or orphaned; deriving it here keeps runner JSON unchanged.
     for (const runtime of this.#projects.values()) {
       try {
-        const runnerConfig = await loadLiveRunnerConfig(runtime.config.configPath)
+        runtime.runnerConfig = await loadLiveRunnerConfig(runtime.config.configPath)
+      } catch (error) {
+        failed += 1
+        runtime.runnerConfig = null
+        runtime.status = {
+          ...runtime.status,
+          phase: 'error',
+          lastOperation: 'reconstruct',
+          updatedAt: Date.now(),
+          lastError: error instanceof Error ? error.message : String(error),
+        }
+      }
+    }
+    for (const runtime of this.#projects.values()) {
+      const loadedConfig = runtime.runnerConfig
+      if (!loadedConfig) continue
+      try {
+        const runnerConfig = this.#withConfiguredLaneFences(loadedConfig)
         runtime.runner = await this.runnerFactory(runnerConfig)
         const snapshot = await runtime.runner.readStatus()
         const now = Date.now()
@@ -236,6 +258,7 @@ export class NativeSymphonyService implements SymphonyServiceControl {
         reconstructed += 1
       } catch (error) {
         failed += 1
+        runtime.runner = null
         runtime.status = {
           ...runtime.status,
           phase: 'error',
@@ -243,14 +266,8 @@ export class NativeSymphonyService implements SymphonyServiceControl {
           updatedAt: Date.now(),
           lastError: error instanceof Error ? error.message : String(error),
         }
-        // Deliberately not rethrown. A project that failed to reconstruct is
-        // refused per project — #operate has no runner to hand out, so nothing
-        // can tick against durable state we could not read. That is the whole
-        // fail-closed requirement, and it does not need the process to die:
-        // this used to propagate to a process.exit(1), so one transient GitHub
-        // rate limit or network blip took down the entire server — every
-        // session, board and workspace with it — and one unreachable
-        // repository blocked the other projects that had reconstructed fine.
+        // Deliberately not rethrown. One malformed or unreachable lane must not
+        // take the other repositories out of the native service.
       }
     }
 
@@ -262,6 +279,18 @@ export class NativeSymphonyService implements SymphonyServiceControl {
     if (this.#accepting && this.config.loop?.enabled) this.#scheduleLoop()
     if (failed > 0) this.#scheduleReconstructRetry()
     return this.status()
+  }
+
+  #withConfiguredLaneFences(config: LiveRunnerConfig): LiveRunnerConfig {
+    const repository = config.github?.repository
+    const fences = [...new Set(
+      [...this.#projects.values()]
+        .map((runtime) => runtime.runnerConfig)
+        .filter((candidate): candidate is LiveRunnerConfig => Boolean(repository) && candidate?.github?.repository === repository)
+        .map((candidate) => candidate.claimFenceIssueId),
+    )].sort()
+    if (!fences.includes(config.claimFenceIssueId)) fences.push(config.claimFenceIssueId)
+    return { ...config, configuredClaimFenceIssueIds: fences }
   }
 
   /** Whether the service is shutting down. A method, so narrowing never elides a re-check after an await. */
@@ -289,7 +318,24 @@ export class NativeSymphonyService implements SymphonyServiceControl {
     for (const runtime of pending) {
       if (this.#shuttingDown()) return
       try {
-        const runnerConfig = await loadLiveRunnerConfig(runtime.config.configPath)
+        runtime.runnerConfig = await loadLiveRunnerConfig(runtime.config.configPath)
+      } catch (error) {
+        runtime.runnerConfig = null
+        runtime.runner = null
+        runtime.status = {
+          ...runtime.status,
+          phase: 'error',
+          lastOperation: 'reconstruct',
+          updatedAt: Date.now(),
+          lastError: error instanceof Error ? error.message : String(error),
+        }
+      }
+    }
+    for (const runtime of pending) {
+      if (this.#shuttingDown()) return
+      if (!runtime.runnerConfig) continue
+      try {
+        const runnerConfig = this.#withConfiguredLaneFences(runtime.runnerConfig)
         runtime.runner = await this.runnerFactory(runnerConfig)
         const snapshot = await runtime.runner.readStatus()
         const now = Date.now()
@@ -310,6 +356,7 @@ export class NativeSymphonyService implements SymphonyServiceControl {
         }
         recovered += 1
       } catch (error) {
+        runtime.runner = null
         runtime.status = {
           ...runtime.status,
           phase: 'error',
