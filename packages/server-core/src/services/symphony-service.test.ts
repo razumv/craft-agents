@@ -343,6 +343,41 @@ describe('NativeSymphonyService autonomous loop', () => {
     await service.stop()
   })
 
+  it("one project's tick error does not stop the next project's dispatch in the same cycle", async () => {
+    const alphaPath = await runnerConfigPath()
+    const betaPath = await runnerConfigPath()
+    const calls: string[] = []
+    let factoryIndex = 0
+    const makeRunner = (project: 'alpha' | 'beta'): SymphonyRunnerLike => ({
+      async preflight() { return { valid: true } },
+      async readStatus() { return { durable: project } },
+      async projectDesk() { return { compact: project } },
+      async shadow() { return shadowReceipt },
+      async tick() {
+        calls.push(`dispatch:${project}`)
+        if (project === 'alpha') throw new Error('grooming exploded')
+        return { durable: 'beta-dispatched' }
+      },
+    })
+    const service = new NativeSymphonyService({
+      version: 1,
+      enabled: true,
+      stopTimeoutMs: 25,
+      projects: [{ id: 'alpha', configPath: alphaPath }, { id: 'beta', configPath: betaPath }],
+      loop: { enabled: true, mode: 'tick', intervalMs: 5, maxConsecutiveErrors: 3 },
+    }, alphaPath, async () => makeRunner(factoryIndex++ === 0 ? 'alpha' : 'beta'))
+
+    await service.start()
+    await new Promise((resolve) => setTimeout(resolve, 40))
+
+    expect(calls[0]).toBe('dispatch:alpha')
+    expect(calls[1]).toBe('dispatch:beta')
+    expect(service.status().projects.find((project) => project.projectId === 'beta')).toMatchObject({
+      phase: 'ready', snapshot: { durable: 'beta-dispatched' },
+    })
+    await service.stop()
+  })
+
   it('clears the drop as soon as one retry succeeds', async () => {
     const path = await runnerConfigPath()
     let shadows = 0

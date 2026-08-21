@@ -134,6 +134,9 @@ class SystemClock implements Clock {
 
 /** One explicitly scoped live composition. No provider is touched until a method is called. */
 export class LiveV4Runner {
+  /** Refusals are revision-scoped: the same issue is reconsidered only after GitHub reports it changed. */
+  readonly #groomingRefusals = new Map<string, string>();
+
   constructor(
     readonly config: LiveRunnerConfig,
     readonly workflow: WorkflowConfig,
@@ -148,6 +151,8 @@ export class LiveV4Runner {
      * simulators can build a runner from bare adapters.
      */
     readonly readScope?: { clear(): void },
+    /** Non-fatal autonomous decisions must remain visible without failing a cycle. */
+    readonly onDiagnostic: (message: string) => void = (message) => console.warn(`[symphony] ${message}`),
   ) {}
 
   /**
@@ -202,8 +207,50 @@ export class LiveV4Runner {
 
   async tick(crashAfter?: CrashPoint): Promise<LiveRunnerStatus> {
     this.#beginOperation();
+    // Dispatch always gets first refusal: an existing ready issue must consume
+    // the lane before autonomous grooming is even considered.
     await this.scheduler.tick(crashAfter);
-    return this.readStatus();
+    await this.#groomIdleLaneAfterDispatch();
+    return this.#readStatusInScope();
+  }
+
+  /**
+   * At most one backlog candidate is considered after dispatch. Every failure
+   * is diagnostic-only: a broken grooming read/write cannot fail this lane's
+   * scheduler tick or prevent the service from dispatching the next project.
+   */
+  async #groomIdleLaneAfterDispatch(): Promise<void> {
+    if (this.config.mode !== "discovery") return;
+    try {
+      const [active, ready] = await Promise.all([
+        this.tracker.activeClaims(),
+        this.tracker.fetchIssuesByStates(["ready"]),
+      ]);
+      if (active.length > 0 || ready.length > 0) return;
+
+      const backlog = await this.tracker.fetchBacklog();
+      const revisions = new Map(backlog.map((candidate) => [candidate.id, groomingRevision(candidate)]));
+      for (const [issueId, refusedRevision] of this.#groomingRefusals) {
+        const current = revisions.get(issueId);
+        if (current === undefined || current !== refusedRevision) this.#groomingRefusals.delete(issueId);
+      }
+      const eligible = backlog.filter((candidate) => this.#groomingRefusals.get(candidate.id) !== revisions.get(candidate.id));
+      const proposal = proposeBacklogGrooming(this.config.github.repository, eligible, this.workflow);
+      if (proposal.outcome === "refused") {
+        if (proposal.candidate) {
+          this.#groomingRefusals.set(proposal.candidate.id, groomingRevision(proposal.candidate));
+          this.onDiagnostic(`grooming refused ${proposal.candidate.identifier}: ${proposal.refusal.message}`);
+        }
+        return;
+      }
+
+      const report = await this.tracker.applyGrooming(proposal);
+      if (report.outcome === "failed") {
+        this.onDiagnostic(`grooming failed ${report.issueIdentifier} at ${report.step}: ${report.error}`);
+      }
+    } catch (error) {
+      this.onDiagnostic(`grooming failed before apply: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
 
   /** The one explicitly pinned issue id; only meaningful in issue mode. */
@@ -627,6 +674,12 @@ export function contractIssueBody(
     "",
     "Created from the Craft Symphony board.",
   ].join("\n");
+}
+
+function groomingRevision(candidate: TrackerBacklogIssue): string {
+  // updatedAt is the provider's issue-change token. The content hash keeps the
+  // fail-closed behavior for providers/fixtures that cannot supply one.
+  return candidate.updatedAt ?? createHash("sha256").update(canonicalJson(candidate)).digest("hex");
 }
 
 function canonicalJson(value: unknown): string {

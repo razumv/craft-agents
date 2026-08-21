@@ -1,6 +1,6 @@
 # Incremental repository scan measurement
 
-Measured on 2026-08-21 against `razumv/lineage2-classic-ue`, the largest repository in the fleet. GitHub reported **580 issues**, satisfying the greater-than-500 requirement; 424 were open backlog issues during the run.
+Measured on 2026-08-21 against `razumv/lineage2-classic-ue`, the largest repository in the fleet. GitHub reported **581 issues**, satisfying the greater-than-500 requirement; 424 were open backlog issues during the run.
 
 ## Exact command
 
@@ -17,7 +17,7 @@ The harness runs the same adapter instance twice. The first tick has no in-memor
 ```json
 {
   "repository": "razumv/lineage2-classic-ue",
-  "issueCount": 580,
+  "issueCount": 581,
   "cold": {
     "label": "before / cold full scan",
     "providerCost": 438,
@@ -26,27 +26,33 @@ The harness runs the same adapter instance twice. The first tick has no in-memor
     "backlogIssues": 424
   },
   "warm": {
-    "label": "after / incremental scan",
-    "providerCost": 2,
-    "providerQueries": 1,
+    "label": "after / incremental scan + idle grooming decision",
+    "providerCost": 3,
+    "providerQueries": 2,
     "managedIssues": 0,
-    "backlogIssues": 424
+    "backlogIssues": 424,
+    "groomingDecision": {
+      "outcome": "refused",
+      "candidate": "razumv/lineage2-classic-ue#45",
+      "addedProviderCost": 0
+    }
   }
 }
 ```
 
 - **Before:** 438 GraphQL points per tick.
-- **After:** 2 GraphQL points per unchanged tick.
-- **Saving:** 436 points, or **99.54%**.
+- **After:** 3 GraphQL points for the measured warm tick.
+- **Saving:** 435 points, or **99.32%**.
+- **Grooming decision added cost:** **0 GraphQL points per lane**. It reuses the backlog observation the discovery status already paid for; the proposal builder is pure and has no transport capability.
 
 The saving is much larger than half. This is a successful reduction, not a marginal result.
 
 At the configured 30-minute cadence, the measured unchanged steady-state cost for a full eight-project fleet cycle is:
 
-- 2 points/project × 8 projects = **16 points per cycle**
-- 16 points/cycle × 2 cycles/hour = **32 GraphQL points per hour**
+- 3 points/project × 8 projects = **24 points per cycle**
+- 24 points/cycle × 2 cycles/hour = **48 GraphQL points per hour**
 
-That 32-point figure is the unchanged-repository floor demonstrated by this measurement. A changed issue or an issue holding a claim intentionally adds its own refresh/hydration cost; active claims are never hidden behind the watermark.
+That 48-point figure is the warm-repository floor demonstrated by this measurement. The autonomous grooming decision adds zero points to it. A successful application is intentionally not performed by this read-cost harness because it would mutate a real backlog issue; its bounded write contract remains the separately tested four writes (body, attribution, configured ready status, then ready label). A changed issue or an issue holding a claim intentionally adds its own refresh/hydration cost; active claims are never hidden behind the watermark.
 
 ## Correctness boundary
 

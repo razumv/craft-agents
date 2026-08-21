@@ -7,6 +7,7 @@ import {
   ReadScopeGitHubTransport,
   lifecycleStates,
   loadWorkflow,
+  proposeBacklogGrooming,
   type LifecycleState,
   type WorkspaceTruthReader,
 } from "../src";
@@ -17,6 +18,7 @@ if (!repository || repository.split("/").length !== 2) {
 }
 
 const workflow = (await loadWorkflow(resolve(import.meta.dir, "../tests/fixtures/WORKFLOW.md"))).config;
+const laneWorkflow = { ...workflow, project: { ...workflow.project, repository } };
 const states = Object.fromEntries(lifecycleStates.map((state) => [state, {
   // The production fleet's compact projection. A repository with managed work
   // will hydrate it; an unmanaged repository still measures its full backlog.
@@ -39,7 +41,7 @@ const adapter = new GitHubIssuesProjectsAdapter({
   gateFieldId: "unused-measurement-gate",
   requiredLabels: ["v4"],
   states,
-  workflow: { ...workflow, project: { ...workflow.project, repository } },
+  workflow: laneWorkflow,
 }, scoped, truth);
 
 async function ghJson<T>(args: readonly string[]): Promise<T> {
@@ -64,7 +66,7 @@ async function issueCount(): Promise<number> {
   return Number(value);
 }
 
-async function tick(label: string) {
+async function tick(label: string, measureGrooming = false) {
   scoped.clear();
   measuredCost = 0;
   measuredQueries = 0;
@@ -72,6 +74,10 @@ async function tick(label: string) {
     adapter.fetchIssuesByStates(lifecycleStates),
     adapter.fetchBacklog(),
   ]);
+  const beforeGrooming = measuredCost;
+  const grooming = measureGrooming
+    ? proposeBacklogGrooming(repository, backlog, laneWorkflow)
+    : null;
   return {
     label,
     // Each provider request carries its own `rateLimit.cost`; summing those
@@ -80,6 +86,15 @@ async function tick(label: string) {
     providerQueries: measuredQueries,
     managedIssues: managed.length,
     backlogIssues: backlog.length,
+    ...(grooming ? {
+      groomingDecision: {
+        outcome: grooming.outcome,
+        candidate: grooming.candidate?.identifier ?? null,
+        // The live loop reuses this already-paid backlog observation after
+        // dispatch; the pure proposal step has no transport capability.
+        addedProviderCost: measuredCost - beforeGrooming,
+      },
+    } : {}),
   };
 }
 
@@ -87,5 +102,5 @@ console.log(JSON.stringify({
   repository,
   issueCount: await issueCount(),
   cold: await tick("before / cold full scan"),
-  warm: await tick("after / incremental scan"),
+  warm: await tick("after / incremental scan + idle grooming decision", true),
 }, null, 2));

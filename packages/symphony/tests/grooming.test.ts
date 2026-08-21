@@ -101,7 +101,7 @@ class ApplyingTransport implements GitHubTransport {
   readonly comments: string[] = [];
   labels: string[];
   statusOptionId = "option:backlog";
-  failAt: "body" | "conflict" | "readback" | "attribution" | "status" | "label" | null = null;
+  failAt: "baseline" | "body" | "conflict" | "readback" | "attribution" | "status" | "label" | null = null;
   private nodeReads = 0;
 
   constructor(readonly record: GitHubIssueRecord) {
@@ -130,7 +130,11 @@ class ApplyingTransport implements GitHubTransport {
   listComments(): Promise<Page<GitHubComment>> { return this.page([]); }
   listClosingPullRequests(): Promise<Page<never>> { return this.page([]); }
   getBranch(): Promise<null> { return Promise.resolve(null); }
-  getBaseSha(): Promise<string> { this.calls.push("read-baseline"); return Promise.resolve("b".repeat(40)); }
+  getBaseSha(): Promise<string> {
+    this.calls.push("read-baseline");
+    if (this.failAt === "baseline") return Promise.reject(new Error("baseline unreadable"));
+    return Promise.resolve("b".repeat(40));
+  }
   containsCommit(): Promise<boolean> { return Promise.resolve(true); }
   mergePullRequest(): Promise<void> { return Promise.resolve(); }
   async updateIssueBody(_repository: string, _number: number, body: string, expectedUpdatedAt: string): Promise<boolean> {
@@ -267,6 +271,19 @@ describe("grooming apply", () => {
     expect(transport.calls.filter((call) => call.startsWith("WRITE:"))).toEqual([]);
   });
 
+  test("an unreadable repository baseline is skipped before any grooming write", async () => {
+    const proposed = proposal();
+    if (proposed.outcome !== "proposed") throw new Error("fixture must propose");
+    const [adapter, transport] = applyingAdapter(proposed.candidate);
+    transport.failAt = "baseline";
+
+    const report = await adapter.applyGrooming(proposed);
+
+    expect(report).toMatchObject({ outcome: "failed", step: "preflight", writes: 0, error: "baseline unreadable" });
+    expect(transport.calls.filter((call) => call.startsWith("WRITE:"))).toEqual([]);
+    expect(transport.record.body).toBe(proposed.candidate.description);
+  });
+
   test("every failed write is named and the issue is never labelled claimable", async () => {
     const proposed = proposal();
     if (proposed.outcome !== "proposed") throw new Error("fixture must propose");
@@ -284,6 +301,103 @@ describe("grooming apply", () => {
       if (step !== "body") expect(parseIssueContract(transport.record.body, proposed.candidate.identifier, workflow)).toEqual(proposed.contract);
       expect((await adapter.fetchBacklog()).map((entry) => entry.identifier)).toEqual([proposed.candidate.identifier]);
     }
+  });
+});
+
+describe("autonomous idle-lane grooming", () => {
+  function autonomousRunner(options: {
+    backlog?: TrackerBacklogIssue[];
+    active?: boolean;
+    ready?: boolean;
+    apply?: (candidate: TrackerBacklogIssue) => Promise<unknown>;
+    calls?: string[];
+    diagnostics?: string[];
+  } = {}) {
+    const calls = options.calls ?? [];
+    const diagnostics = options.diagnostics ?? [];
+    const tracker = {
+      activeClaims: async () => options.active ? [{}] : [],
+      fetchIssuesByStates: async (states: readonly LifecycleState[]) => {
+        if (states.length === 1 && states[0] === "ready") return options.ready ? [{}] : [];
+        return [];
+      },
+      fetchBacklog: async () => options.backlog ?? [],
+      applyGrooming: async (candidateProposal: ReturnType<typeof proposeBacklogGrooming>) => {
+        calls.push(`apply:${candidateProposal.candidate?.identifier}`);
+        if (candidateProposal.candidate) await options.apply?.(candidateProposal.candidate);
+        return { outcome: "applied", writes: 4, issueIdentifier: candidateProposal.candidate?.identifier, baselineSha: "b".repeat(40) };
+      },
+    } as unknown as GitHubIssuesProjectsAdapter;
+    const scheduler = {
+      tick: async () => { calls.push("dispatch"); },
+    } as unknown as DeterministicScheduler;
+    return {
+      calls,
+      diagnostics,
+      runner: new LiveV4Runner(
+        { mode: "discovery", github: { repository: "acme/repo", states: adapterConfig().states } } as LiveRunnerConfig,
+        workflow,
+        tracker,
+        {} as CraftMobileControlPlaneAdapter,
+        {} as CraftCliRpcTransport,
+        scheduler,
+        undefined,
+        undefined,
+        undefined,
+        (message) => diagnostics.push(message),
+      ),
+    };
+  }
+
+  test("dispatch runs first and claimable work prevents grooming", async () => {
+    const { runner, calls } = autonomousRunner({ active: true, backlog: [issue()] });
+
+    await runner.tick();
+
+    expect(calls).toEqual(["dispatch"]);
+  });
+
+  test("several eligible candidates still apply exactly one proposal per cycle", async () => {
+    const candidates = [
+      issue({ id: "I_3", identifier: "acme/repo#3", number: 3, priority: 3 }),
+      issue({ id: "I_1", identifier: "acme/repo#1", number: 1, priority: 1 }),
+      issue({ id: "I_2", identifier: "acme/repo#2", number: 2, priority: 2 }),
+    ];
+    const { runner, calls } = autonomousRunner({ backlog: candidates });
+
+    await runner.tick();
+
+    expect(calls).toEqual(["dispatch", "apply:acme/repo#1"]);
+  });
+
+  test("a refusal is attempted once until that exact issue revision changes", async () => {
+    const candidate = issue({
+      updatedAt: "2026-08-02T00:00:00Z",
+      description: "## Acceptance Criteria\n- Improve it better.\n\n## Non-goals\n- Writes.",
+    });
+    const { runner, calls, diagnostics } = autonomousRunner({ backlog: [candidate] });
+
+    await runner.tick();
+    await runner.tick();
+
+    expect(calls).toEqual(["dispatch", "dispatch"]);
+    expect(diagnostics).toHaveLength(1);
+    expect(diagnostics[0]).toContain("grooming refused acme/repo#1");
+
+    candidate.updatedAt = "2026-08-03T00:00:00Z";
+    await runner.tick();
+    expect(diagnostics).toHaveLength(2);
+  });
+
+  test("a grooming exception is logged but does not fail the scheduler tick", async () => {
+    const { runner, calls, diagnostics } = autonomousRunner({
+      backlog: [issue()],
+      apply: async () => { throw new Error("grooming exploded"); },
+    });
+
+    await expect(runner.tick()).resolves.toMatchObject({ statuses: [], backlog: expect.any(Array) });
+    expect(calls).toEqual(["dispatch", "apply:acme/repo#1"]);
+    expect(diagnostics).toEqual(["grooming failed before apply: grooming exploded"]);
   });
 });
 
