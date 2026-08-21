@@ -413,9 +413,13 @@ export class GhCliTransport implements GitHubTransport {
       if (exitCode === 0) return stdout;
       const diagnostic = stderr.trim() || "no diagnostic";
       lastError = new Error(`gh command failed (${exitCode}): ${diagnostic}`);
-      if (!isTransientTransportFailure(diagnostic)) throw lastError;
+      const failure = classifyTransportFailure(diagnostic);
+      if (failure === "verdict" || failure === "primary-rate-limit") throw lastError;
       if (attempt === GITHUB_READ_ATTEMPTS) break;
-      await new Promise((resolve) => setTimeout(resolve, GITHUB_RETRY_BASE_MS * 2 ** (attempt - 1)));
+      // A burst guard needs tens of seconds, not one; a dropped connection needs
+      // barely any. Waiting a second on a secondary limit just spends an attempt.
+      const base = failure === "secondary-rate-limit" ? GITHUB_SECONDARY_BASE_MS : GITHUB_RETRY_BASE_MS;
+      await new Promise((resolve) => setTimeout(resolve, base * 2 ** (attempt - 1)));
     }
     throw lastError ?? new Error("gh command failed with no diagnostic");
   }
@@ -427,6 +431,33 @@ const GITHUB_NODE_IDS_PER_REQUEST = 100;
 /** Attempts for one read, including the first. */
 const GITHUB_READ_ATTEMPTS = 3;
 const GITHUB_RETRY_BASE_MS = 1_000;
+/** GitHub's burst guard clears in tens of seconds, so the first wait matches that. */
+const GITHUB_SECONDARY_BASE_MS = 20_000;
+
+/**
+ * How a failed `gh` invocation should be treated.
+ *
+ * `primary` is the hourly points budget. It will not change within seconds, so
+ * retrying spends nothing but time and delays the only recovery there is.
+ *
+ * `secondary` is GitHub's burst and concurrency guard, and it is a different
+ * animal: it clears in tens of seconds, and it is what a repository-wide scan of
+ * 580 issues actually trips. It surfaced as both "You have exceeded a secondary
+ * rate limit" and, confusingly, as a generic HTTP 400 "malformed request" whose own
+ * text asks the client to resubmit — which is why lineage-client looked like it was
+ * sending a bad query when it was only asking too fast.
+ *
+ * `transient` is a request that never reached a verdict at all.
+ */
+type TransportFailure = "primary-rate-limit" | "secondary-rate-limit" | "transient" | "verdict";
+
+function classifyTransportFailure(diagnostic: string): TransportFailure {
+  if (/secondary rate limit/i.test(diagnostic)) return "secondary-rate-limit";
+  if (/please try resubmitting your request/i.test(diagnostic)) return "secondary-rate-limit";
+  if (/rate limit/i.test(diagnostic)) return "primary-rate-limit";
+  if (isTransientTransportFailure(diagnostic)) return "transient";
+  return "verdict";
+}
 
 /**
  * Whether a failed `gh` invocation says the request never reached a verdict.
