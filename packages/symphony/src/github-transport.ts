@@ -198,6 +198,19 @@ export class GhCliTransport implements GitHubTransport {
 
   async getIssuesByNodeIds(ids: readonly string[]): Promise<(GitHubIssueRecord | null)[]> {
     if (ids.length === 0) return [];
+    // GitHub answers at most a hundred node ids per request and rejects the whole
+    // call beyond that — razumv/lineage2-classic-ue has 579 issues, and asking for
+    // all of them at once returned "We received a malformed request from your
+    // client (HTTP 400)", which failed the project's reconstruction outright. The
+    // chunks are requested in order and concatenated, so the caller still gets one
+    // answer per id in the order it asked.
+    if (ids.length > GITHUB_NODE_IDS_PER_REQUEST) {
+      const answers: (GitHubIssueRecord | null)[] = [];
+      for (let start = 0; start < ids.length; start += GITHUB_NODE_IDS_PER_REQUEST) {
+        answers.push(...await this.getIssuesByNodeIds(ids.slice(start, start + GITHUB_NODE_IDS_PER_REQUEST)));
+      }
+      return answers;
+    }
     const data = await this.graphql<{ nodes: ({
       id: string; number: number; title: string; body: string; url: string; state: "OPEN" | "CLOSED";
       createdAt: string; updatedAt: string; assignees: { nodes: { id: string }[] };
@@ -407,6 +420,9 @@ export class GhCliTransport implements GitHubTransport {
     throw lastError ?? new Error("gh command failed with no diagnostic");
   }
 }
+
+/** GitHub's own ceiling on `nodes(ids:)` per request. */
+const GITHUB_NODE_IDS_PER_REQUEST = 100;
 
 /** Attempts for one read, including the first. */
 const GITHUB_READ_ATTEMPTS = 3;
