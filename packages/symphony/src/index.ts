@@ -4,6 +4,7 @@ export * from "./adapters";
 export * from "./contract";
 export * from "./craft-adapter";
 export * from "./craft-transport";
+export * from "./deadline-triage";
 export * from "./domain";
 export * from "./github-adapter";
 export * from "./github-transport";

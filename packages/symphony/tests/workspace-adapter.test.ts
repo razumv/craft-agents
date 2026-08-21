@@ -221,6 +221,11 @@ describe("v4 live git worktree adapter", () => {
     const info = preserved[0]!;
     expect(info.attempt).toBe(1);
     expect(info.preservedBranch).toStartWith("v4-preserved/v4-razumv-craft-protocol-52-a1-");
+    await git(first.root, ["branch", `${info.preservedBranch}-unrelated`, info.commit]);
+    expect(await first.adapter.findPreservedBranches(first.context.contract.requiredBranch)).toEqual([{
+      branch: info.preservedBranch,
+      commit: info.commit,
+    }]);
     const files = await git(first.root, ["show", "--name-only", "--format=", info.commit]);
     expect(files).toContain("worker-output.txt");
     const content = await git(first.root, ["show", `${info.commit}:worker-output.txt`]);
