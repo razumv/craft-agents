@@ -140,6 +140,9 @@ export class NativeSymphonyService implements SymphonyServiceControl {
    * to hammer a provider that is rate-limiting us, short enough that a blip
    * heals well inside a GitHub rate-limit window.
    */
+  /** Longest a repeatedly failing project stays quiet between loop retries. */
+  private static readonly MAX_DROPPED_QUIET_CYCLES = 8
+
   private static readonly RECONSTRUCT_RETRY_MS = 60_000
 
   readonly #projects = new Map<string, ProjectRuntime>()
@@ -153,7 +156,7 @@ export class NativeSymphonyService implements SymphonyServiceControl {
   #loopLastCycleAt: number | null = null
   #loopCycleActive = false
   readonly #loopErrors = new Map<string, number>()
-  readonly #loopDropped = new Set<string>()
+  readonly #loopDropped = new Map<string, { cycles: number }>()
   readonly #listeners = new Set<(projectId: string, operation: SymphonyOperationResult['operation']) => void>()
 
   constructor(
@@ -353,7 +356,19 @@ export class NativeSymphonyService implements SymphonyServiceControl {
       for (const runtime of this.#projects.values()) {
         if (!this.#accepting) break
         const projectId = runtime.config.id
-        if (this.#loopDropped.has(projectId)) continue
+        // A dropped project is paused, not banished. It went quiet because it
+        // failed maxConsecutiveErrors cycles in a row, and the cause is usually
+        // transient — one HTTP 499 from a slow repository read took lineage-client
+        // out of the loop for a whole night, while the repository itself was fine
+        // the entire time. So a dropped project is retried after a widening gap,
+        // and one success clears the drop completely.
+        const dropped = this.#loopDropped.get(projectId)
+        if (dropped) {
+          if (dropped.cycles > 0) {
+            this.#loopDropped.set(projectId, { cycles: dropped.cycles - 1 })
+            continue
+          }
+        }
         if (!runtime.runner || runtime.status.phase === 'running') continue
         try {
           if (loop.mode === 'tick') {
@@ -370,10 +385,18 @@ export class NativeSymphonyService implements SymphonyServiceControl {
             await this.refresh(projectId)
           }
           this.#loopErrors.delete(projectId)
+          this.#loopDropped.delete(projectId)
         } catch {
           const errors = (this.#loopErrors.get(projectId) ?? 0) + 1
           this.#loopErrors.set(projectId, errors)
-          if (errors >= loop.maxConsecutiveErrors) this.#loopDropped.add(projectId)
+          if (errors >= loop.maxConsecutiveErrors) {
+            // Back off by doubling the quiet cycles each time the retry fails
+            // again, capped, so a genuinely broken project costs almost nothing
+            // while a transient one recovers on its own.
+            const previous = dropped?.cycles ?? 0
+            const next = Math.min(previous === 0 ? 1 : previous * 2, NativeSymphonyService.MAX_DROPPED_QUIET_CYCLES)
+            this.#loopDropped.set(projectId, { cycles: next })
+          }
         }
       }
       this.#loopCycles += 1
@@ -547,7 +570,7 @@ export class NativeSymphonyService implements SymphonyServiceControl {
             intervalMs: this.config.loop.intervalMs,
             cycles: this.#loopCycles,
             lastCycleAt: this.#loopLastCycleAt,
-            droppedProjects: [...this.#loopDropped],
+            droppedProjects: [...this.#loopDropped.keys()],
           }
         : null,
     }

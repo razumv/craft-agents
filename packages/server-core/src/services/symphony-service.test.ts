@@ -343,6 +343,35 @@ describe('NativeSymphonyService autonomous loop', () => {
     await service.stop()
   })
 
+  it('clears the drop as soon as one retry succeeds', async () => {
+    const path = await runnerConfigPath()
+    let shadows = 0
+    let failing = true
+    const runner: SymphonyRunnerLike = {
+      async preflight() { return { valid: true } },
+      async readStatus() { return { durable: 'same' } },
+      async projectDesk() { return { compact: 'Project Desk' } },
+      async shadow() {
+        shadows += 1
+        if (failing) throw new Error('provider offline')
+        return { receipt: 'ok' }
+      },
+      async tick() { return { mutated: true } },
+    }
+    const service = new NativeSymphonyService(loopConfig(path, { maxConsecutiveErrors: 2 }), path, async () => runner)
+    await service.start()
+    await new Promise((resolve) => setTimeout(resolve, 40))
+    expect(service.status().loop!.droppedProjects).toEqual(['alpha'])
+
+    // The provider comes back. The project must return to the loop by itself —
+    // recovering should not need a restart.
+    failing = false
+    await new Promise((resolve) => setTimeout(resolve, 120))
+    expect(service.status().loop!.droppedProjects).toEqual([])
+    expect(service.status().projects[0]).toMatchObject({ phase: 'ready', lastError: null })
+    await service.stop()
+  })
+
   it('drops a project after maxConsecutiveErrors and stop cancels the loop', async () => {
     const path = await runnerConfigPath()
     let shadows = 0
@@ -358,8 +387,15 @@ describe('NativeSymphonyService autonomous loop', () => {
     await new Promise((resolve) => setTimeout(resolve, 60))
     const status = service.status()
     expect(status.loop!.droppedProjects).toEqual(['alpha'])
-    expect(shadows).toBe(2)
     expect(status.projects[0]).toMatchObject({ phase: 'error', lastError: 'provider offline' })
+    // Dropped means paused, not banished: it keeps being retried across a
+    // widening gap rather than being attempted twice and abandoned. One HTTP 499
+    // from a slow repository read took a project out of the loop for a whole
+    // night, and the repository was fine the entire time.
+    const afterDrop = shadows
+    expect(afterDrop).toBeGreaterThan(2)
+    await new Promise((resolve) => setTimeout(resolve, 60))
+    expect(shadows).toBeGreaterThan(afterDrop)
 
     await service.stop()
     const cyclesAtStop = service.status().loop!.cycles
