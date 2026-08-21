@@ -58,8 +58,10 @@ class MemoryCraftTransport implements CraftRpcTransport {
   cancellationSticky = false;
   createCount = 0;
   promptCount = 0;
+  identityCount = 0;
 
   async identity(): Promise<CraftRuntimeIdentity> {
+    this.identityCount += 1;
     return clone(this.identityValue);
   }
 
@@ -455,6 +457,59 @@ describe("v4.3 Craft mobile control-plane adapter", () => {
       issueId: issue.id,
       ...late,
     })).rejects.toThrow("deadline");
+  });
+
+  test("polls exact addressed instructions once and leaves ordinary conversation untouched", async () => {
+    const { adapter, transport } = adapterFixture();
+    directOwnerMessage(transport, "owner-conversation", "I wonder whether this needs a smaller scope.", transport.now - 10_000);
+    directOwnerMessage(
+      transport,
+      "owner-directive-polled",
+      `DIRECTIVE ${issue.identifier}: Do not touch production.`,
+      transport.now - 10_000,
+    );
+    const targets = [{ issueId: issue.id, issueIdentifier: issue.identifier }];
+
+    const beforeFirst = transport.identityCount + transport.calls.length;
+    const first = await adapter.pollOwnerDesk(targets);
+    const afterFirst = transport.identityCount + transport.calls.length;
+    const second = await adapter.pollOwnerDesk(targets);
+    const afterSecond = transport.identityCount + transport.calls.length;
+
+    expect(first).toMatchObject({ providerReadCalls: 5, providerWriteCalls: 1 });
+    expect(afterFirst - beforeFirst).toBe(6);
+    expect(afterSecond - afterFirst).toBe(4);
+    expect(second).toMatchObject({ providerReadCalls: 4, providerWriteCalls: 0 });
+    expect(first.directives).toHaveLength(1);
+    expect(first.directives[0]).toMatchObject({ newlyIngested: true, directive: { issueId: issue.id, verbatim: "Do not touch production." } });
+    expect(second.directives).toHaveLength(1);
+    expect(second.directives[0]!.newlyIngested).toBe(false);
+    expect(adapter.directives.entries()).toHaveLength(1);
+    expect(transport.notes.match(/craft-protocol-v4:owner-directive/g)).toHaveLength(1);
+    expect(transport.notes).not.toContain("smaller scope");
+  });
+
+  test("refuses any non-configured source and states a stale gate mismatch", async () => {
+    const { adapter, transport } = adapterFixture();
+    transport.sessions.push({
+      id: "other-session", workspaceId: "general", projectId: "craft-protocol-v4",
+      messages: [{ id: "foreign", role: "user", content: "Do this.", timestamp: transport.now }], isProcessing: false,
+    });
+    await expect(adapter.ingestOwnerDirective({
+      id: "foreign-directive",
+      issueId: issue.id,
+      sourceSessionId: "other-session",
+      sourceMessageId: "foreign",
+      receivedAtMs: transport.now,
+      verbatim: "Do this.",
+    })).rejects.toThrow("owner directive source is not the configured direct-owner desk");
+
+    directOwnerMessage(transport, "stale-gate", "APPROVE gate-old", transport.now);
+    const poll = await adapter.pollOwnerDesk([{ issueId: issue.id, issueIdentifier: issue.identifier, gateId: "gate-current" }]);
+    expect(poll.directives).toHaveLength(0);
+    expect(poll.refusals).toEqual([
+      "Project Desk message stale-gate: owner decision gate gate-old does not match the currently open gate (gate-current)",
+    ]);
   });
 
   test("gate decisions require the exact immutable command", async () => {

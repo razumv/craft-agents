@@ -138,9 +138,35 @@ export interface DirectOwnerDirectiveInput {
   sourceSessionId: string;
   sourceMessageId: string;
   receivedAtMs: number;
+  /** Defaults to receivedAtMs for direct callers; polling preserves the authored timestamp separately. */
+  sourceTimestampMs?: number;
   verbatim: string;
   gateId?: string;
 }
+
+export interface ProjectDeskDirectiveTarget {
+  issueId: string;
+  issueIdentifier: string;
+  gateId?: string;
+}
+
+export interface PolledOwnerDirective {
+  directive: Readonly<OwnerDirective>;
+  gateDecision: OwnerGateDecision | null;
+  newlyIngested: boolean;
+}
+
+export interface ProjectDeskDirectivePoll {
+  directives: PolledOwnerDirective[];
+  refusals: string[];
+  /** 4 unchanged; 5 when exact acknowledgement readback verifies a write. */
+  providerReadCalls: 4 | 5;
+  /** 0 unchanged; one batched notes write for every newly discovered message in the cycle. */
+  providerWriteCalls: 0 | 1;
+}
+
+export const PROJECT_DESK_BASE_PROVIDER_READ_CALLS = 4 as const;
+export const PROJECT_DESK_MAX_PROVIDER_CALLS = 6 as const;
 
 export interface ProjectDeskProjection {
   status: ProjectStatus;
@@ -398,6 +424,94 @@ export class CraftMobileControlPlaneAdapter implements CraftControlAdapter {
     return result.status === "settled" ? result : { ...result, status: "cancelled" };
   }
 
+  /**
+   * Poll the configured Project Desk once and ingest only explicitly addressed commands.
+   *
+   * Generic instructions must be exactly `DIRECTIVE <issue identifier>: <text>`.
+   * Gate commands carry their target in the immutable gate id. Ordinary desk
+   * conversation is ignored, not guessed into the ledger.
+   */
+  async pollOwnerDesk(targets: readonly ProjectDeskDirectiveTarget[]): Promise<ProjectDeskDirectivePoll> {
+    await this.verifyRuntime();
+    await this.verifyOwnerDesk();
+    const ownerDesk = await this.readSession(this.config.ownerSessionId);
+    const durable = await this.loadDirectiveLedger();
+    const directives: PolledOwnerDirective[] = [];
+    const refusals: string[] = [];
+    const additions: OwnerDirective[] = [];
+    const nowMs = this.#now();
+
+    for (const message of messages(ownerDesk).filter((entry) => entry.role === "user" && !entry.hidden)) {
+      const content = message.content;
+      if (!content?.trim()) continue;
+      const classified = classifyProjectDeskMessage(content, targets);
+      if (classified.kind === "conversation") continue;
+      if (classified.kind === "refused") {
+        refusals.push(`Project Desk message ${message.id}: ${classified.reason}`);
+        continue;
+      }
+      const sourceTimestampMs = timestamp(message, Number.NaN);
+      if (!Number.isFinite(sourceTimestampMs)) {
+        refusals.push(`Project Desk message ${message.id}: owner directive source timestamp is absent`);
+        continue;
+      }
+      const id = `directive-${digest(`${this.config.ownerSessionId}\n${message.id}`)}`;
+      const existing = this.directives.get(id);
+      if (existing) {
+        if (
+          existing.issueId !== classified.target.issueId
+          || existing.sourceSessionId !== this.config.ownerSessionId
+          || existing.sourceMessageId !== message.id
+          || existing.sourceTimestampMs !== undefined && existing.sourceTimestampMs !== sourceTimestampMs
+          || existing.verbatim !== classified.verbatim
+        ) throw new Error(`directive ${id} is immutable`);
+        directives.push({
+          directive: existing,
+          gateDecision: classified.gateId ? parseOwnerGateDecision(classified.verbatim, classified.gateId) : null,
+          newlyIngested: false,
+        });
+        continue;
+      }
+      const acknowledgementId = `ack-${digest(`${id}\n${classified.target.issueId}\n${nowMs}\n${classified.verbatim}`)}`;
+      const candidate: OwnerDirective = {
+        id,
+        issueId: classified.target.issueId,
+        receivedAtMs: nowMs,
+        acknowledgedAtMs: nowMs,
+        verbatim: classified.verbatim,
+        sourceSessionId: this.config.ownerSessionId,
+        sourceMessageId: message.id,
+        sourceTimestampMs,
+        acknowledgementId,
+      };
+      additions.push(candidate);
+      directives.push({
+        directive: candidate,
+        gateDecision: classified.gateId ? parseOwnerGateDecision(classified.verbatim, classified.gateId) : null,
+        newlyIngested: true,
+      });
+    }
+
+    if (additions.length > 0) {
+      const latest = additions.at(-1)!;
+      const nextBody = [
+        durable.notes.trim(),
+        "## Latest owner acknowledgement",
+        `ACK ${latest.id} ${latest.acknowledgementId}`,
+        ...additions.map(directiveRecord),
+      ].filter(Boolean).join("\n\n");
+      await this.transport.invoke("sessions:setNotes", [this.config.ownerSessionId, nextBody], this.config.deadlines.rpcMs);
+      await this.verifyDeskNotes(nextBody);
+      for (const addition of additions) this.directives.append(addition);
+    }
+    return {
+      directives,
+      refusals,
+      providerReadCalls: additions.length > 0 ? 5 : PROJECT_DESK_BASE_PROVIDER_READ_CALLS,
+      providerWriteCalls: additions.length > 0 ? 1 : 0,
+    };
+  }
+
   async ingestOwnerDirective(input: DirectOwnerDirectiveInput): Promise<{
     directive: Readonly<OwnerDirective>;
     gateDecision: OwnerGateDecision | null;
@@ -430,7 +544,7 @@ export class CraftMobileControlPlaneAdapter implements CraftControlAdapter {
       sourceMatches.length !== 1
       || sourceMatches[0]!.role !== "user"
       || sourceMatches[0]!.content !== input.verbatim
-      || timestamp(sourceMatches[0], -1) !== input.receivedAtMs
+      || timestamp(sourceMatches[0], -1) !== (input.sourceTimestampMs ?? input.receivedAtMs)
     ) {
       throw new Error("owner directive does not match one exact direct-owner message");
     }
@@ -448,6 +562,7 @@ export class CraftMobileControlPlaneAdapter implements CraftControlAdapter {
       verbatim: input.verbatim,
       sourceSessionId: input.sourceSessionId,
       sourceMessageId: input.sourceMessageId,
+      ...(input.sourceTimestampMs === undefined ? {} : { sourceTimestampMs: input.sourceTimestampMs }),
       acknowledgementId,
     };
     const acknowledgement = `ACK ${input.id} ${acknowledgementId}`;
@@ -733,6 +848,48 @@ export class CraftMobileControlPlaneAdapter implements CraftControlAdapter {
     const inspected = this.inspectSession(priorRun, identity.issueId, identity.attempt - 1, await this.readSession(prior.id), this.#now());
     return `Prior attempt ${identity.attempt - 1} (${priorRun}) ended as ${inspected.status}. Continue only from durable issue/tracker evidence.`;
   }
+}
+
+type ClassifiedDeskMessage =
+  | { kind: "conversation" }
+  | { kind: "refused"; reason: string }
+  | { kind: "directive"; target: ProjectDeskDirectiveTarget; verbatim: string; gateId?: string };
+
+export function classifyProjectDeskMessage(
+  content: string,
+  targets: readonly ProjectDeskDirectiveTarget[],
+): ClassifiedDeskMessage {
+  const directive = /^DIRECTIVE ([^:\n]+): ([\s\S]+)$/.exec(content);
+  if (directive) {
+    const reference = directive[1]!.trim();
+    const targetMatches = targets.filter((target) => target.issueId === reference || target.issueIdentifier === reference);
+    if (targetMatches.length !== 1) {
+      return { kind: "refused", reason: `directive target ${reference} does not match one issue in this lane` };
+    }
+    const verbatim = directive[2]!.trim();
+    if (!verbatim) return { kind: "refused", reason: "directive text is blank" };
+    return { kind: "directive", target: targetMatches[0]!, verbatim };
+  }
+
+  const approve = /^APPROVE (\S+)$/.exec(content);
+  const reject = /^REJECT (\S+): (.+)$/.exec(content);
+  if (approve || reject) {
+    const statedGateId = (approve?.[1] ?? reject?.[1])!;
+    const open = targets.filter((target) => target.gateId);
+    const match = open.filter((target) => target.gateId === statedGateId);
+    if (match.length !== 1) {
+      const current = open.map((target) => target.gateId).join(", ") || "none";
+      return {
+        kind: "refused",
+        reason: `owner decision gate ${statedGateId} does not match the currently open gate (${current})`,
+      };
+    }
+    return { kind: "directive", target: match[0]!, verbatim: content, gateId: statedGateId };
+  }
+  if (/^(?:DIRECTIVE|APPROVE|REJECT)(?:\s|$)/.test(content)) {
+    return { kind: "refused", reason: "owner instruction does not match the exact Project Desk command syntax" };
+  }
+  return { kind: "conversation" };
 }
 
 function parseAttempt(name: string | undefined): number {

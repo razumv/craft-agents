@@ -257,6 +257,92 @@ describe("v4 live runner mutation scope", () => {
     expect(mutations).toBe(0);
   });
 
+  test("an unreadable desk is diagnostic-only while another lane dispatches and records its issue receipt", async () => {
+    const base = transitionFixture("settled").runner;
+    const status = await base.readStatus();
+    const snapshot = structuredClone(status.snapshot!);
+    const directive = {
+      id: "directive-owner-52",
+      issueId: snapshot.issue.id,
+      receivedAtMs: 2_000,
+      acknowledgedAtMs: 2_000,
+      verbatim: "Keep the change bounded.",
+      sourceSessionId: "owner-desk",
+      sourceMessageId: "owner-message-52",
+      sourceTimestampMs: 1_500,
+      acknowledgementId: "ack-owner-52",
+    };
+    let unreadableDispatches = 0;
+    let healthyDispatches = 0;
+    const receipts: string[] = [];
+    const tracker = {
+      get: async () => structuredClone(snapshot),
+      recordOwnerDirective: async (entry: typeof directive) => { receipts.push(`${entry.issueId}:${entry.verbatim}`); return { recorded: true }; },
+    } as unknown as GitHubIssuesProjectsAdapter;
+    const unreadableCraft = {
+      pollOwnerDesk: async () => { throw new Error("desk unavailable"); },
+      get: async () => structuredClone(status.execution),
+    } as unknown as CraftMobileControlPlaneAdapter;
+    const healthyCraft = {
+      pollOwnerDesk: async () => ({
+        directives: [{ directive, gateDecision: null, newlyIngested: true }], refusals: [],
+        providerReadCalls: 5 as const, providerWriteCalls: 1 as const,
+      }),
+      get: async () => structuredClone(status.execution),
+    } as unknown as CraftMobileControlPlaneAdapter;
+    const unreadableDiagnostics: string[] = [];
+    const unreadable = new LiveV4Runner(
+      { issueId: snapshot.issue.id } as LiveRunnerConfig, {} as WorkflowConfig, tracker, unreadableCraft,
+      {} as CraftCliRpcTransport, { tick: async () => { unreadableDispatches += 1; } } as unknown as DeterministicScheduler,
+      undefined, undefined, undefined, (message) => unreadableDiagnostics.push(message),
+    );
+    const healthy = new LiveV4Runner(
+      { issueId: snapshot.issue.id } as LiveRunnerConfig, {} as WorkflowConfig, tracker, healthyCraft,
+      {} as CraftCliRpcTransport, { tick: async () => { healthyDispatches += 1; } } as unknown as DeterministicScheduler,
+    );
+
+    await Promise.all([unreadable.tick(), healthy.tick()]);
+
+    expect(unreadableDispatches).toBe(1);
+    expect(healthyDispatches).toBe(1);
+    expect(unreadableDiagnostics).toEqual(["Project Desk read failed; cycle continues: desk unavailable"]);
+    expect(receipts).toEqual([`${snapshot.issue.id}:Keep the change bounded.`]);
+  });
+
+  test("applies an exact current gate approval only after its issue receipt", async () => {
+    const base = transitionFixture("settled").runner;
+    const status = await base.readStatus();
+    const snapshot = structuredClone(status.snapshot!);
+    snapshot.issue.state = "owner-gate";
+    snapshot.evidence.ownerGateId = "GATE-52-head";
+    const directive = {
+      id: "directive-gate-52", issueId: snapshot.issue.id,
+      receivedAtMs: 2_000, acknowledgedAtMs: 2_000, verbatim: "APPROVE GATE-52-head",
+      sourceSessionId: "owner-desk", sourceMessageId: "gate-message-52", sourceTimestampMs: 1_900,
+      acknowledgementId: "ack-gate-52",
+    };
+    const order: string[] = [];
+    const tracker = {
+      get: async () => structuredClone(snapshot),
+      recordOwnerDirective: async () => { order.push("receipt"); return { recorded: true }; },
+      mergeClosingPullRequest: async () => { order.push("merge"); return { merged: true, reason: "mergeable with passing checks" }; },
+    } as unknown as GitHubIssuesProjectsAdapter;
+    const craft = {
+      pollOwnerDesk: async () => ({
+        directives: [{ directive, gateDecision: { kind: "approve" as const, gateId: "GATE-52-head" }, newlyIngested: true }],
+        refusals: [], providerReadCalls: 5 as const, providerWriteCalls: 1 as const,
+      }),
+      get: async () => structuredClone(status.execution),
+    } as unknown as CraftMobileControlPlaneAdapter;
+    const runner = new LiveV4Runner(
+      { issueId: snapshot.issue.id } as LiveRunnerConfig, {} as WorkflowConfig, tracker, craft,
+      {} as CraftCliRpcTransport, { tick: async () => { order.push("dispatch"); } } as unknown as DeterministicScheduler,
+    );
+
+    await runner.tick();
+    expect(order).toEqual(["receipt", "merge", "dispatch"]);
+  });
+
   test("keeps a failing rollup read-only when the provider supplies no exact detail", async () => {
     const base = transitionFixture("settled").runner;
     const status = await base.readStatus();

@@ -340,7 +340,11 @@ describe("autonomous idle-lane grooming", () => {
         { mode: "discovery", github: { repository: "acme/repo", states: adapterConfig().states } } as LiveRunnerConfig,
         workflow,
         tracker,
-        {} as CraftMobileControlPlaneAdapter,
+        {
+          pollOwnerDesk: async () => ({
+            directives: [], refusals: [], providerReadCalls: 4 as const, providerWriteCalls: 0 as const,
+          }),
+        } as unknown as CraftMobileControlPlaneAdapter,
         {} as CraftCliRpcTransport,
         scheduler,
         undefined,

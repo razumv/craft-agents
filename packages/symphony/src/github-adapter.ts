@@ -39,6 +39,7 @@ import {
   type CiFailureDetail,
   type CiRepairAttempt,
 } from "./ci-repair";
+import { OwnerDirectiveLedger, type OwnerDirective } from "./ledger";
 import type {
   LifecycleDecisionResult,
   StartupReconciliation,
@@ -53,6 +54,9 @@ const fencePrefix = "<!-- craft-protocol-v4:wip-fence\n";
 const eventSuffix = "\n-->";
 const ledgerSchema = "craft-protocol/v4/github-event@1";
 const fenceSchema = "craft-protocol/v4/wip-fence@1";
+const directiveReceiptPrefix = "<!-- craft-protocol-v4:directive-receipt\n";
+const directiveReceiptSuffix = "\n-->";
+const directiveReceiptSchema = "craft-protocol/v4/directive-receipt@1";
 
 export interface GitHubStateProjection {
   label: string;
@@ -89,6 +93,11 @@ interface LedgerEvent {
   justification?: string | null;
   /** Null on ordinary events and on pre-supersession ledgers. */
   successor?: string | null;
+}
+
+interface DirectiveReceipt {
+  schema: typeof directiveReceiptSchema;
+  directive: OwnerDirective;
 }
 
 interface SharedFenceEvent {
@@ -307,6 +316,31 @@ export class GitHubIssuesProjectsAdapter implements TrackerAdapter {
    * definition of "landable" for both, so a gate can never be raised on a pull
    * request that auto-merge would have refused, and vice versa.
    */
+  async recordOwnerDirective(directive: Readonly<OwnerDirective>): Promise<{ recorded: boolean }> {
+    const detailed = await this.detailed(directive.issueId);
+    return this.#withStateLock(async () => {
+      const comments = await collectPages((cursor) => this.transport.listComments(directive.issueId, cursor));
+      const matching = comments.flatMap((comment) => {
+        if (this.config.eventAuthorLogin && comment.authorLogin !== this.config.eventAuthorLogin) return [];
+        const receipt = parseDirectiveReceipt(comment.body);
+        return receipt?.directive.id === directive.id ? [receipt] : [];
+      });
+      if (matching.length > 1) throw new Error(`directive receipt ${directive.id} is duplicated on the issue`);
+      if (matching.length === 1) {
+        if (JSON.stringify(matching[0]!.directive) !== JSON.stringify(directive)) {
+          throw new Error(`directive receipt ${directive.id} is immutable`);
+        }
+        return { recorded: false };
+      }
+      const body = serializeDirectiveReceipt(detailed.snapshot.issue.identifier, directive);
+      const written = await this.transport.appendComment(directive.issueId, body);
+      if (written.body !== body || (this.config.eventAuthorLogin && written.authorLogin !== this.config.eventAuthorLogin)) {
+        throw new Error("owner directive receipt did not read back exactly from the configured provider author");
+      }
+      return { recorded: true };
+    });
+  }
+
   async ciRepairAttempts(issueId: string, pullRequestId?: string): Promise<CiRepairAttempt[]> {
     const comments = await collectPages((cursor) => this.transport.listComments(issueId, cursor));
     const records = comments.flatMap((comment) => {
@@ -1452,6 +1486,35 @@ function validateFenceShape(value: unknown): SharedFenceEvent {
     throw new Error("shared-fence lease timestamps are invalid");
   }
   return raw as unknown as SharedFenceEvent;
+}
+
+function serializeDirectiveReceipt(issueIdentifier: string, directive: Readonly<OwnerDirective>): string {
+  const quoted = directive.verbatim.split("\n").map((line) => `> ${line}`).join("\n");
+  const receipt: DirectiveReceipt = { schema: directiveReceiptSchema, directive: { ...directive } };
+  return [
+    `Project Desk directive received for **${issueIdentifier}** as \`${directive.id}\`:`,
+    "",
+    quoted,
+    "",
+    `${directiveReceiptPrefix}${JSON.stringify(receipt)}${directiveReceiptSuffix}`,
+  ].join("\n");
+}
+
+function parseDirectiveReceipt(body: string): DirectiveReceipt | null {
+  const start = body.indexOf(directiveReceiptPrefix);
+  if (start < 0) return null;
+  const jsonStart = start + directiveReceiptPrefix.length;
+  const end = body.indexOf(directiveReceiptSuffix, jsonStart);
+  if (end < 0 || body.indexOf(directiveReceiptPrefix, jsonStart) >= 0) {
+    throw new Error("owner directive receipt is malformed");
+  }
+  let parsed: unknown;
+  try { parsed = JSON.parse(body.slice(jsonStart, end)); } catch { throw new Error("owner directive receipt contains invalid JSON"); }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("owner directive receipt is invalid");
+  const receipt = parsed as Partial<DirectiveReceipt>;
+  if (receipt.schema !== directiveReceiptSchema || !receipt.directive) throw new Error("owner directive receipt schema is invalid");
+  new OwnerDirectiveLedger().append(receipt.directive);
+  return receipt as DirectiveReceipt;
 }
 
 async function collectPages<T>(load: (cursor: string | null) => Promise<Page<T>>): Promise<T[]> {
