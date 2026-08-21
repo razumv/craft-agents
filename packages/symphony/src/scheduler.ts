@@ -188,13 +188,54 @@ export class DeterministicScheduler {
     if (!policy?.enabled) return;
     if (!this.adapters.github.mergeClosingPullRequest) return;
     if (snapshot.issue.state !== "pr-open") return;
-    if (!riskAtMost(snapshot.contract.risk, policy.maxRisk)) return;
+    if (!riskAtMost(snapshot.contract.risk, policy.maxRisk)) {
+      // Work above the ceiling is the owner's to approve — but silently leaving it
+      // in pr-open is how it became indistinguishable from work that is stuck. It
+      // sat there with green checks and nobody could tell it was waiting, while
+      // the Owner gate column stayed empty and the owner had nothing to act on.
+      // So it is raised to the gate, which is the one decision they asked to keep.
+      await this.raiseOwnerGate(snapshot, `risk ${snapshot.contract.risk} exceeds the auto-merge ceiling ${policy.maxRisk}`);
+      return;
+    }
     // A contract that carries deployment authority is not ours to land.
-    if (snapshot.contract.deployAuthority !== "none") return;
+    if (snapshot.contract.deployAuthority !== "none") {
+      await this.raiseOwnerGate(snapshot, `deployAuthority ${snapshot.contract.deployAuthority} is not the lane's to exercise`);
+      return;
+    }
     const outcome = await this.adapters.github.mergeClosingPullRequest(snapshot.issue.id);
     this.adapters.onDiagnostic?.(
       `auto-merge ${outcome.merged ? "merged" : "declined"} ${snapshot.issue.identifier}: ${outcome.reason}`,
     );
+  }
+
+  /**
+   * Move a pull request the lane may not land itself to the owner gate.
+   *
+   * Only when the provider already says it could be merged: an owner asked to
+   * approve something that CI has not passed is being asked to guess. A gate id is
+   * derived from the issue and the pull request head, so the approval the owner
+   * gives names exactly the commit they were shown, and a later push invalidates
+   * it rather than silently inheriting the approval.
+   */
+  private async raiseOwnerGate(snapshot: TrackerIssueSnapshot, reason: string): Promise<void> {
+    const claim = snapshot.claim;
+    if (!claim) return;
+    if (!this.adapters.github.mergeReadiness) {
+      this.adapters.onDiagnostic?.(`owner gate not raised for ${snapshot.issue.identifier}: transport cannot report merge readiness`);
+      return;
+    }
+    const readiness = await this.adapters.github.mergeReadiness(snapshot.issue.id);
+    if (!readiness.ready) {
+      this.adapters.onDiagnostic?.(`owner gate withheld for ${snapshot.issue.identifier}: ${readiness.reason}`);
+      return;
+    }
+    const gateId = `GATE-${snapshot.issue.identifier.replace(/[^A-Za-z0-9]+/g, "-")}-${readiness.headSha.slice(0, 12)}`;
+    await this.adapters.github.transition(snapshot.issue.id, "owner-gate", this.clock.nowMs(), {
+      fence: claim.fence,
+      message: `owner gate raised: ${reason}`,
+      evidence: { ...snapshot.evidence, ownerGateId: gateId },
+    });
+    this.adapters.onDiagnostic?.(`owner gate raised for ${snapshot.issue.identifier}: ${reason} (${gateId})`);
   }
 
   /** Pure deterministic decision preview. It never claims, heartbeats, creates, or reconciles. */

@@ -171,7 +171,19 @@ export class GitHubIssuesProjectsAdapter implements TrackerAdapter {
    * evidence justifies it. Every refusal names itself: an auto-merge that stays
    * quiet about declining is indistinguishable from one that is not running.
    */
-  async mergeClosingPullRequest(issueId: string): Promise<{ merged: boolean; reason: string }> {
+  /**
+   * The same evidence the merge path requires, reported without merging. One
+   * definition of "landable" for both, so a gate can never be raised on a pull
+   * request that auto-merge would have refused, and vice versa.
+   */
+  async mergeReadiness(issueId: string): Promise<{ ready: boolean; reason: string; headSha: string }> {
+    const verdict = await this.landableClosingPullRequest(issueId);
+    return verdict.pr
+      ? { ready: verdict.ready, reason: verdict.reason, headSha: verdict.pr.headRefOid }
+      : { ready: false, reason: verdict.reason, headSha: "" };
+  }
+
+  private async landableClosingPullRequest(issueId: string): Promise<{ ready: boolean; reason: string; pr: GitHubPullRequestEvidence | null }> {
     const detailed = await this.detailed(issueId);
     const contract = detailed.snapshot.contract;
     const prs = await collectPages((cursor) => this.transport.listClosingPullRequests(issueId, cursor));
@@ -179,19 +191,30 @@ export class GitHubIssuesProjectsAdapter implements TrackerAdapter {
       pr.headRefName === contract.requiredBranch
       && pr.baseRefName === contract.baseBranch
     ));
-    if (candidates.length !== 1) return { merged: false, reason: `expected exactly one closing PR, found ${candidates.length}` };
+    if (candidates.length !== 1) return { ready: false, reason: `expected exactly one closing PR, found ${candidates.length}`, pr: null };
     const pr = candidates[0]!;
-    if (pr.state === "MERGED") return { merged: false, reason: "already merged" };
-    if (pr.state !== "OPEN") return { merged: false, reason: `pull request is ${pr.state}` };
-    if (pr.mergeable !== "MERGEABLE") return { merged: false, reason: `mergeability is ${pr.mergeable}` };
+    if (pr.state === "MERGED") return { ready: false, reason: "already merged", pr };
+    if (pr.state !== "OPEN") return { ready: false, reason: `pull request is ${pr.state}`, pr };
+    if (pr.mergeable !== "MERGEABLE") return { ready: false, reason: `mergeability is ${pr.mergeable}`, pr };
     // Today's lesson, encoded: a repository whose workflow does not trigger on
     // this base branch reports NO checks, and reading that as green merges an
     // unverified change. Absence of checks is never success.
-    if (pr.checkCount < 1) return { merged: false, reason: "no checks ran on the head commit" };
-    if (pr.checkRollupState !== "SUCCESS") return { merged: false, reason: `checks are ${pr.checkRollupState ?? "absent"}` };
-    await this.transport.mergePullRequest(pr.id, `${contract.goal.slice(0, 60)} (${detailed.snapshot.issue.identifier})`);
-    return { merged: true, reason: "mergeable with passing checks" };
+    if (pr.checkCount < 1) return { ready: false, reason: "no checks ran on the head commit", pr };
+    if (pr.checkRollupState !== "SUCCESS") return { ready: false, reason: `checks are ${pr.checkRollupState ?? "absent"}`, pr };
+    return { ready: true, reason: "mergeable with passing checks", pr };
   }
+
+  async mergeClosingPullRequest(issueId: string): Promise<{ merged: boolean; reason: string }> {
+    const verdict = await this.landableClosingPullRequest(issueId);
+    if (!verdict.ready || !verdict.pr) return { merged: false, reason: verdict.reason };
+    const detailed = await this.detailed(issueId);
+    await this.transport.mergePullRequest(
+      verdict.pr.id,
+      `${detailed.snapshot.contract.goal.slice(0, 60)} (${detailed.snapshot.issue.identifier})`,
+    );
+    return { merged: true, reason: verdict.reason };
+  }
+
 
   async fetchIssuesByIds(ids: readonly string[]): Promise<TrackerIssueSnapshot[]> {
     if (ids.length === 0) return [];
