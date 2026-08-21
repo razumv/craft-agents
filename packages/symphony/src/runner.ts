@@ -24,7 +24,12 @@ import {
   type Page,
 } from "./github-transport";
 import { ModelPolicy } from "./policy";
-import { proposeBacklogGrooming, type GroomingApplyReport, type GroomingProposal } from "./grooming";
+import {
+  proposeBacklogGrooming,
+  type GroomingApplyReport,
+  type GroomingProposal,
+  type GroomingRefusalRelation,
+} from "./grooming";
 import { ReadScopeGitHubTransport } from "./read-scope-transport";
 import { compareForDispatch, DeterministicScheduler, type Clock, type CrashPoint, type ShadowProposal } from "./scheduler";
 import type { TrackerBacklogIssue } from "./tracker";
@@ -103,6 +108,21 @@ export interface LiveRunnerConfig {
   };
 }
 
+export interface GroomingRefusalRecord {
+  issueId: string;
+  issueNumber: number;
+  issueIdentifier: string;
+  relation: GroomingRefusalRelation;
+  reason: string;
+}
+
+export interface GroomingReport {
+  /** Empty needs new work; exhausted needs the named backlog issues repaired. */
+  state: "backlog-empty" | "groomable" | "exhausted";
+  backlogIssueNumbers: number[];
+  refusals: GroomingRefusalRecord[];
+}
+
 export interface LiveRunnerStatus {
   snapshot: TrackerIssueSnapshot | null;
   status: ProjectStatus | null;
@@ -115,6 +135,8 @@ export interface LiveRunnerStatus {
    * has already been contracted.
    */
   backlog?: TrackerBacklogIssue[];
+  /** Discovery mode only: why unmanaged backlog can or cannot yield work. */
+  grooming?: GroomingReport;
 }
 
 export const SHADOW_RECEIPT_SCHEMA = "craft-agent/symphony-shadow@1" as const;
@@ -137,7 +159,7 @@ class SystemClock implements Clock {
 /** One explicitly scoped live composition. No provider is touched until a method is called. */
 export class LiveV4Runner {
   /** Refusals are revision-scoped: the same issue is reconsidered only after GitHub reports it changed. */
-  readonly #groomingRefusals = new Map<string, string>();
+  readonly #groomingRefusals = new Map<string, GroomingRefusalRecord & { revision: string }>();
 
   constructor(
     readonly config: LiveRunnerConfig,
@@ -282,16 +304,19 @@ export class LiveV4Runner {
       if (active.length > 0 || ready.length > 0) return;
 
       const backlog = await this.tracker.fetchBacklog();
-      const revisions = new Map(backlog.map((candidate) => [candidate.id, groomingRevision(candidate)]));
-      for (const [issueId, refusedRevision] of this.#groomingRefusals) {
-        const current = revisions.get(issueId);
-        if (current === undefined || current !== refusedRevision) this.#groomingRefusals.delete(issueId);
-      }
-      const eligible = backlog.filter((candidate) => this.#groomingRefusals.get(candidate.id) !== revisions.get(candidate.id));
+      this.#reconcileGroomingRefusals(backlog);
+      const eligible = backlog.filter((candidate) => !this.#groomingRefusals.has(candidate.id));
       const proposal = proposeBacklogGrooming(this.config.github.repository, eligible, this.workflow);
       if (proposal.outcome === "refused") {
         if (proposal.candidate) {
-          this.#groomingRefusals.set(proposal.candidate.id, groomingRevision(proposal.candidate));
+          this.#groomingRefusals.set(proposal.candidate.id, {
+            issueId: proposal.candidate.id,
+            issueNumber: proposal.candidate.number,
+            issueIdentifier: proposal.candidate.identifier,
+            relation: proposal.refusal.relation,
+            reason: proposal.refusal.message,
+            revision: groomingRevision(proposal.candidate),
+          });
           this.onDiagnostic(`grooming refused ${proposal.candidate.identifier}: ${proposal.refusal.message}`);
         }
         return;
@@ -345,13 +370,35 @@ export class LiveV4Runner {
     const active = snapshots.find((snapshot) => snapshot.claim !== null && snapshot.claim !== undefined);
     const primary = active ?? snapshots[0] ?? null;
     const execution = active?.claim ? await this.craft.get(active.claim.sessionId) : null;
+    this.#reconcileGroomingRefusals(backlog);
     return {
       snapshot: primary,
       status: primary ? projectStatus(primary) : null,
       execution,
       statuses,
       backlog,
+      grooming: this.#groomingReport(backlog),
     };
+  }
+
+  #reconcileGroomingRefusals(backlog: readonly TrackerBacklogIssue[]): void {
+    const revisions = new Map(backlog.map((candidate) => [candidate.id, groomingRevision(candidate)]));
+    for (const [issueId, refusal] of this.#groomingRefusals) {
+      if (revisions.get(issueId) !== refusal.revision) this.#groomingRefusals.delete(issueId);
+    }
+  }
+
+  #groomingReport(backlog: readonly TrackerBacklogIssue[]): GroomingReport {
+    const backlogIssueNumbers = backlog.map((candidate) => candidate.number).sort((left, right) => left - right);
+    const refusals = [...this.#groomingRefusals.values()]
+      .map(({ revision: _, ...record }) => record)
+      .sort((left, right) => left.issueNumber - right.issueNumber);
+    const state = backlog.length === 0
+      ? "backlog-empty"
+      : refusals.length === backlog.length
+        ? "exhausted"
+        : "groomable";
+    return { state, backlogIssueNumbers, refusals };
   }
 
   /**
