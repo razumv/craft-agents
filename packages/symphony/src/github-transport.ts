@@ -351,9 +351,15 @@ export class GhCliTransport implements GitHubTransport {
   }
 
   private async graphql<T = unknown>(query: string, variables: Record<string, unknown>): Promise<T> {
+    // A mutation is never retried. `appendComment` is not idempotent — a retry
+    // that actually landed the first time would write a second ledger event and
+    // the compare-and-set above would then reject both. Reads have no such
+    // hazard, so only reads get another attempt.
+    const isMutation = /^\s*mutation\b/.test(query);
     const output = await this.run(
       ["api", "graphql", "--input", "-"],
       JSON.stringify({ query, variables }),
+      !isMutation,
     );
     const parsed = JSON.parse(output) as { data?: T; errors?: { message: string }[] };
     if (parsed.errors?.length) throw new Error(`GitHub GraphQL failed: ${parsed.errors.map((entry) => entry.message).join("; ")}`);
@@ -361,20 +367,52 @@ export class GhCliTransport implements GitHubTransport {
     return parsed.data;
   }
 
-  private async run(args: string[], stdin?: string): Promise<string> {
-    const process = Bun.spawn([this.executable, ...args], {
-      stdin: stdin === undefined ? undefined : new Blob([stdin]),
-      stdout: "pipe",
-      stderr: "pipe",
-    });
-    const [exitCode, stdout, stderr] = await Promise.all([
-      process.exited,
-      new Response(process.stdout).text(),
-      new Response(process.stderr).text(),
-    ]);
-    if (exitCode !== 0) throw new Error(`gh command failed (${exitCode}): ${stderr.trim() || "no diagnostic"}`);
-    return stdout;
+  private async run(args: string[], stdin?: string, retryable = false): Promise<string> {
+    let lastError: Error | null = null;
+    for (let attempt = 1; attempt <= (retryable ? GITHUB_READ_ATTEMPTS : 1); attempt += 1) {
+      const process = Bun.spawn([this.executable, ...args], {
+        stdin: stdin === undefined ? undefined : new Blob([stdin]),
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const [exitCode, stdout, stderr] = await Promise.all([
+        process.exited,
+        new Response(process.stdout).text(),
+        new Response(process.stderr).text(),
+      ]);
+      if (exitCode === 0) return stdout;
+      const diagnostic = stderr.trim() || "no diagnostic";
+      lastError = new Error(`gh command failed (${exitCode}): ${diagnostic}`);
+      if (!isTransientTransportFailure(diagnostic)) throw lastError;
+      if (attempt === GITHUB_READ_ATTEMPTS) break;
+      await new Promise((resolve) => setTimeout(resolve, GITHUB_RETRY_BASE_MS * 2 ** (attempt - 1)));
+    }
+    throw lastError ?? new Error("gh command failed with no diagnostic");
   }
+}
+
+/** Attempts for one read, including the first. */
+const GITHUB_READ_ATTEMPTS = 3;
+const GITHUB_RETRY_BASE_MS = 1_000;
+
+/**
+ * Whether a failed `gh` invocation says the request never reached a verdict.
+ *
+ * A dropped connection is not an answer, and treating it as one cost a night:
+ * `HTTP 499` — GitHub's edge reporting that the client went away mid-request —
+ * failed one repository read, which failed the project's reconstruction, which
+ * after three cycles dropped razumv/lineage2-classic-ue out of the autonomous
+ * loop entirely while the repository was reachable the whole time.
+ *
+ * Deliberately narrow. A rate limit is excluded: it is a real answer, it will not
+ * change within seconds, and retrying it just spends the budget that is already
+ * gone. Anything the provider actually decided — a 4xx that is not 499, a GraphQL
+ * error, a missing node — must surface unchanged, because failing closed on those
+ * is what keeps WIP correct.
+ */
+function isTransientTransportFailure(diagnostic: string): boolean {
+  if (/rate limit/i.test(diagnostic)) return false;
+  return /HTTP 499|HTTP 5\d\d|timeout|timed out|connection reset|connection refused|EOF|network is unreachable|temporary failure|try again/i.test(diagnostic);
 }
 
 function normalizeRawFieldValue(raw: Record<string, unknown>): GitHubProjectFieldValue {
