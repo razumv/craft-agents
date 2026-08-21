@@ -18,6 +18,8 @@ import {
   type GitHubComment,
   type GitHubIssueLink,
   type GitHubIssueRecord,
+  type GitHubProjectFieldValue,
+  type GitHubProjectItem,
   type GitHubTransport,
   type LifecycleState,
   type LiveRunnerConfig,
@@ -88,9 +90,87 @@ class RecordingTransport implements GitHubTransport {
   getBaseSha(): Promise<string> { this.calls.push("getBaseSha"); return Promise.resolve("b".repeat(40)); }
   mergePullRequest(): Promise<void> { return Promise.resolve(this.write("mergePullRequest")); }
   appendComment(): Promise<GitHubComment> { return Promise.resolve(this.write("appendComment")); }
+  updateIssueBody(): Promise<boolean> { return Promise.resolve(this.write("updateIssueBody")); }
   replaceLabels(): Promise<void> { return Promise.resolve(this.write("replaceLabels")); }
   updateProjectSingleSelect(): Promise<void> { return Promise.resolve(this.write("updateProjectSingleSelect")); }
   updateProjectText(): Promise<void> { return Promise.resolve(this.write("updateProjectText")); }
+}
+
+class ApplyingTransport implements GitHubTransport {
+  readonly calls: string[] = [];
+  readonly comments: string[] = [];
+  labels: string[];
+  statusOptionId = "option:backlog";
+  failAt: "body" | "conflict" | "readback" | "attribution" | "status" | "label" | null = null;
+  private nodeReads = 0;
+
+  constructor(readonly record: GitHubIssueRecord) {
+    this.labels = [...(record.labelNames ?? [])];
+  }
+
+  private page<T>(nodes: T[]): Promise<Page<T>> { return Promise.resolve({ nodes, nextCursor: null }); }
+  listIssues(): Promise<Page<GitHubIssueRecord>> {
+    return this.page([{ ...this.record, labelNames: [...this.labels] }]);
+  }
+  getIssuesByNodeIds(): Promise<(GitHubIssueRecord | null)[]> {
+    this.calls.push("read-body");
+    this.nodeReads += 1;
+    if (this.failAt === "readback" && this.nodeReads === 2) return Promise.resolve([{ ...this.record, body: "corrupted readback" }]);
+    return Promise.resolve([structuredClone(this.record)]);
+  }
+  listLabels(): Promise<Page<string>> { this.calls.push("read-labels"); return this.page([...this.labels]); }
+  listBlockedBy(): Promise<Page<GitHubIssueLink>> { return this.page([]); }
+  listProjectItems(): Promise<Page<GitHubProjectItem>> {
+    this.calls.push("read-project-item");
+    return this.page([{ id: "ITEM", projectId: "PROJECT" }]);
+  }
+  listProjectFieldValues(): Promise<Page<GitHubProjectFieldValue>> {
+    return this.page([{ kind: "single-select", fieldId: "STATUS", fieldName: "Status", optionId: this.statusOptionId, value: null }]);
+  }
+  listComments(): Promise<Page<GitHubComment>> { return this.page([]); }
+  listClosingPullRequests(): Promise<Page<never>> { return this.page([]); }
+  getBranch(): Promise<null> { return Promise.resolve(null); }
+  getBaseSha(): Promise<string> { this.calls.push("read-baseline"); return Promise.resolve("b".repeat(40)); }
+  containsCommit(): Promise<boolean> { return Promise.resolve(true); }
+  mergePullRequest(): Promise<void> { return Promise.resolve(); }
+  async updateIssueBody(_repository: string, _number: number, body: string, expectedUpdatedAt: string): Promise<boolean> {
+    this.calls.push(`WRITE:body:${expectedUpdatedAt}`);
+    if (this.failAt === "body") throw new Error("body failed");
+    if (this.failAt === "conflict") {
+      this.labels.push("state:blocked");
+      return false;
+    }
+    this.record.body = body;
+    return true;
+  }
+  async appendComment(_issueId: string, body: string): Promise<GitHubComment> {
+    this.calls.push("WRITE:attribution");
+    if (this.failAt === "attribution") throw new Error("attribution failed");
+    this.comments.push(body);
+    return { databaseId: 1, body, authorLogin: "bot", createdAt: "2026-08-21T00:00:00Z", updatedAt: "2026-08-21T00:00:00Z" };
+  }
+  async updateProjectSingleSelect(_projectId: string, _itemId: string, _fieldId: string, optionId: string): Promise<void> {
+    this.calls.push(`WRITE:status:${optionId}`);
+    if (this.failAt === "status") throw new Error("status failed");
+    this.statusOptionId = optionId;
+  }
+  async replaceLabels(_repository: string, _number: number, labels: readonly string[]): Promise<void> {
+    this.calls.push("WRITE:label");
+    if (this.failAt === "label") throw new Error("label failed");
+    this.labels = [...labels];
+  }
+  updateProjectText(): Promise<void> { return Promise.resolve(); }
+}
+
+function applyingAdapter(candidate: TrackerBacklogIssue, transport?: ApplyingTransport): [GitHubIssuesProjectsAdapter, ApplyingTransport] {
+  const record: GitHubIssueRecord = {
+    id: candidate.id, number: candidate.number, title: candidate.title, body: candidate.description, url: candidate.url!,
+    state: "OPEN", createdAt: candidate.createdAt!, updatedAt: candidate.updatedAt!, assigneeId: null, labelNames: candidate.labels,
+  };
+  const mutable = transport ?? new ApplyingTransport(record);
+  return [new GitHubIssuesProjectsAdapter(
+    adapterConfig(), mutable, { inspect: async () => ({ kind: "absent" as const }) } as WorkspaceTruthReader,
+  ), mutable];
 }
 
 function adapterConfig(): GitHubAdapterConfig {
@@ -110,6 +190,102 @@ function adapterConfig(): GitHubAdapterConfig {
     eventAuthorLogin: "bot",
   };
 }
+
+describe("grooming apply", () => {
+  test("a refusal performs no tracker read or write", async () => {
+    const refused = proposal(issue({ description: "## Acceptance Criteria\n- Improve it better.\n\n## Non-goals\n- Writes." }));
+    expect(refused.outcome).toBe("refused");
+    const [adapter, transport] = applyingAdapter(issue());
+
+    const report = await adapter.applyGrooming(refused);
+
+    expect(report).toMatchObject({ outcome: "refused", writes: 0 });
+    expect(transport.calls).toEqual([]);
+  });
+
+  test("an existing parser-valid contract is never overwritten", async () => {
+    const proposed = proposal();
+    if (proposed.outcome !== "proposed") throw new Error("fixture must propose");
+    const [adapter, transport] = applyingAdapter(proposed.candidate);
+    transport.record.body = proposed.contractMarkdown;
+
+    const report = await adapter.applyGrooming(proposed);
+
+    expect(report).toEqual({ outcome: "already-present", writes: 0, issueIdentifier: "acme/repo#1" });
+    expect(transport.calls.filter((call) => call.startsWith("WRITE:"))).toEqual([]);
+    expect(transport.record.body).toBe(proposed.contractMarkdown);
+  });
+
+  test("writes verified body, attribution, configured ready status, and label; a second apply is a no-op", async () => {
+    const proposed = proposal();
+    if (proposed.outcome !== "proposed") throw new Error("fixture must propose");
+    const [adapter, transport] = applyingAdapter(proposed.candidate);
+    const configuredReadyOption = adapterConfig().states.ready.projectStatusOptionId;
+
+    const first = await adapter.applyGrooming(proposed);
+    const second = await adapter.applyGrooming(proposed);
+
+    expect(first).toEqual({ outcome: "applied", writes: 4, issueIdentifier: "acme/repo#1", baselineSha: "b".repeat(40) });
+    expect(second).toEqual({ outcome: "already-present", writes: 0, issueIdentifier: "acme/repo#1" });
+    expect(parseIssueContract(transport.record.body, proposed.candidate.identifier, workflow)).toEqual(proposed.contract);
+    expect(transport.record.body).toStartWith(proposed.candidate.description);
+    expect(transport.statusOptionId).toBe(configuredReadyOption);
+    expect(transport.labels).toEqual(["enhancement", adapterConfig().states.ready.label]);
+    expect(transport.comments).toEqual([
+      `Contract authored by Symphony grooming from backlog issue acme/repo#1 against repository acme/repo baseline ${"b".repeat(40)}.`,
+    ]);
+    expect(transport.calls.filter((call) => call.startsWith("WRITE:"))).toEqual([
+      `WRITE:body:${proposed.candidate.updatedAt}`, "WRITE:attribution", `WRITE:status:${configuredReadyOption}`, "WRITE:label",
+    ]);
+  });
+
+  test("a concurrent lifecycle mutation loses the body compare-and-set and is not overwritten", async () => {
+    const proposed = proposal();
+    if (proposed.outcome !== "proposed") throw new Error("fixture must propose");
+    const [adapter, transport] = applyingAdapter(proposed.candidate);
+    transport.failAt = "conflict";
+
+    const report = await adapter.applyGrooming(proposed);
+
+    expect(report).toMatchObject({ outcome: "failed", step: "body", writes: 0, error: "grooming body compare-and-set conflict" });
+    expect(transport.record.body).toBe(proposed.candidate.description);
+    expect(transport.labels).toContain(adapterConfig().states.blocked.label);
+    expect(transport.calls.filter((call) => call.startsWith("WRITE:"))).toEqual([
+      `WRITE:body:${proposed.candidate.updatedAt}`,
+    ]);
+  });
+
+  test("an issue carrying any lifecycle label is untouched", async () => {
+    const proposed = proposal();
+    if (proposed.outcome !== "proposed") throw new Error("fixture must propose");
+    const candidate = { ...proposed.candidate, labels: ["enhancement", adapterConfig().states.blocked.label] };
+    const [adapter, transport] = applyingAdapter(candidate);
+
+    const report = await adapter.applyGrooming(proposed);
+
+    expect(report).toMatchObject({ outcome: "lifecycle-present", writes: 0 });
+    expect(transport.calls.filter((call) => call.startsWith("WRITE:"))).toEqual([]);
+  });
+
+  test("every failed write is named and the issue is never labelled claimable", async () => {
+    const proposed = proposal();
+    if (proposed.outcome !== "proposed") throw new Error("fixture must propose");
+    const cases = [
+      ["body", 0], ["readback", 1], ["attribution", 1], ["status", 2], ["label", 3],
+    ] as const;
+    for (const [step, writes] of cases) {
+      const [adapter, transport] = applyingAdapter(proposed.candidate);
+      transport.failAt = step;
+
+      const report = await adapter.applyGrooming(proposed);
+
+      expect(report).toMatchObject({ outcome: "failed", step, writes });
+      expect(transport.labels).not.toContain(adapterConfig().states.ready.label);
+      if (step !== "body") expect(parseIssueContract(transport.record.body, proposed.candidate.identifier, workflow)).toEqual(proposed.contract);
+      expect((await adapter.fetchBacklog()).map((entry) => entry.identifier)).toEqual([proposed.candidate.identifier]);
+    }
+  });
+});
 
 describe("read-only backlog grooming", () => {
   test("runner builds one proposal from the existing backlog read and the transport receives no write call", async () => {

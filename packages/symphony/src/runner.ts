@@ -22,7 +22,7 @@ import {
   type Page,
 } from "./github-transport";
 import { ModelPolicy } from "./policy";
-import { proposeBacklogGrooming, type GroomingProposal } from "./grooming";
+import { proposeBacklogGrooming, type GroomingApplyReport, type GroomingProposal } from "./grooming";
 import { ReadScopeGitHubTransport } from "./read-scope-transport";
 import { compareForDispatch, DeterministicScheduler, type Clock, type CrashPoint, type ShadowProposal } from "./scheduler";
 import type { TrackerBacklogIssue } from "./tracker";
@@ -300,6 +300,12 @@ export class LiveV4Runner {
     this.#beginOperation();
     const backlog = await this.tracker.fetchBacklog();
     return proposeBacklogGrooming(this.config.github.repository, backlog, this.workflow);
+  }
+
+  /** Apply only the exact proposal returned by grooming; refusals remain read-only. */
+  async applyGrooming(proposal: GroomingProposal): Promise<GroomingApplyReport> {
+    this.#beginOperation();
+    return this.tracker.applyGrooming(proposal);
   }
 
   /**
@@ -718,6 +724,12 @@ export class DiscoveryGitHubTransport implements GitHubTransport {
     }
     return this.delegate.appendComment(issueId, body);
   }
+  async updateIssueBody(repository: string, issueNumber: number, body: string, expectedUpdatedAt: string): Promise<boolean> {
+    if (repository !== this.scope.repository || !this.#issueNumbers.has(issueNumber)) {
+      throw new Error("GitHub body mutation escaped discovered issue scope");
+    }
+    return this.delegate.updateIssueBody(repository, issueNumber, body, expectedUpdatedAt);
+  }
   async replaceLabels(repository: string, issueNumber: number, labels: readonly string[]): Promise<void> {
     if (repository !== this.scope.repository || !this.#issueNumbers.has(issueNumber)) {
       throw new Error("GitHub label mutation escaped discovered repository/issue scope");
@@ -790,6 +802,12 @@ export class ScopedGitHubTransport implements GitHubTransport {
   appendComment(issueId: string, body: string): Promise<GitHubComment> {
     if (issueId !== this.scope.issueId && issueId !== this.scope.fenceIssueId) throw new Error("GitHub comment mutation escaped configured issue/fence scope");
     return this.delegate.appendComment(issueId, body);
+  }
+  updateIssueBody(repository: string, issueNumber: number, body: string, expectedUpdatedAt: string): Promise<boolean> {
+    if (repository !== this.scope.repository || issueNumber !== this.scope.issueNumber) {
+      throw new Error("GitHub body mutation escaped configured issue scope");
+    }
+    return this.delegate.updateIssueBody(repository, issueNumber, body, expectedUpdatedAt);
   }
   replaceLabels(repository: string, issueNumber: number, labels: readonly string[]): Promise<void> {
     if (repository !== this.scope.repository || issueNumber !== this.scope.issueNumber) {

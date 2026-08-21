@@ -44,6 +44,7 @@ class CountingTransport implements GitHubTransport {
   async getBranch(): Promise<null> { this.#hit("getBranch"); return null; }
   async getBaseSha(): Promise<string> { this.#hit("getBaseSha"); return "b".repeat(40); }
   async appendComment(): Promise<never> { this.#hit("appendComment"); return { databaseId: 1, body: "", authorLogin: "bot", createdAt: "", updatedAt: "" } as never; }
+  async updateIssueBody(): Promise<boolean> { this.#hit("updateIssueBody"); return true; }
   async replaceLabels(): Promise<void> { this.#hit("replaceLabels"); }
   async updateProjectSingleSelect(): Promise<void> { this.#hit("updateProjectSingleSelect"); }
   async updateProjectText(): Promise<void> { this.#hit("updateProjectText"); }

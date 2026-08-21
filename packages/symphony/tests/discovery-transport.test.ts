@@ -42,6 +42,7 @@ function fakeDelegate(calls: string[]): GitHubTransport {
     async getBranch() { return null; },
     async getBaseSha() { return "a".repeat(40); },
     async appendComment(issueId) { calls.push(`comment:${issueId}`); return { id: "C_1", body: "", authorLogin: "x", createdAt: "" } as never; },
+    async updateIssueBody(_repository, issueNumber) { calls.push(`body:${issueNumber}`); return true; },
     async replaceLabels(_repo, issueNumber) { calls.push(`labels:${issueNumber}`); },
     async updateProjectSingleSelect(_p, itemId) { calls.push(`status:${itemId}`); },
     async updateProjectText(_p, itemId) { calls.push(`gate:${itemId}`); },

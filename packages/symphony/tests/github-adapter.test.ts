@@ -148,6 +148,13 @@ class MemoryGitHubTransport implements GitHubTransport {
     await Promise.resolve();
     return structuredClone(comment);
   }
+  updateIssueBody(_repository: string, issueNumber: number, body: string): Promise<boolean> {
+    this.hit("update-body");
+    const issue = this.issues.find((entry) => entry.number === issueNumber);
+    if (!issue) return Promise.reject(new Error("missing issue"));
+    issue.body = body;
+    return Promise.resolve(true);
+  }
   replaceLabels(_repository: string, issueNumber: number, labels: readonly string[]): Promise<void> {
     this.hit("replace-labels");
     this.labels.set(`I_${issueNumber}`, [...labels]);
