@@ -376,23 +376,81 @@ describe("autonomous idle-lane grooming", () => {
     expect(calls).toEqual(["dispatch", "apply:acme/repo#1"]);
   });
 
-  test("a refusal is attempted once until that exact issue revision changes", async () => {
+  test("an unchanged refusal is recorded once with its issue, relation, and readable reason", async () => {
     const candidate = issue({
       updatedAt: "2026-08-02T00:00:00Z",
       description: "## Acceptance Criteria\n- Improve it better.\n\n## Non-goals\n- Writes.",
     });
     const { runner, calls, diagnostics } = autonomousRunner({ backlog: [candidate] });
 
-    await runner.tick();
-    await runner.tick();
+    const first = await runner.tick();
+    const second = await runner.tick();
 
     expect(calls).toEqual(["dispatch", "dispatch"]);
     expect(diagnostics).toHaveLength(1);
     expect(diagnostics[0]).toContain("grooming refused acme/repo#1");
+    expect(first.grooming).toEqual({
+      state: "exhausted",
+      backlogIssueNumbers: [1],
+      refusals: [{
+        issueId: "I_1",
+        issueNumber: 1,
+        issueIdentifier: "acme/repo#1",
+        relation: "grounding",
+        reason: "issue acme/repo#1 cannot ground an executable contract: missing at least one falsifiable acceptance criterion with an observable outcome",
+      }],
+    });
+    expect(second.grooming).toEqual(first.grooming);
+  });
 
+  test("records every refused issue number and distinguishes exhaustion from an empty backlog", async () => {
+    const blocked = issue({
+      blockedBy: [{ id: "I_9", identifier: "acme/repo#9", state: "OPEN", title: "Blocking issue", url: "https://github.test/acme/repo/issues/9" }],
+    });
+    const parented = issue({
+      id: "I_2", identifier: "acme/repo#2", number: 2, priority: 2,
+      parent: { id: "I_8", identifier: "acme/repo#8", state: "OPEN", title: "Parent issue", url: "https://github.test/acme/repo/issues/8" },
+    });
+    const populated = autonomousRunner({ backlog: [parented, blocked] });
+    const empty = autonomousRunner({ backlog: [] });
+
+    const partlyRefused = await populated.runner.tick();
+    const exhausted = await populated.runner.tick();
+    const backlogEmpty = await empty.runner.tick();
+
+    expect(partlyRefused.grooming).toMatchObject({ state: "groomable", backlogIssueNumbers: [1, 2] });
+    expect(exhausted.grooming).toEqual({
+      state: "exhausted",
+      backlogIssueNumbers: [1, 2],
+      refusals: [
+        {
+          issueId: "I_1", issueNumber: 1, issueIdentifier: "acme/repo#1",
+          relation: "blocked-by", reason: "blocked-by relation acme/repo#9 is open",
+        },
+        {
+          issueId: "I_2", issueNumber: 2, issueIdentifier: "acme/repo#2",
+          relation: "parent", reason: "parent relation acme/repo#8 is open",
+        },
+      ],
+    });
+    expect(backlogEmpty.grooming).toEqual({ state: "backlog-empty", backlogIssueNumbers: [], refusals: [] });
+  });
+
+  test("an edited refusal is retried and removed when the issue becomes groomable", async () => {
+    const candidate = issue({
+      updatedAt: "2026-08-02T00:00:00Z",
+      description: "## Acceptance Criteria\n- Improve it better.\n\n## Non-goals\n- Writes.",
+    });
+    const { runner, calls } = autonomousRunner({ backlog: [candidate] });
+
+    const refused = await runner.tick();
     candidate.updatedAt = "2026-08-03T00:00:00Z";
-    await runner.tick();
-    expect(diagnostics).toHaveLength(2);
+    candidate.description = issue().description;
+    const retried = await runner.tick();
+
+    expect(refused.grooming?.refusals).toHaveLength(1);
+    expect(calls).toEqual(["dispatch", "dispatch", "apply:acme/repo#1"]);
+    expect(retried.grooming).toEqual({ state: "groomable", backlogIssueNumbers: [1], refusals: [] });
   });
 
   test("a grooming exception is logged but does not fail the scheduler tick", async () => {
