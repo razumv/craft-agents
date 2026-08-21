@@ -3,6 +3,7 @@
 import type {
   GitHubBranchEvidence,
   GitHubComment,
+  GitHubFailedCheckDetail,
   GitHubIssueLink,
   GitHubIssueRecord,
   GitHubProjectFieldValue,
@@ -135,6 +136,13 @@ export class ReadScopeGitHubTransport implements GitHubTransport {
 
   listClosingPullRequests(issueId: string, cursor: string | null): Promise<Page<GitHubPullRequestEvidence>> {
     return this.#memo(`listClosingPullRequests\n${issueId}\n${cursor ?? ""}`, () => this.inner.listClosingPullRequests(issueId, cursor));
+  }
+
+  listFailedCheckDetails(repository: string, headSha: string): Promise<GitHubFailedCheckDetail[]> {
+    return this.#memo(
+      `listFailedCheckDetails\n${repository}\n${headSha}`,
+      () => this.inner.listFailedCheckDetails(repository, headSha),
+    );
   }
 
   getBranch(repository: string, branchName: string): Promise<GitHubBranchEvidence | null> {

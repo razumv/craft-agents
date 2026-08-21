@@ -86,6 +86,7 @@ class RecordingTransport implements GitHubTransport {
   listProjectFieldValues(): Promise<Page<never>> { return this.read("listProjectFieldValues", []); }
   listComments(): Promise<Page<GitHubComment>> { return this.read("listComments", []); }
   listClosingPullRequests(): Promise<Page<never>> { return this.read("listClosingPullRequests", []); }
+  listFailedCheckDetails(): Promise<never[]> { return this.read("listFailedCheckDetails", []).then((page) => page.nodes); }
   getBranch(): Promise<null> { this.calls.push("getBranch"); return Promise.resolve(null); }
   getBaseSha(): Promise<string> { this.calls.push("getBaseSha"); return Promise.resolve("b".repeat(40)); }
   mergePullRequest(): Promise<void> { return Promise.resolve(this.write("mergePullRequest")); }
@@ -129,6 +130,7 @@ class ApplyingTransport implements GitHubTransport {
   }
   listComments(): Promise<Page<GitHubComment>> { return this.page([]); }
   listClosingPullRequests(): Promise<Page<never>> { return this.page([]); }
+  listFailedCheckDetails(): Promise<never[]> { return Promise.resolve([]); }
   getBranch(): Promise<null> { return Promise.resolve(null); }
   getBaseSha(): Promise<string> {
     this.calls.push("read-baseline");

@@ -2,11 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { formatStatusOutput } from "./cli-output";
+import type { CiRepairProposal } from "./ci-repair";
 import { createLiveRunner, loadLiveRunnerConfig } from "./runner";
 import type { CrashPoint } from "./scheduler";
 
 const [configPath, command = "status", ...args] = process.argv.slice(2);
-if (!configPath) fail("usage: bun run src/cli.ts <absolute-config.json> <preflight|tick|status|propose-deadline-successor|project|transition-pr-open|archive|watch> [options]");
+if (!configPath) fail("usage: bun run src/cli.ts <absolute-config.json> <preflight|tick|status|prepare-ci-repair|propose-deadline-successor|project|transition-pr-open|archive|watch> [options]");
 
 const config = await loadLiveRunnerConfig(configPath);
 const runner = await createLiveRunner(config);
@@ -25,6 +26,19 @@ switch (command) {
   case "status":
     process.stdout.write(formatStatusOutput(await runner.readStatus(), args.includes("--compact")));
     break;
+  case "prepare-ci-repair": {
+    const [issueId, proposalPath] = args;
+    if (!issueId || !proposalPath) fail("prepare-ci-repair requires <issue-node-id> <proposal.json|->");
+    const raw = proposalPath === "-" ? await Bun.stdin.text() : await Bun.file(proposalPath).text();
+    let proposal: CiRepairProposal;
+    try {
+      proposal = JSON.parse(raw) as CiRepairProposal;
+    } catch {
+      fail("prepare-ci-repair proposal is not valid JSON");
+    }
+    output(await runner.prepareCiRepair(issueId, proposal));
+    break;
+  }
   case "propose-deadline-successor":
     output(await runner.proposeDeadlineSuccessor());
     break;

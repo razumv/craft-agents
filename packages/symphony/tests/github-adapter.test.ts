@@ -52,6 +52,7 @@ class MemoryGitHubTransport implements GitHubTransport {
   readonly fields = new Map<string, GitHubProjectFieldValue[]>();
   readonly comments = new Map<string, GitHubComment[]>();
   readonly prs = new Map<string, GitHubPullRequestEvidence[]>();
+  readonly failedChecks = new Map<string, { checkName: string; checkUrl: string; command: string; output: string }[]>();
   readonly branches = new Map<string, GitHubBranchEvidence>();
   readonly calls = new Map<string, number>();
   readonly issueBounds: (string | null)[] = [];
@@ -119,6 +120,10 @@ class MemoryGitHubTransport implements GitHubTransport {
   }
   listClosingPullRequests(issueId: string, cursor: string | null): Promise<Page<GitHubPullRequestEvidence>> {
     return Promise.resolve(this.paged("pull-requests", this.prs.get(issueId) ?? [], cursor));
+  }
+  listFailedCheckDetails(_repository: string, headSha: string) {
+    this.hit("failed-check-details");
+    return Promise.resolve(structuredClone(this.failedChecks.get(headSha) ?? []));
   }
   getBranch(_repository: string, branchName: string): Promise<GitHubBranchEvidence | null> {
     this.hit("branch");
@@ -448,6 +453,87 @@ describe("v4.2 GitHub Issues and Projects adapter", () => {
     // guessing here could show a managed issue as unmanaged backlog.
 
     expect(await adapter.fetchBacklog()).toEqual([]);
+  });
+
+  test("grounds a red pull request in the provider's exact failing command and output", async () => {
+    const { transport, adapter } = setup();
+    transport.addIssue(1, "pr-open").labelNames = ["v4", "state:pr-open"];
+    attachPr(transport, "I_1", false, { state: "FAILURE", count: 1 });
+    transport.failedChecks.set("d".repeat(40), [{
+      checkName: "validate / test",
+      checkUrl: "https://github.test/acme/repo/actions/runs/1",
+      command: "bun test packages/symphony/tests/ci-repair.test.ts",
+      output: "AssertionError: expected exact provider output",
+    }]);
+
+    expect(await adapter.ciFailure("I_1")).toEqual({
+      pullRequestId: "PR_1",
+      pullRequestUrl: "https://github.test/acme/repo/pull/1",
+      headBranch: "v4/acme-repo-1",
+      headSha: "d".repeat(40),
+      checkName: "validate / test",
+      checkUrl: "https://github.test/acme/repo/actions/runs/1",
+      command: "bun test packages/symphony/tests/ci-repair.test.ts",
+      output: "AssertionError: expected exact provider output",
+    });
+    expect(transport.calls.get("failed-check-details")).toBe(1);
+  });
+
+  test("serializes concurrent repair authorizations so one attempt number is consumed once", async () => {
+    const { transport, adapter } = setup();
+    transport.addIssue(1, "pr-open").labelNames = ["v4", "state:pr-open"];
+    const candidate = {
+      attempt: 1 as const,
+      headSha: "d".repeat(40),
+      checkName: "validate / test",
+      command: "bun test",
+      output: "failure",
+      cause: "contract-work" as const,
+      diagnosis: "one diagnosis",
+      touchedPaths: ["src/widget.ts"],
+      previousMistake: null,
+    };
+    const results = await Promise.allSettled([
+      adapter.recordCiRepairAttempt("I_1", "PR_1", candidate),
+      adapter.recordCiRepairAttempt("I_1", "PR_1", candidate),
+    ]);
+    expect(results.map((result) => result.status).sort()).toEqual(["fulfilled", "rejected"]);
+    expect(await adapter.ciRepairAttempts("I_1", "PR_1")).toHaveLength(1);
+  });
+
+  test("persists the repair budget in authenticated provider comments and refuses a third attempt", async () => {
+    const { transport, adapter } = setup();
+    transport.addIssue(1, "pr-open").labelNames = ["v4", "state:pr-open"];
+    const base = {
+      headSha: "d".repeat(40),
+      checkName: "validate / test",
+      command: "bun test",
+      output: "failure",
+      cause: "contract-work" as const,
+      touchedPaths: ["src/widget.ts"],
+    };
+    await adapter.recordCiRepairAttempt("I_1", "PR_1", {
+      ...base, attempt: 1, diagnosis: "first diagnosis", previousMistake: null,
+    });
+    await adapter.recordCiRepairAttempt("I_1", "PR_1", {
+      ...base, attempt: 2, diagnosis: "second diagnosis", previousMistake: "the first diagnosis targeted the wrong layer",
+    });
+
+    expect(await adapter.ciRepairAttempts("I_1", "PR_1")).toMatchObject([
+      { attempt: 1, diagnosis: "first diagnosis" },
+      { attempt: 2, diagnosis: "second diagnosis", previousMistake: "the first diagnosis targeted the wrong layer" },
+    ]);
+    await expect(adapter.recordCiRepairAttempt("I_1", "PR_1", {
+      ...base, attempt: 2, diagnosis: "third diagnosis", previousMistake: "again",
+    })).rejects.toThrow("two-attempt cap");
+  });
+
+  test("returns no actionable repair evidence when a red rollup has no failed-step detail", async () => {
+    const { transport, adapter } = setup();
+    transport.addIssue(1, "pr-open").labelNames = ["v4", "state:pr-open"];
+    attachPr(transport, "I_1", false, { state: "FAILURE", count: 1 });
+
+    expect(await adapter.ciFailure("I_1")).toBeNull();
   });
 
   test("auto-merge lands a mergeable pull request whose checks actually passed", async () => {

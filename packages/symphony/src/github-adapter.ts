@@ -33,6 +33,12 @@ import type {
   GitHubTransport,
   Page,
 } from "./github-transport";
+import {
+  ciRepairAttemptComment,
+  parseCiRepairAttemptComment,
+  type CiFailureDetail,
+  type CiRepairAttempt,
+} from "./ci-repair";
 import type {
   LifecycleDecisionResult,
   StartupReconciliation,
@@ -301,6 +307,61 @@ export class GitHubIssuesProjectsAdapter implements TrackerAdapter {
    * definition of "landable" for both, so a gate can never be raised on a pull
    * request that auto-merge would have refused, and vice versa.
    */
+  async ciRepairAttempts(issueId: string, pullRequestId?: string): Promise<CiRepairAttempt[]> {
+    const comments = await collectPages((cursor) => this.transport.listComments(issueId, cursor));
+    const records = comments.flatMap((comment) => {
+      if (this.config.eventAuthorLogin && comment.authorLogin !== this.config.eventAuthorLogin) return [];
+      const record = parseCiRepairAttemptComment(comment.body);
+      if (!record || record.issueId !== issueId || (pullRequestId && record.pullRequestId !== pullRequestId)) return [];
+      return [record];
+    });
+    const attempts = records.map((record) => record.attempt).sort((left, right) => left.attempt - right.attempt);
+    for (let index = 0; index < attempts.length; index += 1) {
+      if (attempts[index]!.attempt !== index + 1) throw new Error("CI repair attempt ledger is duplicated or non-sequential");
+    }
+    return attempts;
+  }
+
+  async recordCiRepairAttempt(issueId: string, pullRequestId: string, attempt: CiRepairAttempt): Promise<void> {
+    return this.#withStateLock(async () => {
+      const existing = await this.ciRepairAttempts(issueId, pullRequestId);
+      if (attempt.attempt !== existing.length + 1 || existing.length >= 2) {
+        throw new Error("CI repair attempt is duplicated, out of sequence, or above the two-attempt cap");
+      }
+      const body = ciRepairAttemptComment(issueId, pullRequestId, attempt);
+      const written = await this.transport.appendComment(issueId, body);
+      if (written.body !== body || (this.config.eventAuthorLogin && written.authorLogin !== this.config.eventAuthorLogin)) {
+        throw new Error("CI repair attempt record did not read back exactly from the configured provider author");
+      }
+    });
+  }
+
+  async ciFailure(issueId: string): Promise<CiFailureDetail | null> {
+    const detailed = await this.detailed(issueId);
+    const contract = detailed.snapshot.contract;
+    const prs = (await collectPages((cursor) => this.transport.listClosingPullRequests(issueId, cursor))).filter((pr) => (
+      pr.state === "OPEN"
+      && pr.headRefName === contract.requiredBranch
+      && pr.baseRefName === contract.baseBranch
+    ));
+    if (prs.length !== 1) return null;
+    const pr = prs[0]!;
+    if (pr.checkRollupState !== "FAILURE" && pr.checkRollupState !== "ERROR") return null;
+    const failures = await this.transport.listFailedCheckDetails(this.config.repository, pr.headRefOid);
+    if (failures.length === 0) return null;
+    const failure = failures[0]!;
+    return {
+      pullRequestId: pr.id,
+      pullRequestUrl: pr.url,
+      headBranch: pr.headRefName,
+      headSha: pr.headRefOid,
+      checkName: failure.checkName,
+      checkUrl: failure.checkUrl,
+      command: failure.command,
+      output: failure.output,
+    };
+  }
+
   async mergeReadiness(issueId: string): Promise<{ ready: boolean; reason: string; headSha: string }> {
     const verdict = await this.landableClosingPullRequest(issueId);
     return verdict.pr
