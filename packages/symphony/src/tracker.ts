@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+import type { OwnerDirective } from "./ledger";
 import type {
   Claim,
   FailureClass,
@@ -65,6 +66,8 @@ export interface TrackerAdapter {
    * raised on the provider's own evidence without anything being landed.
    */
   mergeReadiness?(issueId: string): Promise<{ ready: boolean; reason: string; headSha: string }>;
+  /** Durable, idempotent issue-visible receipt for one immutable Project Desk directive. */
+  recordOwnerDirective?(directive: Readonly<OwnerDirective>): Promise<{ recorded: boolean }>;
   fetchIssuesByIds(ids: readonly string[]): Promise<TrackerIssueSnapshot[]>;
   activeClaims(): Awaitable<TrackerIssueSnapshot[]>;
   get(issueId: string): Awaitable<TrackerIssueSnapshot>;

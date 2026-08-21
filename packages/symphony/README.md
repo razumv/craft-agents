@@ -36,6 +36,20 @@ The workflow schema is exported as `@craft-agent/symphony/workflow.schema.json`.
 - root-confined, atomic workspace claim bindings;
 - fresh replacement sessions with bounded status handoff and no transcript inheritance.
 
+## Project Desk directives
+
+Every runner cycle reads only its configured `craft.ownerSessionId` before dispatch. A desk message is binding only when it exactly matches one of these forms:
+
+```text
+DIRECTIVE <issue node ID or repository#number>: <verbatim instruction>
+APPROVE <currently open gate ID>
+REJECT <currently open gate ID>: <reason>
+```
+
+All other owner messages remain conversation and are not stored. Gate IDs are matched to the issue currently in `owner-gate`; stale IDs are refused with the current mismatch, never retargeted. Accepted messages are keyed by the configured desk session plus source message ID, stored once in the immutable Craft ledger, and projected as an idempotent visible receipt on the target GitHub issue. Generic directive text is delivered but not interpreted or acted on; exact current gate decisions use the existing merge/block lifecycle paths.
+
+Measured at the `CraftRpcTransport` boundary, an unchanged desk costs **4 provider reads per lane per cycle**: runtime identity, session index, desk transcript, and desk notes. A cycle discovering one or more new messages batches them into **5 reads plus 1 write** (the fifth read verifies the acknowledgement write), so the hard bound is **6 provider calls per lane per cycle**, independent of the number of new messages in that transcript.
+
 ## Failed-work decisions
 
 A terminal failed attempt does not decide whether the work is still wanted. An owner may revive an **open** failed issue only by naming a demonstrably changed fact or reference; that exact justification is append-only, can be used once, and grants a fresh attempt budget starting again at attempt 1. `scheduler.max_revivals` bounds those fresh budgets. A failed issue may instead be recorded as cancelled only when supersession names the exact successor where the work continued.

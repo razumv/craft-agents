@@ -209,11 +209,62 @@ export class LiveV4Runner {
 
   async tick(crashAfter?: CrashPoint): Promise<LiveRunnerStatus> {
     this.#beginOperation();
-    // Dispatch always gets first refusal: an existing ready issue must consume
-    // the lane before autonomous grooming is even considered.
+    // Owner input is part of this cycle's frozen context. Poll before dispatch
+    // so a directive addressed to a ready issue reaches the session created by
+    // this tick. Failure is diagnostic-only: an unreadable desk cannot stop the
+    // lane, and the fleet service can continue operating its other runners.
+    await this.#pollOwnerDesk();
+    // Dispatch always gets first refusal after owner input: an existing ready
+    // issue must consume the lane before autonomous grooming is considered.
     await this.scheduler.tick(crashAfter);
     await this.#groomIdleLaneAfterDispatch();
     return this.#readStatusInScope();
+  }
+
+  async #pollOwnerDesk(): Promise<void> {
+    try {
+      const snapshots = this.config.mode === "discovery"
+        ? await this.tracker.fetchIssuesByStates(lifecycleStates)
+        : [await this.tracker.get(this.#pinnedIssueId())];
+      const poll = await this.craft.pollOwnerDesk(snapshots.map((snapshot) => ({
+        issueId: snapshot.issue.id,
+        issueIdentifier: snapshot.issue.identifier,
+        ...(snapshot.issue.state === "owner-gate" && snapshot.evidence.ownerGateId
+          ? { gateId: snapshot.evidence.ownerGateId }
+          : {}),
+      })));
+      for (const refusal of poll.refusals) this.onDiagnostic(`owner directive refused: ${refusal}`);
+      for (const item of poll.directives) {
+        let current = item.gateDecision ? await this.tracker.get(item.directive.issueId) : null;
+        if (item.gateDecision && (current?.issue.state !== "owner-gate" || current.evidence.ownerGateId !== item.gateDecision.gateId)) {
+          const actual = current?.evidence.ownerGateId ?? "none";
+          throw new Error(`owner decision gate ${item.gateDecision.gateId} does not match the currently open gate (${actual})`);
+        }
+        if (!this.tracker.recordOwnerDirective) throw new Error("tracker cannot persist owner directive receipts");
+        await this.tracker.recordOwnerDirective(item.directive);
+        if (!item.gateDecision || !current) continue;
+        // The receipt write is external. Re-read before acting so a gate changed
+        // concurrently cannot inherit a decision for the prior gate.
+        current = await this.tracker.get(item.directive.issueId);
+        if (current.issue.state !== "owner-gate" || current.evidence.ownerGateId !== item.gateDecision.gateId) {
+          const actual = current.evidence.ownerGateId ?? "none";
+          throw new Error(`owner decision gate ${item.gateDecision.gateId} does not match the currently open gate (${actual})`);
+        }
+        if (item.gateDecision.kind === "approve") {
+          if (!this.tracker.mergeClosingPullRequest) throw new Error("tracker cannot apply an owner gate approval");
+          const outcome = await this.tracker.mergeClosingPullRequest(current.issue.id);
+          this.onDiagnostic(`owner gate approval ${outcome.merged ? "merged" : "declined"} ${current.issue.identifier}: ${outcome.reason}`);
+        } else {
+          await this.tracker.transition(current.issue.id, "blocked", Date.now(), {
+            ...(current.claim ? { fence: current.claim.fence } : {}),
+            evidence: { ...current.evidence, blocker: `owner rejected ${item.gateDecision.gateId}: ${item.gateDecision.reason}` },
+            message: `owner rejected ${item.gateDecision.gateId}: ${item.gateDecision.reason}`,
+          });
+        }
+      }
+    } catch (error) {
+      this.onDiagnostic(`Project Desk read failed; cycle continues: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
 
   /**

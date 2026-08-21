@@ -298,6 +298,32 @@ function attachPr(
 }
 
 describe("v4.2 GitHub Issues and Projects adapter", () => {
+  test("projects one immutable directive receipt visibly on its issue and deduplicates after restart", async () => {
+    const { transport, truth, adapter } = setup();
+    transport.addIssue(1);
+    const directive = {
+      id: "directive-owner-1",
+      issueId: "I_1",
+      receivedAtMs: 2_000,
+      acknowledgedAtMs: 2_000,
+      verbatim: "Keep the change bounded.",
+      sourceSessionId: "owner-desk",
+      sourceMessageId: "owner-message-1",
+      sourceTimestampMs: 1_500,
+      acknowledgementId: "ack-owner-1",
+    };
+
+    expect(await adapter.recordOwnerDirective(directive)).toEqual({ recorded: true });
+    const restarted = new GitHubIssuesProjectsAdapter(config(), transport, truth);
+    expect(await restarted.recordOwnerDirective(directive)).toEqual({ recorded: false });
+
+    const receipts = transport.comments.get("I_1")!;
+    expect(receipts).toHaveLength(1);
+    expect(receipts[0]!.body).toContain("Project Desk directive received for **acme/repo#1**");
+    expect(receipts[0]!.body).toContain("> Keep the change bounded.");
+    expect(transport.calls.get("append-comment")).toBe(1);
+  });
+
   test("empty fetches avoid provider requests and pagination normalizes exact fields and dependencies", async () => {
     const { transport, adapter } = setup();
     transport.pageSize = 1;

@@ -10,6 +10,8 @@ export interface OwnerDirective {
   sourceSessionId?: string;
   /** Exact owner-authored message verified in the configured desk transcript. */
   sourceMessageId?: string;
+  /** Author timestamp; distinct from receivedAtMs when a polling cycle discovers an older message. */
+  sourceTimestampMs?: number;
   /** Immutable evidence for the compact acknowledgement projection. */
   acknowledgementId?: string;
 }
