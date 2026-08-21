@@ -366,22 +366,21 @@ export class GitHubIssuesProjectsAdapter implements TrackerAdapter {
         results.push({ issueId: snapshot.issue.id, action: "preservation-unknown", reason });
         continue;
       }
-      if (snapshot.issue.state === "running" && snapshot.evidence.prUrl) {
-        await this.transition(snapshot.issue.id, "pr-open", nowMs, {
+      // Startup reconciliation used to carry its own copy of the evidence hops,
+      // and a copy drifts: every rule added to the real table since — high-risk
+      // work merged without its gate going to blocked, a merge after a failed
+      // attempt, an issue closed by hand — was missing here. razumv/lineage2-server#94
+      // hit exactly that: this path insisted on `merged` for a high-risk contract,
+      // the ledger's guard refused it every cycle, and after three refusals the
+      // whole project was dropped from the autonomous loop for the night.
+      const step = nextEvidenceStep(snapshot);
+      if (step) {
+        await this.transition(snapshot.issue.id, step.to, nowMs, {
           fence: claim.fence,
-          message: "startup reconciliation observed pull request evidence",
+          message: `startup reconciliation observed ${step.reason}`,
           evidence: snapshot.evidence,
         });
-        results.push({ issueId: snapshot.issue.id, action: "advanced", reason: "pull request evidence" });
-        continue;
-      }
-      if (["pr-open", "review", "owner-gate"].includes(snapshot.issue.state) && snapshot.evidence.mergedAt) {
-        await this.transition(snapshot.issue.id, "merged", nowMs, {
-          fence: claim.fence,
-          message: "startup reconciliation observed merge evidence",
-          evidence: snapshot.evidence,
-        });
-        results.push({ issueId: snapshot.issue.id, action: "advanced", reason: "merge evidence" });
+        results.push({ issueId: snapshot.issue.id, action: "advanced", reason: step.reason });
         continue;
       }
       results.push({ issueId: snapshot.issue.id, action: "resume", reason: truth.kind === "absent" ? "claimed workspace not created yet" : "claim binding matches" });
