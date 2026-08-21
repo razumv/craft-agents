@@ -6,7 +6,8 @@ import { resolve } from "node:path";
 import type { CraftExecutionSession, CraftRpcSession, ProjectDeskReadback } from "./craft-adapter";
 import { CraftMobileControlPlaneAdapter } from "./craft-adapter";
 import { CraftCliRpcTransport, type CraftCliTransportConfig } from "./craft-transport";
-import type { LifecycleState, ProjectStatus, TrackerIssueSnapshot, WorkflowConfig } from "./domain";
+import { lifecycleStates, type LifecycleState, type ProjectStatus, type TrackerIssueSnapshot, type WorkflowConfig } from "./domain";
+import { proposeDeadlineSuccessor, type DeadlineSuccessorProposal } from "./deadline-triage";
 import { GitHubIssuesProjectsAdapter, type GitHubStateProjection } from "./github-adapter";
 import {
   GhCliTransport,
@@ -23,7 +24,7 @@ import {
 import { ModelPolicy } from "./policy";
 import { proposeBacklogGrooming, type GroomingProposal } from "./grooming";
 import { ReadScopeGitHubTransport } from "./read-scope-transport";
-import { DeterministicScheduler, type Clock, type CrashPoint, type ShadowProposal } from "./scheduler";
+import { compareForDispatch, DeterministicScheduler, type Clock, type CrashPoint, type ShadowProposal } from "./scheduler";
 import type { TrackerBacklogIssue } from "./tracker";
 import { projectStatus } from "./status";
 import { loadWorkflow } from "./workflow";
@@ -299,6 +300,22 @@ export class LiveV4Runner {
     this.#beginOperation();
     const backlog = await this.tracker.fetchBacklog();
     return proposeBacklogGrooming(this.config.github.repository, backlog, this.workflow);
+  }
+
+  /**
+   * Read failed managed issues and return the first grounded deadline successor.
+   * Like grooming, this method has no applying capability: it performs no issue,
+   * label, comment, or Project mutation.
+   */
+  async proposeDeadlineSuccessor(): Promise<DeadlineSuccessorProposal | null> {
+    this.#beginOperation();
+    const issues = await this.tracker.fetchIssuesByStates(lifecycleStates);
+    for (const failed of issues.filter((issue) => issue.issue.state === "failed").sort(compareForDispatch)) {
+      const preserved = await this.workspaces?.findPreservedBranches(failed.contract.requiredBranch) ?? [];
+      const proposal = proposeDeadlineSuccessor(failed, this.workflow, issues, preserved);
+      if (proposal) return proposal;
+    }
+    return null;
   }
 
   async projectDesk(): Promise<ProjectDeskReadback> {

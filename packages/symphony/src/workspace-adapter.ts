@@ -78,6 +78,28 @@ export class GitWorktreeAdapter {
     return { gitExecutable, repositoryRoot, workspaceRoot };
   }
 
+  /**
+   * Read the rescue refs created for a deterministic branch. The ref namespace
+   * is derived by the same function as preservation, so unrelated branches can
+   * never be inherited by a successor proposal.
+   */
+  async findPreservedBranches(requiredBranch: string): Promise<{ branch: string; commit: string }[]> {
+    const branch = validateBranch(requiredBranch);
+    const prefix = `v4-preserved/${stripRefPrefix(branch)}-a`;
+    const output = await this.git([
+      "for-each-ref",
+      "--format=%(refname:short)%09%(objectname)",
+      "refs/heads/v4-preserved",
+    ]);
+    return output.split(/\r?\n/).filter(Boolean).flatMap((line) => {
+      const [preservedBranch, commit, ...extra] = line.split("\t");
+      if (!preservedBranch || !commit || extra.length || !/^[0-9a-f]{40,64}$/i.test(commit)) {
+        throw new Error("git returned an invalid preserved branch record");
+      }
+      return preservedBranch.startsWith(prefix) ? [{ branch: preservedBranch, commit }] : [];
+    }).sort((left, right) => left.branch.localeCompare(right.branch) || left.commit.localeCompare(right.commit));
+  }
+
   async ensure(identity: RunIdentity, context?: CraftStartContext): Promise<GitWorktree> {
     if (!context) throw new Error("real worktree adapter requires frozen issue/run context");
     const { claim, contract } = context;
