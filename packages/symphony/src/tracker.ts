@@ -54,6 +54,13 @@ export interface TrackerAdapter {
    * rather than silently doing nothing. Optional capability.
    */
   mergeClosingPullRequest?(issueId: string): Promise<{ merged: boolean; reason: string }>;
+
+  /**
+   * Whether the closing pull request could be merged right now, and the head
+   * commit it would land. Asked separately from merging, so an owner gate can be
+   * raised on the provider's own evidence without anything being landed.
+   */
+  mergeReadiness?(issueId: string): Promise<{ ready: boolean; reason: string; headSha: string }>;
   fetchIssuesByIds(ids: readonly string[]): Promise<TrackerIssueSnapshot[]>;
   activeClaims(): Awaitable<TrackerIssueSnapshot[]>;
   get(issueId: string): Awaitable<TrackerIssueSnapshot>;

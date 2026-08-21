@@ -220,6 +220,56 @@ describe("v4.1 deterministic scheduler core", () => {
     expect(attempts).toBeEmpty();
   });
 
+  test("work above the ceiling is raised to the owner gate, and only when the provider says it could land", async () => {
+    const drive = async (ready: boolean) => {
+      const diagnostics: string[] = [];
+      const simulator = new CrashRestartSimulator(workflow);
+      const seeded = simulator.seed(issue(), contract("high"));
+      const github = simulator.github as unknown as {
+        mergeReadiness?: (issueId: string) => Promise<{ ready: boolean; reason: string; headSha: string }>;
+        mergeClosingPullRequest?: (issueId: string) => Promise<{ merged: boolean; reason: string }>;
+      };
+      let merged = false;
+      github.mergeClosingPullRequest = async () => { merged = true; return { merged: true, reason: "should not happen" }; };
+      github.mergeReadiness = async () => ready
+        ? { ready: true, reason: "mergeable with passing checks", headSha: "f".repeat(40) }
+        : { ready: false, reason: "checks are FAILURE", headSha: "f".repeat(40) };
+
+      const config = { ...workflow.config, autoMerge: { enabled: true, maxRisk: "medium" as RiskTier } };
+      const adapters = {
+        github: simulator.github,
+        workspaces: simulator.workspaces,
+        craft: simulator.craft,
+        onDiagnostic: (message: string) => diagnostics.push(message),
+      };
+      const scheduler = new DeterministicScheduler(config, adapters, simulator.clock);
+      // Claim and start, then put the run where a finished agent leaves it.
+      await scheduler.tick();
+      const claim = (await simulator.github.activeClaims())[0]?.claim;
+      if (claim) {
+        await simulator.github.transition(seeded.id, "pr-open", simulator.clock.nowMs(), {
+          fence: claim.fence,
+          evidence: { prUrl: "https://github.test/acme/repo/pull/1" },
+        });
+      }
+      await scheduler.tick();
+      return { diagnostics: diagnostics.join(" "), merged, state: (await simulator.github.get(seeded.id)).issue.state };
+    };
+
+    // Green and above the ceiling: the owner is given something to decide, and the
+    // lane does not land it itself.
+    const green = await drive(true);
+    expect(green.diagnostics).toContain("owner gate raised");
+    expect(green.merged).toBeFalse();
+    expect(green.state).toBe("owner-gate");
+
+    // Red and above the ceiling: an owner asked to approve what CI has not passed
+    // is being asked to guess, so no gate is raised and it stays where it was.
+    const red = await drive(false);
+    expect(red.diagnostics).toContain("owner gate withheld");
+    expect(red.state).toBe("pr-open");
+  });
+
   test("owner directives are immutable and gates require exact IDs", () => {
     const ledger = new OwnerDirectiveLedger();
     const entry = ledger.append({
