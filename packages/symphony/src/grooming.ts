@@ -61,6 +61,25 @@ export interface RefusedGroomingContract extends GroomingProposalBase {
 
 export type GroomingProposal = ProposedGroomingContract | RefusedGroomingContract;
 
+export type GroomingApplyStep = "preflight" | "body" | "readback" | "attribution" | "status" | "label";
+
+export type GroomingApplyReport =
+  | { outcome: "refused"; writes: 0; reason: string }
+  | { outcome: "already-present"; writes: 0; issueIdentifier: string }
+  | { outcome: "lifecycle-present"; writes: 0; issueIdentifier: string; labels: string[] }
+  | { outcome: "applied"; writes: 4; issueIdentifier: string; baselineSha: string }
+  | { outcome: "failed"; writes: number; issueIdentifier: string; step: GroomingApplyStep; error: string };
+
+/** The exact body persisted by apply: original backlog authorship plus the grounded contract. */
+export function appliedGroomingBody(original: string, contractMarkdown: string): string {
+  return [original.trimEnd(), contractMarkdown.trim()].filter(Boolean).join("\n\n");
+}
+
+/** Attribution is deliberately human-readable and carries the immutable repository baseline. */
+export function groomingAttributionComment(issueIdentifier: string, repository: string, baselineSha: string): string {
+  return `Contract authored by Symphony grooming from backlog issue ${issueIdentifier} against repository ${repository} baseline ${baselineSha}.`;
+}
+
 type SectionName = "goal" | "acceptance" | "nonGoals" | null;
 type SourcedLine = { text: string; line: number };
 

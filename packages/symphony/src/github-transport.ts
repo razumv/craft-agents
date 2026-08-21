@@ -118,6 +118,8 @@ export interface GitHubTransport {
   getBranch(repository: string, branchName: string): Promise<GitHubBranchEvidence | null>;
   getBaseSha(repository: string, branchName: string): Promise<string>;
   appendComment(issueId: string, body: string): Promise<GitHubComment>;
+  /** Compare-and-set body update. False means the provider rejected a concurrent issue mutation. */
+  updateIssueBody(repository: string, issueNumber: number, body: string, expectedUpdatedAt: string): Promise<boolean>;
   replaceLabels(repository: string, issueNumber: number, labels: readonly string[]): Promise<void>;
   updateProjectSingleSelect(projectId: string, itemId: string, fieldId: string, optionId: string): Promise<void>;
   updateProjectText(projectId: string, itemId: string, fieldId: string, value: string): Promise<void>;
@@ -321,6 +323,23 @@ export class GhCliTransport implements GitHubTransport {
     const data = await this.graphql<{ addComment: { commentEdge: { node: GitHubComment & { author: { login: string } | null } } } }>(`mutation AppendEvent($id:ID!,$body:String!){addComment(input:{subjectId:$id,body:$body}){commentEdge{node{databaseId body author{login}createdAt updatedAt}}}}`, { id: issueId, body });
     const entry = data.addComment.commentEdge.node;
     return { ...entry, authorLogin: entry.author?.login ?? null };
+  }
+
+  async updateIssueBody(repository: string, issueNumber: number, body: string, expectedUpdatedAt: string): Promise<boolean> {
+    const input = JSON.stringify({ body });
+    const unmodifiedSince = new Date(expectedUpdatedAt).toUTCString();
+    if (unmodifiedSince === "Invalid Date") throw new Error("expected issue updatedAt must be a provider timestamp");
+    try {
+      await this.run([
+        "api", "--method", "PATCH", `repos/${repository}/issues/${issueNumber}`,
+        "--header", `If-Unmodified-Since: ${unmodifiedSince}`, "--input", "-",
+      ], input);
+      return true;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (/\b(?:HTTP )?412\b|precondition failed/i.test(message)) return false;
+      throw error;
+    }
   }
 
   async replaceLabels(repository: string, issueNumber: number, labels: readonly string[]): Promise<void> {

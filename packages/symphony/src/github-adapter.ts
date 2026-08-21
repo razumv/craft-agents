@@ -16,6 +16,13 @@ import {
   type WorkflowConfig,
 } from "./domain";
 import { parseIssueContract } from "./contract";
+import {
+  appliedGroomingBody,
+  groomingAttributionComment,
+  type GroomingApplyReport,
+  type GroomingApplyStep,
+  type GroomingProposal,
+} from "./grooming";
 import type {
   GitHubComment,
   GitHubIssueLink,
@@ -140,6 +147,90 @@ export class GitHubIssuesProjectsAdapter implements TrackerAdapter {
    * backlog candidates. Unknown/truncated labels are omitted rather than
    * guessed at, so a managed issue can never be mistaken for backlog.
    */
+  async applyGrooming(proposal: GroomingProposal): Promise<GroomingApplyReport> {
+    if (proposal.outcome === "refused") {
+      return { outcome: "refused", writes: 0, reason: proposal.refusal.message };
+    }
+    const identifier = proposal.candidate.identifier;
+    let writes = 0;
+    const failed = (step: GroomingApplyStep, error: unknown): GroomingApplyReport => ({
+      outcome: "failed", writes, issueIdentifier: identifier, step, error: errorMessage(error),
+    });
+
+    try {
+      if (proposal.repository !== this.config.repository || proposal.contract.repository !== this.config.repository) {
+        throw new Error("grooming proposal repository does not match adapter repository");
+      }
+      const [fresh] = await this.transport.getIssuesByNodeIds([proposal.candidate.id]);
+      if (!fresh || fresh.number !== proposal.candidate.number || fresh.state !== "OPEN") {
+        throw new Error("grooming candidate is missing, changed identity, or no longer open");
+      }
+      const labels = await collectPages((cursor) => this.transport.listLabels(fresh.id, cursor));
+      try {
+        parseIssueContract(fresh.body, identifier, this.config.workflow);
+        return { outcome: "already-present", writes: 0, issueIdentifier: identifier };
+      } catch {
+        // No parser-valid contract exists yet. Apply may proceed only if the
+        // issue text used to ground the proposal has not changed meanwhile.
+      }
+      const lifecycle = labels.filter((label) => this.#managedLabels.has(normalizeLabel(label)));
+      if (lifecycle.length) {
+        return { outcome: "lifecycle-present", writes: 0, issueIdentifier: identifier, labels: lifecycle };
+      }
+      if (fresh.body !== proposal.candidate.description) {
+        throw new Error("grooming candidate body changed after proposal");
+      }
+      const items = (await collectPages((cursor) => this.transport.listProjectItems(fresh.id, cursor)))
+        .filter((item) => item.projectId === this.config.projectId);
+      if (items.length !== 1) throw new Error(`expected exactly one configured Project item, found ${items.length}`);
+      const baselineSha = await this.transport.getBaseSha(this.config.repository, proposal.contract.baseBranch);
+      const body = appliedGroomingBody(fresh.body, proposal.contractMarkdown);
+
+      try {
+        const updated = await this.transport.updateIssueBody(
+          this.config.repository, fresh.number, body, fresh.updatedAt,
+        );
+        if (!updated) throw new Error("grooming body compare-and-set conflict");
+        writes += 1;
+      } catch (error) { return failed("body", error); }
+
+      let readback: GitHubIssueRecord | null = null;
+      try {
+        [readback] = await this.transport.getIssuesByNodeIds([fresh.id]);
+        if (!readback || readback.body !== body) throw new Error("written grooming body did not read back exactly");
+        parseIssueContract(readback.body, identifier, this.config.workflow);
+      } catch (error) { return failed("readback", error); }
+
+      try {
+        await this.transport.appendComment(fresh.id, groomingAttributionComment(identifier, this.config.repository, baselineSha));
+        writes += 1;
+      } catch (error) { return failed("attribution", error); }
+
+      try {
+        await this.transport.updateProjectSingleSelect(
+          this.config.projectId,
+          items[0]!.id,
+          this.config.statusFieldId,
+          this.config.states.ready.projectStatusOptionId,
+        );
+        writes += 1;
+      } catch (error) { return failed("status", error); }
+
+      try {
+        await this.transport.replaceLabels(
+          this.config.repository,
+          fresh.number,
+          [...labels, this.config.states.ready.label],
+        );
+        writes += 1;
+      } catch (error) { return failed("label", error); }
+
+      return { outcome: "applied", writes: 4, issueIdentifier: identifier, baselineSha };
+    } catch (error) {
+      return failed("preflight", error);
+    }
+  }
+
   async fetchBacklog(): Promise<TrackerBacklogIssue[]> {
     return this.#withStateLock(async () => {
       const scan = await this.#scanRecords(new Set());
