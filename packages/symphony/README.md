@@ -36,6 +36,12 @@ The workflow schema is exported as `@craft-agent/symphony/workflow.schema.json`.
 - root-confined, atomic workspace claim bindings;
 - fresh replacement sessions with bounded status handoff and no transcript inheritance.
 
+## Failed-work decisions
+
+A terminal failed attempt does not decide whether the work is still wanted. An owner may revive an **open** failed issue only by naming a demonstrably changed fact or reference; that exact justification is append-only, can be used once, and grants a fresh attempt budget starting again at attempt 1. `scheduler.max_revivals` bounds those fresh budgets. A failed issue may instead be recorded as cancelled only when supersession names the exact successor where the work continued.
+
+Neither decision is delivery. Only the provider's own merge evidence can advance work to `merged`, `deployed`, or `done`. **Closed now means work that is not wanted**: closure remains an explicit owner decision, never an automatic fallback for a failed attempt.
+
 ## Read-only backlog grooming
 
 `LiveV4Runner.proposeGrooming()` reads one repository's existing unmanaged backlog and returns either one parser-valid contract proposal or an exact refusal. It never labels, comments, edits, claims, or updates a Project field. Candidate order is the scheduler's upstream order: priority 1 through 4 ascending; every other value and null after; creation time oldest first with null last; then identifier.

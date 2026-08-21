@@ -35,12 +35,13 @@
     },
     "scheduler": {
       "type": "object",
-      "required": ["wip_limit", "claim_ttl_ms", "stale_run_ms", "max_attempts", "retry_base_ms", "retry_max_ms"],
+      "required": ["wip_limit", "claim_ttl_ms", "stale_run_ms", "max_attempts", "max_revivals", "retry_base_ms", "retry_max_ms"],
       "properties": {
         "wip_limit": { "const": 1 },
         "claim_ttl_ms": { "type": "integer", "minimum": 1 },
         "stale_run_ms": { "type": "integer", "minimum": 1 },
         "max_attempts": { "type": "integer", "minimum": 1 },
+        "max_revivals": { "type": "integer", "minimum": 0 },
         "retry_base_ms": { "type": "integer", "minimum": 1 },
         "retry_max_ms": { "type": "integer", "minimum": 1 }
       },

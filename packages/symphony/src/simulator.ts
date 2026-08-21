@@ -6,13 +6,14 @@ import type { NormalizedIssue, ProjectStatus, WorkflowDefinition } from "./domai
 import { DeterministicScheduler, ManualClock, SimulatedCrash, type CrashPoint } from "./scheduler";
 
 export class CrashRestartSimulator {
-  readonly github = new FakeGitHubAdapter();
+  readonly github: FakeGitHubAdapter;
   readonly craft = new FakeCraftAdapter();
   readonly workspaces = new FakeWorkspaceAdapter();
   readonly clock = new ManualClock(1_000_000);
   scheduler: DeterministicScheduler;
 
   constructor(readonly workflow: WorkflowDefinition) {
+    this.github = new FakeGitHubAdapter(workflow.config.scheduler.maxRevivals);
     this.scheduler = this.newScheduler();
   }
 

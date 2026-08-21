@@ -113,6 +113,8 @@ export function parseWorkflow(content: string, workflowPath = resolve("WORKFLOW.
   const workspaceRoot = isAbsolute(rootPath) ? resolve(rootPath) : resolve(dirname(workflowPath), rootPath);
   const retryBaseMs = integer(scheduler.retry_base_ms, "scheduler.retry_base_ms");
   const retryMaxMs = integer(scheduler.retry_max_ms, "scheduler.retry_max_ms");
+  const maxRevivals = integer(scheduler.max_revivals, "scheduler.max_revivals");
+  if (maxRevivals < 0) throw new Error("scheduler.max_revivals must be non-negative");
   if (retryMaxMs < retryBaseMs) throw new Error("scheduler.retry_max_ms must be >= retry_base_ms");
 
   const config: WorkflowConfig = {
@@ -134,6 +136,7 @@ export function parseWorkflow(content: string, workflowPath = resolve("WORKFLOW.
       claimTtlMs: integer(scheduler.claim_ttl_ms, "scheduler.claim_ttl_ms"),
       staleRunMs: integer(scheduler.stale_run_ms, "scheduler.stale_run_ms"),
       maxAttempts: integer(scheduler.max_attempts, "scheduler.max_attempts"),
+      maxRevivals,
       retryBaseMs,
       retryMaxMs,
     },

@@ -17,6 +17,10 @@ export interface TrackerTransitionOptions {
   evidence?: MaterialEvidence;
 }
 
+export type LifecycleDecisionResult =
+  | { accepted: true; snapshot: TrackerIssueSnapshot; reason: string }
+  | { accepted: false; snapshot: TrackerIssueSnapshot; reason: string };
+
 /** Provider-independent durable tracker boundary used by the deterministic scheduler. */
 /**
  * An open issue in the configured repository that the lane does NOT manage: no
@@ -79,6 +83,10 @@ export interface TrackerAdapter {
     nowMs: number,
     scheduler: WorkflowConfig["scheduler"],
   ): Awaitable<TrackerIssueSnapshot>;
+  /** Owner decision: failed work gets a fresh attempt budget because this exact fact changed. */
+  reviveFailed(issueId: string, justification: string, nowMs: number): Awaitable<LifecycleDecisionResult>;
+  /** Owner decision: failed work intentionally continued at this exact successor reference. */
+  supersedeFailed(issueId: string, successor: string, nowMs: number): Awaitable<LifecycleDecisionResult>;
   transition(
     issueId: string,
     to: LifecycleState,

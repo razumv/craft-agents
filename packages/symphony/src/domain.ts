@@ -96,6 +96,8 @@ export interface WorkflowConfig {
     claimTtlMs: number;
     staleRunMs: number;
     maxAttempts: number;
+    /** Maximum fresh attempt budgets an owner may grant after terminal failure. */
+    maxRevivals: number;
     retryBaseMs: number;
     retryMaxMs: number;
   };
@@ -181,7 +183,15 @@ export interface MaterialEvidence {
   ownerGateId?: string;
 }
 
-export type LifecycleEventKind = "baseline" | "claim" | "running" | "heartbeat" | "failure" | "transition";
+export type LifecycleEventKind =
+  | "baseline"
+  | "claim"
+  | "running"
+  | "heartbeat"
+  | "failure"
+  | "transition"
+  | "revival"
+  | "supersession";
 
 export interface MaterialEvent {
   sequence: number;
@@ -190,6 +200,10 @@ export interface MaterialEvent {
   message: string;
   /** Optional for compatibility with alpha.1 fixtures; new provider events always set it. */
   kind?: LifecycleEventKind;
+  /** Exact changed fact/reference that granted a fresh attempt budget. */
+  justification?: string;
+  /** Exact issue/PR/reference where intentionally continued work moved. */
+  successor?: string;
 }
 
 export interface TrackerIssueSnapshot {

@@ -172,6 +172,34 @@ describe("v4.1 deterministic scheduler core", () => {
     expect(simulator.workspaces.count()).toBe(workflow.config.scheduler.maxAttempts);
   });
 
+  test("a revived issue is claimed through the unchanged ready scheduler path as attempt one", async () => {
+    const oneAttemptWorkflow: WorkflowDefinition = {
+      ...workflow,
+      config: {
+        ...workflow.config,
+        scheduler: { ...workflow.config.scheduler, maxAttempts: 1 },
+      },
+    };
+    const simulator = new CrashRestartSimulator(oneAttemptWorkflow);
+    simulator.seed(issue(), contract());
+
+    await simulator.scheduler.tick();
+    let running = simulator.github.get("issue-45");
+    simulator.craft.setStatus(running.claim!.sessionId, "failed");
+    simulator.clock.advance(oneAttemptWorkflow.config.scheduler.staleRunMs);
+    await simulator.scheduler.tick();
+    expect(simulator.github.get("issue-45").issue.state).toBe("failed");
+
+    const revived = simulator.github.reviveFailed("issue-45", "provider quota reset OPS-42", simulator.clock.nowMs());
+    expect(revived).toMatchObject({ accepted: true, snapshot: { issue: { state: "ready" } } });
+    await simulator.scheduler.tick();
+
+    running = simulator.github.get("issue-45");
+    expect(running.issue.state).toBe("running");
+    expect(running.claim?.attempt).toBe(1);
+    expect(simulator.github.claimSuccessCount).toBe(2);
+  });
+
   test("failed bounded cancellation preserves the claim instead of starting a replacement", async () => {
     const simulator = new CrashRestartSimulator(workflow);
     simulator.seed(issue(), contract());

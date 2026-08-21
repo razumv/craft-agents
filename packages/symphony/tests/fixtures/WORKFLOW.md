@@ -29,6 +29,7 @@ scheduler:
   claim_ttl_ms: 60000
   stale_run_ms: 120000
   max_attempts: 3
+  max_revivals: 2
   retry_base_ms: 1000
   retry_max_ms: 4000
 workspace:
