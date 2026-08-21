@@ -40,9 +40,11 @@ function issue(id = "issue-45", identifier = "CP-45") {
   };
 }
 
-function contract(risk: RiskTier = "low"): string {
+function contract(risk: RiskTier = "low", deploy?: "none" | "dev" | "production-gated"): string {
   const budget = workflow.config.verification[risk].budget;
-  const deployAuthority = risk === "high" ? "production-gated" : risk === "medium" ? "dev" : "none";
+  // Risk and deploy authority are independent: high-risk work that ships nothing
+  // is common, and the two gates answer different questions.
+  const deployAuthority = deploy ?? (risk === "high" ? "production-gated" : risk === "medium" ? "dev" : "none");
   return `## Work contract
 
 \`\`\`yaml
@@ -218,6 +220,41 @@ describe("v4.1 deterministic scheduler core", () => {
     const tooRisky = build({ enabled: true, maxRisk: "low" }, "high");
     await new DeterministicScheduler(tooRisky.config, { github: tooRisky.simulator.github, workspaces: tooRisky.simulator.workspaces, craft: tooRisky.simulator.craft }, tooRisky.simulator.clock).tick();
     expect(attempts).toBeEmpty();
+  });
+
+  test("a ceiling that admits the risk satisfies its own gate instead of waiting for a second answer", async () => {
+    const diagnostics: string[] = [];
+    const simulator = new CrashRestartSimulator(workflow);
+    const seeded = simulator.seed(issue(), contract("high", "none"));
+    const github = simulator.github as unknown as {
+      mergeReadiness?: (issueId: string) => Promise<{ ready: boolean; reason: string; headSha: string }>;
+      mergeClosingPullRequest?: (issueId: string) => Promise<{ merged: boolean; reason: string }>;
+    };
+    let merged = 0;
+    github.mergeReadiness = async () => ({ ready: true, reason: "mergeable with passing checks", headSha: "f".repeat(40) });
+    github.mergeClosingPullRequest = async () => { merged += 1; return { merged: true, reason: "mergeable with passing checks" }; };
+
+    // The ceiling admits high risk: the owner has delegated that decision, so the
+    // lane must honour the delegation. Raising a gate nothing can leave is a trap —
+    // the approval is recorded but no code acts on it.
+    const config = { ...workflow.config, autoMerge: { enabled: true, maxRisk: "high" as RiskTier } };
+    const scheduler = new DeterministicScheduler(config,
+      { github: simulator.github, workspaces: simulator.workspaces, craft: simulator.craft, onDiagnostic: (m) => diagnostics.push(m) },
+      simulator.clock);
+    await scheduler.tick();
+    const claim = (await simulator.github.activeClaims())[0]?.claim;
+    if (claim) {
+      await simulator.github.transition(seeded.id, "pr-open", simulator.clock.nowMs(), {
+        fence: claim.fence,
+        evidence: { prUrl: "https://github.test/acme/repo/pull/1" },
+      });
+    }
+    await scheduler.tick();
+
+    // The gate is still raised and recorded — the invariant that high risk merges
+    // only out of owner-gate is untouched — and then answered by the policy.
+    expect(diagnostics.join(" ")).toContain("approval delegated by the configured ceiling");
+    expect(merged).toBe(1);
   });
 
   test("work above the ceiling is raised to the owner gate, and only when the provider says it could land", async () => {

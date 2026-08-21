@@ -187,7 +187,13 @@ export class DeterministicScheduler {
     const policy = this.config.autoMerge;
     if (!policy?.enabled) return;
     if (!this.adapters.github.mergeClosingPullRequest) return;
-    if (snapshot.issue.state !== "pr-open") return;
+    // owner-gate is included deliberately. Raising a gate with nothing able to
+    // leave it is a trap: the approval is parsed and recorded, but no code acted
+    // on it, so razumv/magicmarkets#148 was moved somewhere only a human merging
+    // by hand could rescue it from. A ceiling that admits the risk means the owner
+    // has already delegated that decision, and the lane must honour the
+    // delegation rather than wait for a second answer to the same question.
+    if (snapshot.issue.state !== "pr-open" && snapshot.issue.state !== "owner-gate") return;
     if (!riskAtMost(snapshot.contract.risk, policy.maxRisk)) {
       // Work above the ceiling is the owner's to approve — but silently leaving it
       // in pr-open is how it became indistinguishable from work that is stuck. It
@@ -197,14 +203,27 @@ export class DeterministicScheduler {
       await this.raiseOwnerGate(snapshot, `risk ${snapshot.contract.risk} exceeds the auto-merge ceiling ${policy.maxRisk}`);
       return;
     }
-    // A contract that carries deployment authority is not ours to land.
+    // A contract that carries deployment authority is not ours to land. This is
+    // the gate that stays: shipping is the owner's call, and no ceiling delegates
+    // it. Merging is not shipping — where a repository deploys from its default
+    // branch, the deployment workflow is where the approval belongs, not here.
     if (snapshot.contract.deployAuthority !== "none") {
       await this.raiseOwnerGate(snapshot, `deployAuthority ${snapshot.contract.deployAuthority} is not the lane's to exercise`);
       return;
     }
-    const outcome = await this.adapters.github.mergeClosingPullRequest(snapshot.issue.id);
+    // High risk may only be recorded as merged out of owner-gate — that invariant
+    // is what makes the gate mean anything. Within the configured ceiling the gate
+    // is still raised, and then satisfied by the policy, so the ledger shows both
+    // the gate and what answered it instead of quietly skipping the step.
+    let current = snapshot;
+    if (current.contract.risk === "high" && current.issue.state === "pr-open") {
+      await this.raiseOwnerGate(current, `risk high, approval delegated by the configured ceiling ${policy.maxRisk}`);
+      current = await this.adapters.github.get(current.issue.id);
+      if (current.issue.state !== "owner-gate") return;
+    }
+    const outcome = await this.adapters.github.mergeClosingPullRequest(current.issue.id);
     this.adapters.onDiagnostic?.(
-      `auto-merge ${outcome.merged ? "merged" : "declined"} ${snapshot.issue.identifier}: ${outcome.reason}`,
+      `auto-merge ${outcome.merged ? "merged" : "declined"} ${current.issue.identifier}: ${outcome.reason}`,
     );
   }
 
