@@ -154,6 +154,14 @@ export class ReadScopeGitHubTransport implements GitHubTransport {
     return this.inner.appendComment(issueId, body);
   }
 
+  async updateIssueBody(issueId: string, body: string): Promise<void> {
+    // The body rides on both repository listings and exact node reads. Drop
+    // those observations before forwarding so the mandatory parser readback
+    // cannot accidentally validate the pre-write body from this operation.
+    this.#invalidateListing();
+    return this.inner.updateIssueBody(issueId, body);
+  }
+
   async replaceLabels(repository: string, issueNumber: number, labels: readonly string[]): Promise<void> {
     // Labels decide which lifecycle state an issue is in, and they ride along
     // with the repository listing, so both go. The listing is one query per

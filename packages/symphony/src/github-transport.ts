@@ -118,6 +118,7 @@ export interface GitHubTransport {
   getBranch(repository: string, branchName: string): Promise<GitHubBranchEvidence | null>;
   getBaseSha(repository: string, branchName: string): Promise<string>;
   appendComment(issueId: string, body: string): Promise<GitHubComment>;
+  updateIssueBody(issueId: string, body: string): Promise<void>;
   replaceLabels(repository: string, issueNumber: number, labels: readonly string[]): Promise<void>;
   updateProjectSingleSelect(projectId: string, itemId: string, fieldId: string, optionId: string): Promise<void>;
   updateProjectText(projectId: string, itemId: string, fieldId: string, value: string): Promise<void>;
@@ -321,6 +322,10 @@ export class GhCliTransport implements GitHubTransport {
     const data = await this.graphql<{ addComment: { commentEdge: { node: GitHubComment & { author: { login: string } | null } } } }>(`mutation AppendEvent($id:ID!,$body:String!){addComment(input:{subjectId:$id,body:$body}){commentEdge{node{databaseId body author{login}createdAt updatedAt}}}}`, { id: issueId, body });
     const entry = data.addComment.commentEdge.node;
     return { ...entry, authorLogin: entry.author?.login ?? null };
+  }
+
+  async updateIssueBody(issueId: string, body: string): Promise<void> {
+    await this.graphql(`mutation UpdateIssueBody($id:ID!,$body:String!){updateIssue(input:{id:$id,body:$body}){issue{id}}}`, { id: issueId, body });
   }
 
   async replaceLabels(repository: string, issueNumber: number, labels: readonly string[]): Promise<void> {

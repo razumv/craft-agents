@@ -6,6 +6,7 @@ import { compareForDispatch } from "./scheduler";
 import type { TrackerBacklogIssue } from "./tracker";
 
 export const GROOMING_PROPOSAL_SCHEMA = "craft-agent/symphony-grooming-proposal@1" as const;
+export const GROOMING_APPLY_SCHEMA = "craft-agent/symphony-grooming-apply@1" as const;
 
 /**
  * Deterministic risk rubric for read-only grooming.
@@ -60,6 +61,39 @@ export interface RefusedGroomingContract extends GroomingProposalBase {
 }
 
 export type GroomingProposal = ProposedGroomingContract | RefusedGroomingContract;
+
+export type GroomingApplyStep =
+  | "validate-proposal"
+  | "read-issue"
+  | "inspect-existing-contract"
+  | "read-labels"
+  | "read-project-item"
+  | "read-baseline"
+  | "write-attribution"
+  | "write-body"
+  | "read-back-body"
+  | "write-labels"
+  | "write-status";
+
+interface GroomingApplyBase {
+  schema: typeof GROOMING_APPLY_SCHEMA;
+  repository: string;
+  candidateIdentifier: string | null;
+  writes: number;
+}
+
+export type GroomingApplyReport =
+  | (GroomingApplyBase & { outcome: "refused"; writes: 0; refusal: GroomingRefusal })
+  | (GroomingApplyBase & { outcome: "already-present"; writes: 0; contract: IssueContract })
+  | (GroomingApplyBase & { outcome: "lifecycle-present"; writes: 0; lifecycleLabels: string[] })
+  | (GroomingApplyBase & { outcome: "failed"; failedStep: GroomingApplyStep; message: string })
+  | (GroomingApplyBase & {
+      outcome: "applied";
+      readyLabel: string;
+      projectStatusOptionId: string;
+      baselineSha: string;
+      attributionCommentId: number;
+    });
 
 type SectionName = "goal" | "acceptance" | "nonGoals" | null;
 type SourcedLine = { text: string; line: number };
