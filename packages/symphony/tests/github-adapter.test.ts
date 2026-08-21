@@ -48,7 +48,10 @@ class MemoryGitHubTransport implements GitHubTransport {
   readonly prs = new Map<string, GitHubPullRequestEvidence[]>();
   readonly branches = new Map<string, GitHubBranchEvidence>();
   readonly calls = new Map<string, number>();
+  readonly issueBounds: (string | null)[] = [];
   pageSize = 100;
+  honorUpdatedSince = false;
+  failNextListIssues = false;
   #commentId = 1000;
 
   addIssue(number: number, state: LifecycleState = "ready", dependencies: string[] = [], risk: "low" | "medium" | "high" = "low"): GitHubIssueRecord {
@@ -77,8 +80,17 @@ class MemoryGitHubTransport implements GitHubTransport {
     return record;
   }
 
-  listIssues(_repository: string, cursor: string | null): Promise<Page<GitHubIssueRecord>> {
-    return Promise.resolve(this.paged("issues", this.issues, cursor));
+  listIssues(_repository: string, cursor: string | null, updatedSince: string | null = null): Promise<Page<GitHubIssueRecord>> {
+    this.issueBounds.push(updatedSince);
+    if (this.failNextListIssues) {
+      this.failNextListIssues = false;
+      this.hit("issues");
+      return Promise.reject(new Error("provider listing failed"));
+    }
+    const issues = this.honorUpdatedSince && updatedSince !== null
+      ? this.issues.filter((issue) => issue.updatedAt > updatedSince)
+      : this.issues;
+    return Promise.resolve(this.paged("issues", issues, cursor));
   }
   getIssuesByNodeIds(ids: readonly string[]): Promise<(GitHubIssueRecord | null)[]> {
     this.hit("issue-nodes");
@@ -283,6 +295,75 @@ describe("v4.2 GitHub Issues and Projects adapter", () => {
     expect(candidate?.issue.dispatchable).toBeTrue();
     expect(transport.calls.get("issues")).toBe(2);
     expect((transport.calls.get("field-values") ?? 0) >= 4).toBeTrue();
+  });
+
+  test("the first scan after start walks every issue with no update bound", async () => {
+    const { transport, adapter } = setup();
+    transport.honorUpdatedSince = true;
+    transport.pageSize = 1;
+    for (let number = 1; number <= 3; number += 1) transport.addIssue(number);
+
+    expect(await adapter.fetchIssuesByStates(["ready"])).toHaveLength(3);
+    expect(transport.calls.get("issues")).toBe(3);
+    expect(transport.issueBounds).toEqual([null, null, null]);
+
+    // No state is persisted: a replacement adapter pays the cold-start cost.
+    transport.issueBounds.length = 0;
+    const restarted = new GitHubIssuesProjectsAdapter(config(), transport, new MemoryWorkspaceTruth());
+    expect(await restarted.fetchIssuesByStates(["ready"])).toHaveLength(3);
+    expect(transport.issueBounds).toEqual([null, null, null]);
+  });
+
+  test("later scans ask the provider for only updates since its last reported timestamp", async () => {
+    const { transport, adapter } = setup();
+    transport.honorUpdatedSince = true;
+    const first = transport.addIssue(1);
+    const second = transport.addIssue(2);
+    first.labelNames = ["v4", "state:ready"];
+    second.labelNames = ["v4", "state:ready"];
+
+    await adapter.fetchIssuesByStates(["ready"]);
+    const providerWatermark = second.updatedAt;
+    first.updatedAt = "2026-08-20T12:34:56Z";
+    transport.issueBounds.length = 0;
+
+    expect(await adapter.fetchIssuesByStates(["ready"])).toHaveLength(2);
+    expect(transport.issueBounds).toEqual([providerWatermark]);
+    // Only the one issue returned in that provider window is hydrated again.
+    expect(transport.calls.get("issues")).toBe(2);
+  });
+
+  test("an active claim is node-refreshed when PR checks change without touching the issue", async () => {
+    const { transport, adapter } = setup();
+    transport.honorUpdatedSince = true;
+    transport.addIssue(1);
+    const ready = await adapter.get("I_1");
+    const claim = await proposedClaim(adapter, "I_1");
+    await adapter.tryClaim("I_1", ready.version, claim, 1_000);
+    await adapter.markRunning(claim.fence, 1_100);
+    const unchangedIssueTimestamp = transport.issues[0]!.updatedAt;
+
+    transport.calls.clear();
+    transport.issueBounds.length = 0;
+    attachPr(transport, "I_1");
+    const advanced = await adapter.advanceByEvidence(1_200);
+
+    expect(advanced).toEqual([{ issueId: "I_1", action: "advanced", reason: "pull request evidence" }]);
+    expect(transport.calls.get("issue-nodes")).toBeGreaterThan(0);
+    expect(transport.issueBounds[0]).toBe(unchangedIssueTimestamp);
+  });
+
+  test("a failed scan leaves the provider watermark unchanged for the retry", async () => {
+    const { transport, adapter } = setup();
+    transport.honorUpdatedSince = true;
+    const issue = transport.addIssue(1);
+    await adapter.fetchIssuesByStates(["ready"]);
+    transport.issueBounds.length = 0;
+    transport.failNextListIssues = true;
+
+    await expect(adapter.fetchIssuesByStates(["ready"])).rejects.toThrow("provider listing failed");
+    await expect(adapter.fetchIssuesByStates(["ready"])).resolves.toHaveLength(1);
+    expect(transport.issueBounds).toEqual([issue.updatedAt, issue.updatedAt]);
   });
 
   test("listing labels let discovery skip unmanaged issues without hydrating them", async () => {
