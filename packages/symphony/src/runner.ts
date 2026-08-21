@@ -640,9 +640,9 @@ export class DiscoveryGitHubTransport implements GitHubTransport {
 
   constructor(readonly delegate: GitHubTransport, readonly scope: GitHubDiscoveryScope) {}
 
-  async listIssues(repository: string, cursor: string | null): Promise<Page<GitHubIssueRecord>> {
+  async listIssues(repository: string, cursor: string | null, updatedSince: string | null = null): Promise<Page<GitHubIssueRecord>> {
     if (repository !== this.scope.repository) throw new Error("GitHub request escaped configured repository scope");
-    const page = await this.delegate.listIssues(repository, cursor);
+    const page = await this.delegate.listIssues(repository, cursor, updatedSince);
     for (const record of page.nodes) {
       this.#issueIds.add(record.id);
       this.#issueNumbers.add(record.number);
@@ -742,11 +742,11 @@ export interface GitHubMutationScope {
 
 export class ScopedGitHubTransport implements GitHubTransport {
   constructor(readonly delegate: GitHubTransport, readonly scope: GitHubMutationScope) {}
-  async listIssues(repository: string, cursor: string | null): Promise<Page<GitHubIssueRecord>> {
+  async listIssues(repository: string, cursor: string | null, updatedSince: string | null = null): Promise<Page<GitHubIssueRecord>> {
     if (cursor !== null) return { nodes: [], nextCursor: null };
     let providerCursor: string | null = null;
     do {
-      const page = await this.delegate.listIssues(repository, providerCursor);
+      const page = await this.delegate.listIssues(repository, providerCursor, updatedSince);
       const issue = page.nodes.find((candidate) => candidate.id === this.scope.issueId);
       if (issue) return { nodes: [issue], nextCursor: null };
       providerCursor = page.nextCursor;

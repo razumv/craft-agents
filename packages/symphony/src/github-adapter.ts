@@ -99,6 +99,13 @@ interface CoreHydrated extends Hydrated {
 
 export class GitHubIssuesProjectsAdapter implements TrackerAdapter {
   readonly #managedLabels: Set<string>;
+  /** In-memory only: a restart deliberately pays for a complete recovery read. */
+  #watermark: string | null = null;
+  #records = new Map<string, GitHubIssueRecord>();
+  #hydrated = new Map<string, CoreHydrated>();
+  #backlog = new Map<string, TrackerBacklogIssue>();
+  /** Serializes the shared in-memory observation used by parallel status reads. */
+  #stateTail: Promise<void> = Promise.resolve();
 
   constructor(
     readonly config: GitHubAdapterConfig,
@@ -134,36 +141,53 @@ export class GitHubIssuesProjectsAdapter implements TrackerAdapter {
    * guessed at, so a managed issue can never be mistaken for backlog.
    */
   async fetchBacklog(): Promise<TrackerBacklogIssue[]> {
-    const records = await collectPages((cursor) => this.transport.listIssues(this.config.repository, cursor));
-    const candidates = records.filter((record) => (
-      record.id !== this.config.claimFenceIssueId
-      && record.state === "OPEN"
-      && this.#listingHasNoLifecycleLabel(record)
-    ));
-    return Promise.all(candidates.map(async (record) => {
-      const blockedBy = await collectPages((cursor) => this.transport.listBlockedBy(record.id, cursor));
-      const relation = (issue: GitHubIssueLink) => ({
-        id: issue.id,
-        identifier: `${this.config.repository}#${issue.number}`,
-        state: issue.state,
-        title: issue.title,
-        url: issue.url,
-      });
-      return {
-        id: record.id,
-        identifier: `${this.config.repository}#${record.number}`,
-        number: record.number,
-        title: record.title,
-        description: record.body,
-        url: record.url ?? null,
-        labels: [...(record.labelNames ?? [])],
-        priority: Number.isInteger(record.priority) ? record.priority! : null,
-        createdAt: record.createdAt ?? null,
-        updatedAt: record.updatedAt ?? null,
-        blockedBy: blockedBy.map(relation),
-        parent: record.parent ? relation(record.parent) : null,
-      };
-    }));
+    return this.#withStateLock(async () => {
+      const scan = await this.#scanRecords(new Set());
+      const backlog = new Map(this.#backlog);
+      const candidateIds = new Set<string>();
+      for (const record of scan.records.values()) {
+        const candidate = record.id !== this.config.claimFenceIssueId
+          && record.state === "OPEN"
+          && this.#listingHasNoLifecycleLabel(record);
+        if (!candidate) {
+          backlog.delete(record.id);
+          continue;
+        }
+        candidateIds.add(record.id);
+        const cached = backlog.get(record.id);
+        if (!scan.changedIds.has(record.id) && cached?.updatedAt === record.updatedAt) continue;
+        const blockedBy = await collectPages((cursor) => this.transport.listBlockedBy(record.id, cursor));
+        const relation = (issue: GitHubIssueLink) => ({
+          id: issue.id,
+          identifier: `${this.config.repository}#${issue.number}`,
+          state: issue.state,
+          title: issue.title,
+          url: issue.url,
+        });
+        backlog.set(record.id, {
+          id: record.id,
+          identifier: `${this.config.repository}#${record.number}`,
+          number: record.number,
+          title: record.title,
+          description: record.body,
+          url: record.url ?? null,
+          labels: [...(record.labelNames ?? [])],
+          priority: Number.isInteger(record.priority) ? record.priority! : null,
+          createdAt: record.createdAt ?? null,
+          updatedAt: record.updatedAt ?? null,
+          blockedBy: blockedBy.map(relation),
+          parent: record.parent ? relation(record.parent) : null,
+        });
+      }
+      for (const id of backlog.keys()) {
+        if (!candidateIds.has(id)) backlog.delete(id);
+      }
+      // Commit only after every provider read needed for this backlog succeeds.
+      this.#records = scan.records;
+      this.#backlog = backlog;
+      this.#watermark = scan.watermark;
+      return [...backlog.values()];
+    });
   }
 
   /**
@@ -578,67 +602,133 @@ export class GitHubIssuesProjectsAdapter implements TrackerAdapter {
     return found;
   }
 
-  private async loadAll(strict: boolean, requested = new Set<string>()): Promise<Map<string, Hydrated>> {
-    const records = await collectPages((cursor) => this.transport.listIssues(this.config.repository, cursor));
-    const cores = new Map<string, CoreHydrated>();
-    let skippedUnmanaged = 0;
-    for (const record of records) {
-      if (record.id === this.config.claimFenceIssueId) continue;
-      // Hydration costs six further queries per issue, and an issue with no
-      // lifecycle label is discarded either way — it cannot hold a claim, so it
-      // cannot affect WIP. When the listing already told us its labels, decide
-      // here and pay nothing. Unknown labels (a truncated page, or a transport
-      // that cannot supply them) fall through to hydration as before.
-      // Never skip an explicitly requested id: fetchIssuesByIds treats a missing
-      // requested issue as an error, and the caller asked for that issue by name.
-      if (!requested.has(record.id) && this.#listingHasNoLifecycleLabel(record)) {
-        skippedUnmanaged += 1;
-        continue;
-      }
-      try {
-        cores.set(record.id, await this.hydrateCore(record));
-      } catch (error) {
-        if (strict && (requested.size === 0 || requested.has(record.id))) {
-          // Strict loads protect WIP reconciliation: silently omitting a
-          // malformed issue that actually holds an active claim could release
-          // WIP and duplicate a run. But repository-wide discovery inevitably
-          // sees contract-less issues (trackers, plain bugs). An issue with NO
-          // managed lifecycle label cannot be holding a claim, so omitting it
-          // is safe; anything carrying a lifecycle label still fails closed.
-          if (!(await this.hasNoLifecycleLabel(record))) throw error;
+  private loadAll(strict: boolean, requested = new Set<string>()): Promise<Map<string, Hydrated>> {
+    return this.#withStateLock(async () => {
+      const scan = await this.#scanRecords(requested);
+      // Work on clones so a failed strict read cannot partially mutate the last
+      // successful observation or advance its watermark.
+      const cores = new Map<string, CoreHydrated>(
+        [...this.#hydrated].map(([id, core]) => [id, structuredClone(core)]),
+      );
+      let skippedUnmanaged = 0;
+      for (const record of scan.records.values()) {
+        if (record.id === this.config.claimFenceIssueId) {
+          cores.delete(record.id);
+          continue;
         }
-        this.config.onDiagnostic?.(`omitting malformed GitHub issue ${record.id}: ${errorMessage(error)}`);
+        const cached = cores.get(record.id);
+        const mustRefresh = scan.changedIds.has(record.id)
+          || scan.forcedIds.has(record.id)
+          || !cached
+          || cached.record.updatedAt !== record.updatedAt;
+        if (!mustRefresh) continue;
+        // Hydration costs six further queries per issue. An unchanged issue is
+        // retained from the last successful scan; only changed issues, explicit
+        // reads and every durable claim are refreshed.
+        if (!requested.has(record.id) && this.#listingHasNoLifecycleLabel(record)) {
+          cores.delete(record.id);
+          skippedUnmanaged += 1;
+          continue;
+        }
+        try {
+          cores.set(record.id, await this.hydrateCore(record));
+        } catch (error) {
+          cores.delete(record.id);
+          if (strict && (requested.size === 0 || requested.has(record.id))) {
+            // Strict loads protect WIP reconciliation: silently omitting a
+            // malformed issue that actually holds an active claim could release
+            // WIP and duplicate a run. Unmanaged issues cannot hold a claim.
+            if (!(await this.hasNoLifecycleLabel(record))) throw error;
+          }
+          this.config.onDiagnostic?.(`omitting malformed GitHub issue ${record.id}: ${errorMessage(error)}`);
+        }
+      }
+      if (skippedUnmanaged > 0) {
+        this.config.onDiagnostic?.(`skipped ${skippedUnmanaged} GitHub issues with no lifecycle label from the listing`);
+      }
+      const byContract = indexUnique(cores, (entry) => entry.contract.id);
+      const byIdentifier = indexUnique(cores, (entry) => entry.snapshot.issue.identifier);
+      const output = new Map<string, Hydrated>();
+      for (const [id, core] of cores) {
+        try {
+          const dependencies = core.contract.dependencies.map((dependency) => resolveDependency(dependency, byContract, byIdentifier));
+          const native = core.nativeBlockers.map((blocker) => {
+            const target = cores.get(blocker.id);
+            return {
+              id: blocker.id,
+              identifier: `${this.config.repository}#${blocker.number}`,
+              state: target?.snapshot.issue.state ?? (blocker.state === "CLOSED" ? "done" : "unknown"),
+            };
+          });
+          core.snapshot.issue.blockedBy = dedupeBlockers([...native, ...dependencies]);
+          // Reset the provider-derived base before applying blockers. A cached
+          // issue may have been non-dispatchable only because a dependency was
+          // blocked on the previous read and must be allowed to become ready.
+          core.snapshot.issue.dispatchable = core.record.state === "OPEN"
+            && this.config.requiredLabels.every((required) => issueHasLabel(core.labels, required))
+            && !core.snapshot.issue.blockedBy.some((blocker) => blocker.state !== "done");
+          output.set(id, core);
+        } catch (error) {
+          if (strict && (requested.size === 0 || requested.has(id))) throw error;
+          this.config.onDiagnostic?.(`omitting GitHub issue ${id} with ambiguous dependencies: ${errorMessage(error)}`);
+        }
+      }
+      // Commit all in-memory scan state together, and only after every provider
+      // read required by this operation has succeeded.
+      this.#records = scan.records;
+      this.#hydrated = new Map([...output].map(([id, core]) => [id, core as CoreHydrated]));
+      this.#watermark = scan.watermark;
+      return output;
+    });
+  }
+
+  async #scanRecords(requested: ReadonlySet<string>): Promise<{
+    records: Map<string, GitHubIssueRecord>;
+    changedIds: Set<string>;
+    forcedIds: Set<string>;
+    watermark: string | null;
+  }> {
+    const since = this.#watermark;
+    const changed = await collectPages((cursor) => this.transport.listIssues(this.config.repository, cursor, since));
+    const records = since === null ? new Map<string, GitHubIssueRecord>() : new Map(this.#records);
+    for (const record of changed) records.set(record.id, mergeListingRecord(records.get(record.id), record));
+
+    // GitHub does not touch an issue when a closing PR merges or a check turns
+    // green. Node-refresh every known durable claim on every scan so that its
+    // PR/check evidence is hydrated even when it falls behind the watermark.
+    const forcedIds = new Set<string>(requested);
+    if (since !== null) {
+      for (const [id, core] of this.#hydrated) {
+        if (core.snapshot.claim) forcedIds.add(id);
+      }
+      const ids = [...forcedIds];
+      for (let offset = 0; offset < ids.length; offset += 100) {
+        const batch = ids.slice(offset, offset + 100);
+        const refreshed = await this.transport.getIssuesByNodeIds(batch);
+        if (refreshed.length !== batch.length) throw new Error("GitHub ID refresh returned the wrong number of issues");
+        for (let index = 0; index < batch.length; index += 1) {
+          const record = refreshed[index];
+          const id = batch[index]!;
+          if (!record) throw new Error(`GitHub issue node ${id} is missing`);
+          records.set(id, mergeListingRecord(records.get(id), record));
+        }
       }
     }
-    if (skippedUnmanaged > 0) {
-      // Say what was skipped: a silent narrowing of a repository-wide scan is
-      // indistinguishable from a scan that found nothing.
-      this.config.onDiagnostic?.(`skipped ${skippedUnmanaged} GitHub issues with no lifecycle label from the listing`);
-    }
-    const byContract = indexUnique(cores, (entry) => entry.contract.id);
-    const byIdentifier = indexUnique(cores, (entry) => entry.snapshot.issue.identifier);
-    const output = new Map<string, Hydrated>();
-    for (const [id, core] of cores) {
-      try {
-        const dependencies = core.contract.dependencies.map((dependency) => resolveDependency(dependency, byContract, byIdentifier));
-        const native = core.nativeBlockers.map((blocker) => {
-          const target = cores.get(blocker.id);
-          return {
-            id: blocker.id,
-            identifier: `${this.config.repository}#${blocker.number}`,
-            state: target?.snapshot.issue.state ?? (blocker.state === "CLOSED" ? "done" : "unknown"),
-          };
-        });
-        core.snapshot.issue.blockedBy = dedupeBlockers([...native, ...dependencies]);
-        core.snapshot.issue.dispatchable = core.snapshot.issue.dispatchable
-          && !core.snapshot.issue.blockedBy.some((blocker) => blocker.state !== "done");
-        output.set(id, core);
-      } catch (error) {
-        if (strict && (requested.size === 0 || requested.has(id))) throw error;
-        this.config.onDiagnostic?.(`omitting GitHub issue ${id} with ambiguous dependencies: ${errorMessage(error)}`);
-      }
-    }
-    return output;
+
+    // The bound is exclusively provider evidence. No local clock participates,
+    // and failure before the caller commits this scan leaves the old bound intact.
+    return {
+      records,
+      changedIds: new Set(changed.map((record) => record.id)),
+      forcedIds,
+      watermark: providerWatermark(since, changed),
+    };
+  }
+
+  #withStateLock<T>(operation: () => Promise<T>): Promise<T> {
+    const run = this.#stateTail.then(operation, operation);
+    this.#stateTail = run.then(() => undefined, () => undefined);
+    return run;
   }
 
   /** True only when the issue verifiably carries zero managed lifecycle labels. */
@@ -814,6 +904,32 @@ export class GitHubIssuesProjectsAdapter implements TrackerAdapter {
     snapshot.evidence = { ...snapshot.evidence, ...providerEvidence };
     return { snapshot, providerEvidence, record, item, labels, acceptedCommentIds, projectionDrift, contract, nativeBlockers };
   }
+}
+
+function providerWatermark(current: string | null, records: readonly GitHubIssueRecord[]): string | null {
+  let latest = current;
+  let latestMs = latest === null ? Number.NEGATIVE_INFINITY : Date.parse(latest);
+  if (!Number.isFinite(latestMs) && latest !== null) throw new Error("stored GitHub provider watermark is invalid");
+  for (const record of records) {
+    const candidateMs = Date.parse(record.updatedAt);
+    if (!Number.isFinite(candidateMs)) throw new Error(`GitHub issue ${record.id} has invalid provider updatedAt`);
+    if (candidateMs > latestMs) {
+      latest = record.updatedAt;
+      latestMs = candidateMs;
+    }
+  }
+  return latest;
+}
+
+/** Preserve listing-only metadata when a direct node refresh omits it. */
+function mergeListingRecord(previous: GitHubIssueRecord | undefined, next: GitHubIssueRecord): GitHubIssueRecord {
+  return {
+    ...previous,
+    ...next,
+    labelNames: next.labelNames ?? previous?.labelNames ?? null,
+    priority: next.priority ?? previous?.priority ?? null,
+    parent: next.parent ?? previous?.parent ?? null,
+  };
 }
 
 /**
