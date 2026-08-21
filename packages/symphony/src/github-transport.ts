@@ -104,6 +104,13 @@ export interface GitHubTransport {
    * throw, where the failure is visible.
    */
   mergePullRequest(pullRequestId: string, commitHeadline: string): Promise<void>;
+
+  /**
+   * Whether `head` contains `base` — that is, whether the work grew from it
+   * rather than being a different lineage. Answered over REST, which has its own
+   * hourly budget, so an ancestry question never competes with the GraphQL reads.
+   */
+  containsCommit(repository: string, base: string, head: string): Promise<boolean>;
   getBranch(repository: string, branchName: string): Promise<GitHubBranchEvidence | null>;
   getBaseSha(repository: string, branchName: string): Promise<string>;
   appendComment(issueId: string, body: string): Promise<GitHubComment>;
@@ -265,6 +272,16 @@ export class GhCliTransport implements GitHubTransport {
     const branch = await this.getBranch(repository, branchName);
     if (!branch) throw new Error(`base branch ${branchName} is missing`);
     return branch.oid;
+  }
+
+  async containsCommit(repository: string, base: string, head: string): Promise<boolean> {
+    if (base === head) return true;
+    const [owner, name] = splitRepository(repository);
+    // REST compare answers this in one call and spends the REST budget, not the
+    // GraphQL one. `identical` and `behind` both mean head already contains base.
+    const output = await this.run(["api", `repos/${owner}/${name}/compare/${base}...${head}`, "--jq", ".status"], undefined, true);
+    const status = output.trim();
+    return status === "ahead" || status === "identical";
   }
 
   async mergePullRequest(pullRequestId: string, commitHeadline: string): Promise<void> {

@@ -46,6 +46,7 @@ function fakeDelegate(calls: string[]): GitHubTransport {
     async updateProjectSingleSelect(_p, itemId) { calls.push(`status:${itemId}`); },
     async updateProjectText(_p, itemId) { calls.push(`gate:${itemId}`); },
     async mergePullRequest(pullRequestId) { calls.push(`merge:${pullRequestId}`); },
+    async containsCommit(_repository, base, head) { calls.push(`contains:${base}..${head}`); return true; },
   };
 }
 

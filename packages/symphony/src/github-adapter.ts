@@ -768,9 +768,23 @@ export class GitHubIssuesProjectsAdapter implements TrackerAdapter {
     // as failed for a day with its work in main because of that. A ledger SHA
     // that EXISTS and disagrees still refuses — that is a different commit, not
     // a missing one.
-    const headMatchesLedger = durableHeadSha
+    let headMatchesLedger = durableHeadSha
       ? matchingPr?.headRefOid === durableHeadSha
       : !snapshot.evidence.branchSha;
+    // An exact match is the common case. When it fails, the question is whether
+    // the work GREW from what the ledger recorded or is a different lineage —
+    // and only the second one is a reason to refuse. A branch updated from the
+    // base to pick up a fix is the first: the attempt's commit is still in there.
+    // Without this, a pull request that needed a rebase could never be recorded
+    // as merged, so its issue sat in pr-open with delivered work and a held WIP
+    // slot, and the only way to land it was by hand.
+    if (!headMatchesLedger && matchingPr && durableHeadSha && this.transport.containsCommit) {
+      headMatchesLedger = await this.transport.containsCommit(
+        this.config.repository,
+        durableHeadSha,
+        matchingPr.headRefOid,
+      );
+    }
     if (matchingPr && headMatchesLedger) {
       Object.assign(providerEvidence, prEvidence(matchingPr));
     }

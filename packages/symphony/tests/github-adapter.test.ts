@@ -39,6 +39,12 @@ class MemoryWorkspaceTruth implements WorkspaceTruthReader {
 }
 
 class MemoryGitHubTransport implements GitHubTransport {
+  readonly descendants = new Map<string, Set<string>>();
+  async containsCommit(_repository: string, base: string, head: string): Promise<boolean> {
+    if (base === head) return true;
+    return this.descendants.get(head)?.has(base) ?? false;
+  }
+
   readonly issues: GitHubIssueRecord[] = [];
   readonly labels = new Map<string, string[]>();
   readonly blockers = new Map<string, GitHubIssueLink[]>();
@@ -681,6 +687,29 @@ describe("v4.2 GitHub Issues and Projects adapter", () => {
     expect((await adapter.get("I_1")).issue.state).toBe("done");
   });
 
+  test("a branch updated from the base still counts as this attempt's work", async () => {
+    const { transport, adapter } = setup();
+    transport.addIssue(1);
+    const before = await adapter.get("I_1");
+    const claim = await proposedClaim(adapter, "I_1");
+    await adapter.tryClaim("I_1", before.version, claim, 1_000);
+    await adapter.markRunning(claim.fence, 1_100);
+    attachPr(transport, "I_1");
+    await adapter.advanceByEvidence(1_150);
+    expect((await adapter.get("I_1")).evidence.branchSha).toBe("d".repeat(40));
+
+    // The branch is updated from the base to pick up a fix that made CI pass, so
+    // its head moves. The attempt's own commit is still in there — refusing this
+    // is what left delivered work stranded in pr-open with a held WIP slot.
+    attachPr(transport, "I_1", true);
+    transport.branches.delete("v4/acme-repo-1");
+    transport.prs.get("I_1")![0]!.headRefOid = "a".repeat(40);
+    transport.descendants.set("a".repeat(40), new Set(["d".repeat(40)]));
+
+    await adapter.advanceByEvidence(1_300);
+    expect((await adapter.get("I_1")).issue.state).toBe("done");
+  });
+
   test("a ledger branch SHA that disagrees with the pull request still refuses", async () => {
     const { transport, adapter } = setup();
     transport.addIssue(1);
@@ -696,6 +725,7 @@ describe("v4.2 GitHub Issues and Projects adapter", () => {
     attachPr(transport, "I_1", true);
     transport.branches.delete("v4/acme-repo-1");
     transport.prs.get("I_1")![0]!.headRefOid = "7".repeat(40);
+    // Not a descendant: a different lineage, not this attempt's work grown.
 
     // A recorded SHA that disagrees is a different commit, not a missing one.
     expect(await adapter.advanceByEvidence(1_300)).toEqual([]);

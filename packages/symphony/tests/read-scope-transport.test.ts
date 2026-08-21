@@ -17,6 +17,11 @@ class CountingTransport implements GitHubTransport {
     return this.calls.get(name) ?? 0;
   }
 
+  async containsCommit(): Promise<boolean> {
+    this.#hit("containsCommit");
+    return true;
+  }
+
   async mergePullRequest(): Promise<void> {
     this.#hit("mergePullRequest");
   }

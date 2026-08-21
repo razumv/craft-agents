@@ -67,6 +67,10 @@ function proposal(candidate = issue()) {
 }
 
 class RecordingTransport implements GitHubTransport {
+  async containsCommit(): Promise<boolean> {
+    return true;
+  }
+
   readonly calls: string[] = [];
   constructor(readonly record: GitHubIssueRecord, readonly blockers: GitHubIssueLink[] = []) {}
   private read<T>(name: string, nodes: T[]): Promise<Page<T>> { this.calls.push(name); return Promise.resolve({ nodes, nextCursor: null }); }

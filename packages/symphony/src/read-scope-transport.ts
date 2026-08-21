@@ -185,6 +185,12 @@ export class ReadScopeGitHubTransport implements GitHubTransport {
    * belongs to — so this one genuinely invalidates everything. Merges are rare;
    * the cost is a single re-scan when work actually lands.
    */
+  containsCommit(repository: string, base: string, head: string): Promise<boolean> {
+    // Ancestry between two fixed commits cannot change, so it is memoized like
+    // any other read.
+    return this.#memo(`containsCommit\n${repository}\n${base}\n${head}`, () => this.inner.containsCommit(repository, base, head));
+  }
+
   async mergePullRequest(pullRequestId: string, commitHeadline: string): Promise<void> {
     this.clear();
     return this.inner.mergePullRequest(pullRequestId, commitHeadline);
