@@ -669,6 +669,11 @@ export class DiscoveryGitHubTransport implements GitHubTransport {
     return this.delegate.mergePullRequest(pullRequestId, commitHeadline);
   }
 
+  async containsCommit(repository: string, base: string, head: string): Promise<boolean> {
+    if (repository !== this.scope.repository) throw new Error("GitHub request escaped configured repository scope");
+    return this.delegate.containsCommit(repository, base, head);
+  }
+
   async listLabels(issueId: string, cursor: string | null): Promise<Page<string>> { return this.delegate.listLabels(this.assertRead(issueId), cursor); }
   async listBlockedBy(issueId: string, cursor: string | null): Promise<Page<GitHubIssueLink>> { return this.delegate.listBlockedBy(this.assertRead(issueId), cursor); }
   async listProjectItems(issueId: string, cursor: string | null): Promise<Page<GitHubProjectItem>> {
@@ -753,6 +758,7 @@ export class ScopedGitHubTransport implements GitHubTransport {
     return this.delegate.getIssuesByNodeIds(ids);
   }
   mergePullRequest(pullRequestId: string, commitHeadline: string): Promise<void> { return this.delegate.mergePullRequest(pullRequestId, commitHeadline); }
+  containsCommit(repository: string, base: string, head: string): Promise<boolean> { return this.delegate.containsCommit(repository, base, head); }
   listLabels(issueId: string, cursor: string | null): Promise<Page<string>> { return this.delegate.listLabels(this.assertIssue(issueId), cursor); }
   listBlockedBy(issueId: string, cursor: string | null): Promise<Page<GitHubIssueLink>> { return this.delegate.listBlockedBy(this.assertIssue(issueId), cursor); }
   listProjectItems(issueId: string, cursor: string | null): Promise<Page<GitHubProjectItem>> { return this.delegate.listProjectItems(this.assertIssue(issueId), cursor); }
