@@ -2,11 +2,15 @@
 
 import { describe, expect, test } from "bun:test";
 import {
+  CraftMobileControlPlaneAdapter,
   LiveV4Runner,
   ScopedGitHubTransport,
+  type CraftAdapterConfig,
   type CraftCliRpcTransport,
   type CraftExecutionSession,
-  type CraftMobileControlPlaneAdapter,
+  type CraftRpcSession,
+  type CraftRpcTransport,
+  type CraftRuntimeIdentity,
   type CraftSessionStatus,
   type DeterministicScheduler,
   type GitHubComment,
@@ -39,6 +43,28 @@ function fixture() {
     gateFieldId: "GATE",
   });
   return { calls, scoped };
+}
+
+function failedOutcome(
+  directive: { id: string; issueId: string; verbatim: string; sourceSessionId?: string; sourceMessageId?: string; sourceTimestampMs?: number },
+  issueIdentifier: string,
+  input: { decisionKind: "revive" | "supersede"; status: "accepted" | "refused"; stage: string; reason: string },
+) {
+  return {
+    id: `outcome-${directive.id}`,
+    sourceSessionId: directive.sourceSessionId ?? "owner-desk",
+    sourceMessageId: directive.sourceMessageId ?? `message-${directive.id}`,
+    sourceTimestampMs: directive.sourceTimestampMs ?? null,
+    verbatim: directive.verbatim,
+    directiveId: directive.id,
+    issueId: directive.issueId,
+    issueIdentifier,
+    decisionKind: input.decisionKind,
+    status: input.status,
+    stage: input.stage,
+    reason: input.reason,
+    recordedAtMs: 2_200,
+  };
 }
 
 function transitionFixture(status: CraftSessionStatus) {
@@ -300,7 +326,7 @@ describe("v4 live runner mutation scope", () => {
     const serialized = JSON.stringify(first);
 
     expect(first).toEqual(restarted);
-    expect(Object.keys(first).sort()).toEqual(["projectDesk", "proposal", "receiptHash", "schema", "writes"]);
+    expect(Object.keys(first).sort()).toEqual(["failedDecisionOutcome", "projectDesk", "proposal", "receiptHash", "schema", "writes"]);
     expect(first).toMatchObject({ schema: "craft-agent/symphony-shadow@1", writes: 0, proposal: { action: "resume" } });
     expect(first.receiptHash).toMatch(/^[0-9a-f]{64}$/);
     // The canonical hash must cover the schema field: a different schema value changes the hash.
@@ -373,6 +399,121 @@ describe("v4 live runner mutation scope", () => {
     expect(receipts).toEqual([`${snapshot.issue.id}:Keep the change bounded.`]);
   });
 
+  test("a normal discovery tick reads the real Desk transcript, refreshes an omitted failed target, and resumes API-commit-before-ack", async () => {
+    const base = transitionFixture("settled").runner;
+    const source = structuredClone((await base.readStatus()).snapshot!);
+    source.issue.id = "LINEAGE_293";
+    source.issue.identifier = "razumv/lineage2-client#293";
+    source.issue.state = "failed";
+    source.issue.closed = false;
+    source.claim = null;
+    source.version = 7;
+    source.events = [{ sequence: 7, atMs: 1_900, state: "failed", kind: "failure", message: "attempt failed" }];
+
+    const runtime: CraftRuntimeIdentity = {
+      cliPath: "/opt/craft/bin/craft-cli", cliVersion: "0.11.4",
+      serverId: "craft-server", serverVersion: "0.11.4-admission.test",
+    };
+    const desk: CraftRpcSession = {
+      id: "owner-desk", workspaceId: "general", projectId: "PROJECT", name: "Project Desk",
+      isProcessing: false, labels: [], messages: [
+        { id: "owner-293", role: "user", content: "REVIVE razumv/lineage2-client#293: provider quota reset OPS-293", timestamp: 1_950 },
+        { id: "tool-after-293", role: "tool", content: "null", timestamp: 1_960 },
+        { id: "assistant-after-293", role: "assistant", content: "No relay is required.", timestamp: 1_970 },
+      ],
+    };
+    let notes = "";
+    let failOutcomeAcknowledgementOnce = true;
+    const rpcCalls: string[] = [];
+    const transport: CraftRpcTransport = {
+      identity: async () => structuredClone(runtime),
+      invoke: async <T>(channel: string, args: readonly unknown[] = []) => {
+        rpcCalls.push(channel);
+        if (channel === "sessions:get") return structuredClone([{ ...desk, messages: [] }]) as T;
+        if (channel === "sessions:getMessages") return structuredClone(desk) as T;
+        if (channel === "sessions:getNotes") return notes as T;
+        if (channel === "sessions:setNotes") {
+          const body = args[1] as string;
+          if (body.includes("craft-protocol-v4:failed-decision-outcome") && failOutcomeAcknowledgementOnce) {
+            failOutcomeAcknowledgementOnce = false;
+            throw new Error("simulated acknowledgement interruption");
+          }
+          notes = body;
+          return undefined as T;
+        }
+        throw new Error(`unexpected RPC ${channel}`);
+      },
+    };
+    const craftConfig: CraftAdapterConfig = {
+      workspaceId: "general", projectId: "PROJECT", projectWorkingDirectory: "/repo", ownerSessionId: "owner-desk",
+      repositoryInstructions: "bounded", issueLabelId: "issue", runLabelId: "run", promptLabelId: "prompt",
+      model: { connection: "chatgpt-plus", allowedProfiles: ["pi/gpt-5.6-sol"] }, expectedRuntime: runtime,
+      deadlines: { rpcMs: 5_000, turnMs: 60_000, cancelMs: 5_000, pollMs: 100, maxContextTokens: 55_000 },
+      maxHandoffChars: 512, nowMs: () => 2_000,
+    };
+    let targetRefreshes = 0;
+    let receiptWrites = 0;
+    let revivals = 0;
+    let supersessions = 0;
+    let transitions = 0;
+    let schedulerTicks = 0;
+    const tracker = {
+      fetchFailedDecisionTargets: async () => { targetRefreshes += 1; return [structuredClone(source)]; },
+      // The exact failed row is deliberately absent from ordinary board/read projections.
+      fetchIssuesByStates: async () => [],
+      fetchBacklog: async () => [],
+      activeClaims: async () => [],
+      get: async () => structuredClone(source),
+      recordOwnerDirective: async () => { receiptWrites += 1; return { recorded: true }; },
+      reviveFailed: async (_issueId: string, justification: string) => {
+        revivals += 1;
+        source.issue.state = "ready";
+        source.version += 1;
+        source.events.push({ sequence: 8, atMs: 2_010, state: "ready", kind: "revival", message: "revived", justification });
+        return { accepted: true as const, snapshot: structuredClone(source), reason: "revived after exact owner command" };
+      },
+      supersedeFailed: async () => { supersessions += 1; throw new Error("must not supersede"); },
+      transition: async () => { transitions += 1; return structuredClone(source); },
+    } as unknown as GitHubIssuesProjectsAdapter;
+    const runnerConfig = {
+      mode: "discovery",
+      github: { repository: "razumv/lineage2-client", states: { failed: {}, ready: {} } },
+    } as unknown as LiveRunnerConfig;
+    const makeRunner = () => new LiveV4Runner(
+      runnerConfig,
+      { project: { repository: "razumv/lineage2-client" }, scheduler: { maxRevivals: 2 } } as WorkflowConfig,
+      tracker,
+      new CraftMobileControlPlaneAdapter(craftConfig, transport),
+      {} as CraftCliRpcTransport,
+      { tick: async () => { schedulerTicks += 1; }, previewNext: async () => null } as unknown as DeterministicScheduler,
+    );
+
+    const interrupted = await makeRunner().tick();
+    expect(interrupted.failedDecisionOutcome).toBeNull();
+    expect(revivals).toBe(1);
+    expect(receiptWrites).toBe(1);
+    expect(notes).toContain("craft-protocol-v4:owner-directive");
+    expect(notes).not.toContain("craft-protocol-v4:failed-decision-outcome");
+    expect(schedulerTicks).toBe(0);
+
+    const resumedRunner = makeRunner();
+    const resumed = await resumedRunner.tick();
+    expect(resumed.failedDecisionOutcome).toMatchObject({
+      sourceMessageId: "owner-293", status: "accepted", stage: "readback", decisionKind: "revive",
+    });
+    expect(notes).toContain("ACCEPTED readback");
+    expect(targetRefreshes).toBe(2);
+    expect(revivals).toBe(1);
+    expect(receiptWrites).toBe(1);
+    expect(supersessions).toBe(0);
+    expect(transitions).toBe(0);
+    expect(schedulerTicks).toBe(1);
+    const shadow = await resumedRunner.shadow();
+    expect(shadow.failedDecisionOutcome).toEqual(resumed.failedDecisionOutcome);
+    expect(rpcCalls).toContain("sessions:getMessages");
+    expect(rpcCalls).not.toContain("sessions:sendMessage");
+  });
+
   test("deduplicates an exact owner revival through one ledger operation and exact reconstructed readback", async () => {
     const base = transitionFixture("settled").runner;
     const status = await base.readStatus();
@@ -391,6 +532,7 @@ describe("v4 live runner mutation scope", () => {
     let receiptWrites = 0;
     let revivals = 0;
     let directTransitions = 0;
+    let deskOutcome: ReturnType<typeof failedOutcome> | null = null;
     const tracker = {
       get: async () => structuredClone(snapshot),
       recordOwnerDirective: async () => { receiptWrites += 1; return { recorded: receiptWrites === 1 }; },
@@ -405,12 +547,16 @@ describe("v4 live runner mutation scope", () => {
     } as unknown as GitHubIssuesProjectsAdapter;
     const craft = {
       pollOwnerDesk: async () => ({
-        directives: [{
+        directives: deskOutcome ? [] : [{
           directive, gateDecision: null, newlyIngested: revivals === 0,
           failedDecision: { kind: "revive" as const, issueId: snapshot.issue.id, justification: "provider quota reset OPS-42", evidenceId: directive.id },
         }],
-        refusals: [], providerReadCalls: 4 as const, providerWriteCalls: 0 as const,
+        refusals: [], latestFailedDecisionOutcome: deskOutcome, providerReadCalls: 4 as const, providerWriteCalls: 0 as const,
       }),
+      acknowledgeFailedDecision: async (_directive: unknown, input: Parameters<typeof failedOutcome>[2]) => {
+        deskOutcome = failedOutcome(directive, snapshot.issue.identifier, input);
+        return deskOutcome;
+      },
       get: async () => structuredClone(status.execution),
     } as unknown as CraftMobileControlPlaneAdapter;
     const diagnostics: string[] = [];
@@ -428,8 +574,59 @@ describe("v4 live runner mutation scope", () => {
     expect(receiptWrites).toBe(1);
     expect(directTransitions).toBe(0);
     expect(String(snapshot.issue.state)).toBe("ready");
-    expect(diagnostics).toContainEqual(expect.stringContaining("failed decision revive"));
-    expect(diagnostics).toContainEqual(expect.stringContaining("source lifecycle is ready, not failed"));
+    expect(diagnostics.filter((message) => message.includes("failed decision revive") && message.includes("accepted from"))).toHaveLength(1);
+  });
+
+  test("refuses a Desk decision whose failed source ledger revision changed before apply", async () => {
+    const base = transitionFixture("settled").runner;
+    const source = structuredClone((await base.readStatus()).snapshot!);
+    source.issue.state = "failed";
+    source.claim = null;
+    source.version = 8;
+    source.events = [{ sequence: 88, atMs: 2_000, state: "failed", kind: "failure", message: "new failure revision" }];
+    const directive = {
+      id: "revision-bound", issueId: source.issue.id, receivedAtMs: 1_900, acknowledgedAtMs: 1_900,
+      verbatim: `REVIVE ${source.issue.identifier}: quota reset OPS-42`, sourceSessionId: "desk",
+      sourceMessageId: "revision-message", sourceTimestampMs: 1_850, sourceRevision: 7, acknowledgementId: "ack-revision",
+    };
+    let receipts = 0;
+    let revivals = 0;
+    let acknowledged: { status?: string; stage?: string; reason?: string } | null = null;
+    const tracker = {
+      get: async () => structuredClone(source),
+      recordOwnerDirective: async () => { receipts += 1; return { recorded: true }; },
+      reviveFailed: async () => { revivals += 1; throw new Error("must not revive changed revision"); },
+    } as unknown as GitHubIssuesProjectsAdapter;
+    const craft = {
+      pollOwnerDesk: async () => ({
+        directives: [{
+          directive, gateDecision: null, newlyIngested: true,
+          failedDecision: { kind: "revive" as const, issueId: source.issue.id, justification: "quota reset OPS-42", evidenceId: directive.id, sourceVersion: 7 },
+        }],
+        refusals: [], latestFailedDecisionOutcome: null, providerReadCalls: 5 as const, providerWriteCalls: 1 as const,
+      }),
+      acknowledgeFailedDecision: async (_directive: unknown, input: { status: "accepted" | "refused"; stage: string; reason: string }) => {
+        acknowledged = input;
+        return {
+          id: "failed-revision", sourceSessionId: "desk", sourceMessageId: "revision-message", sourceTimestampMs: 1_850,
+          verbatim: directive.verbatim, directiveId: directive.id, issueId: source.issue.id,
+          issueIdentifier: source.issue.identifier, decisionKind: "revive" as const,
+          status: input.status, stage: input.stage, reason: input.reason, recordedAtMs: 2_100,
+        };
+      },
+    } as unknown as CraftMobileControlPlaneAdapter;
+    const runner = new LiveV4Runner(
+      { issueId: source.issue.id } as LiveRunnerConfig,
+      { scheduler: { maxRevivals: 2 } } as WorkflowConfig,
+      tracker, craft, {} as CraftCliRpcTransport, { tick: async () => {} } as unknown as DeterministicScheduler,
+    );
+
+    const status = await runner.tick();
+
+    expect(receipts).toBe(0);
+    expect(revivals).toBe(0);
+    expect(acknowledged).toMatchObject({ status: "refused", stage: "preflight", reason: expect.stringContaining("revision changed from 7 to 8") });
+    expect(status.failedDecisionOutcome).toMatchObject({ status: "refused", stage: "preflight" });
   });
 
   test("applies one exact #94 receipt even when the Project Desk is unreadable", async () => {
@@ -535,8 +732,9 @@ describe("v4 live runner mutation scope", () => {
             successor: successor.issue.identifier, evidenceId: directive.id,
           },
         }],
-        refusals: [], providerReadCalls: 4 as const, providerWriteCalls: 0 as const,
+        refusals: [], latestFailedDecisionOutcome: null, providerReadCalls: 4 as const, providerWriteCalls: 0 as const,
       }),
+      acknowledgeFailedDecision: async (_directive: unknown, input: Parameters<typeof failedOutcome>[2]) => failedOutcome(directive, source.issue.identifier, input),
       get: async () => structuredClone(status.execution),
     } as unknown as CraftMobileControlPlaneAdapter;
     const runner = new LiveV4Runner(
@@ -574,15 +772,17 @@ describe("v4 live runner mutation scope", () => {
       recordOwnerDirective: async () => { receipts += 1; return { recorded: true }; },
       supersedeFailed: async () => { supersessions += 1; throw new Error("must not mutate"); },
     } as unknown as GitHubIssuesProjectsAdapter;
+    const badDirective = {
+      id: "bad-lineage", issueId: source.issue.id, receivedAtMs: 2_000, acknowledgedAtMs: 2_000,
+      verbatim: "SUPERSEDE acme/repo#1: acme/repo#152", sourceSessionId: "desk", sourceMessageId: "bad", acknowledgementId: "ack-bad",
+    };
     const craft = {
       pollOwnerDesk: async () => ({ directives: [{
-        directive: {
-          id: "bad-lineage", issueId: source.issue.id, receivedAtMs: 2_000, acknowledgedAtMs: 2_000,
-          verbatim: "SUPERSEDE acme/repo#1: acme/repo#152", sourceSessionId: "desk", sourceMessageId: "bad", acknowledgementId: "ack-bad",
-        },
+        directive: badDirective,
         gateDecision: null, newlyIngested: true,
         failedDecision: { kind: "supersede" as const, issueId: source.issue.id, successorIssueId: successor.issue.id, successor: successor.issue.identifier, evidenceId: "bad-lineage" },
-      }], refusals: [], providerReadCalls: 4 as const, providerWriteCalls: 0 as const }),
+      }], refusals: [], latestFailedDecisionOutcome: null, providerReadCalls: 4 as const, providerWriteCalls: 0 as const }),
+      acknowledgeFailedDecision: async (_directive: unknown, input: Parameters<typeof failedOutcome>[2]) => failedOutcome(badDirective, source.issue.identifier, input),
       get: async () => structuredClone(status.execution),
     } as unknown as CraftMobileControlPlaneAdapter;
     const runner = new LiveV4Runner(

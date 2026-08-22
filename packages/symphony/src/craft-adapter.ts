@@ -158,6 +158,8 @@ export interface DirectOwnerDirectiveInput {
 export interface ProjectDeskDirectiveTarget {
   issueId: string;
   issueIdentifier: string;
+  /** Exact reconstructed ledger revision used to reject changed-source commands. */
+  version?: number;
   state?: string;
   closed?: boolean;
   providerMerged?: boolean;
@@ -173,9 +175,31 @@ export interface PolledOwnerDirective {
   newlyIngested: boolean;
 }
 
+export type FailedDecisionOutcomeStatus = "accepted" | "refused";
+
+/** One immutable, Desk-visible terminal outcome for one exact transcript message. */
+export interface FailedDecisionOutcome {
+  id: string;
+  sourceSessionId: string;
+  sourceMessageId: string;
+  sourceTimestampMs: number | null;
+  verbatim: string;
+  directiveId: string | null;
+  issueId: string | null;
+  issueIdentifier: string | null;
+  decisionKind: "revive" | "supersede" | null;
+  status: FailedDecisionOutcomeStatus;
+  /** Attribution boundary: transport, author, syntax, target, preflight, API, or readback. */
+  stage: string;
+  reason: string;
+  recordedAtMs: number;
+}
+
 export interface ProjectDeskDirectivePoll {
   directives: PolledOwnerDirective[];
   refusals: string[];
+  /** Latest durable failed-lifecycle outcome reconstructed from Desk notes. */
+  latestFailedDecisionOutcome: FailedDecisionOutcome | null;
   /** 4 unchanged; 5 when exact acknowledgement readback verifies a write. */
   providerReadCalls: 4 | 5;
   /** 0 unchanged; one batched notes write for every newly discovered message in the cycle. */
@@ -253,9 +277,52 @@ function digest(value: string): string {
 
 const directiveRecordPrefix = "<!-- craft-protocol-v4:owner-directive\n";
 const directiveRecordSuffix = "\n-->";
+const failedDecisionOutcomePrefix = "<!-- craft-protocol-v4:failed-decision-outcome\n";
+const failedDecisionOutcomeSuffix = "\n-->";
 
 function directiveRecord(entry: OwnerDirective): string {
   return `${directiveRecordPrefix}${JSON.stringify(entry)}${directiveRecordSuffix}`;
+}
+
+function failedDecisionOutcomeRecord(entry: FailedDecisionOutcome): string {
+  return [
+    "## Failed lifecycle decision acknowledgement",
+    failedDecisionOutcomeAcknowledgement(entry),
+    `${failedDecisionOutcomePrefix}${JSON.stringify(entry)}${failedDecisionOutcomeSuffix}`,
+  ].join("\n\n");
+}
+
+function validateFailedDecisionOutcome(entry: FailedDecisionOutcome): FailedDecisionOutcome {
+  required(entry.id, "failed decision outcome id");
+  required(entry.sourceSessionId, "failed decision outcome source session");
+  required(entry.sourceMessageId, "failed decision outcome source message");
+  required(entry.verbatim, "failed decision outcome verbatim message");
+  required(entry.stage, "failed decision outcome stage");
+  required(entry.reason, "failed decision outcome reason");
+  if (entry.sourceTimestampMs !== null && !Number.isFinite(entry.sourceTimestampMs)) throw new Error("failed decision outcome source timestamp is invalid");
+  if (!Number.isFinite(entry.recordedAtMs)) throw new Error("failed decision outcome recorded timestamp is invalid");
+  if (!(["accepted", "refused"] as const).includes(entry.status)) throw new Error("failed decision outcome status is invalid");
+  if (entry.decisionKind !== null && entry.decisionKind !== "revive" && entry.decisionKind !== "supersede") {
+    throw new Error("failed decision outcome kind is invalid");
+  }
+  return Object.freeze({ ...entry });
+}
+
+function failedDecisionOutcomeRecords(notes: string): { entry: FailedDecisionOutcome; block: string }[] {
+  const pattern = /<!-- craft-protocol-v4:failed-decision-outcome\n([\s\S]*?)\n-->/g;
+  const matches = [...notes.matchAll(pattern)];
+  if ((notes.match(/<!-- craft-protocol-v4:failed-decision-outcome/g) ?? []).length !== matches.length) {
+    throw new Error("Project Desk failed decision outcome ledger is malformed");
+  }
+  return matches.map((match) => {
+    let entry: unknown;
+    try { entry = JSON.parse(match[1]!); } catch { throw new Error("Project Desk failed decision outcome ledger contains invalid JSON"); }
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      throw new Error("Project Desk failed decision outcome ledger contains an invalid record");
+    }
+    const validated = validateFailedDecisionOutcome(entry as FailedDecisionOutcome);
+    return { entry: validated, block: failedDecisionOutcomeRecord(validated) };
+  });
 }
 
 function directiveRecords(notes: string): { entry: OwnerDirective; block: string }[] {
@@ -294,6 +361,7 @@ function timestamp(message: CraftMessage | undefined, fallback: number): number 
 
 export class CraftMobileControlPlaneAdapter implements CraftControlAdapter {
   readonly directives = new OwnerDirectiveLedger();
+  readonly #failedDecisionOutcomes = new Map<string, FailedDecisionOutcome>();
   readonly #models: ModelPolicy;
   readonly #now: () => number;
   readonly #sleep: (ms: number) => Promise<void>;
@@ -456,38 +524,83 @@ export class CraftMobileControlPlaneAdapter implements CraftControlAdapter {
     const directives: PolledOwnerDirective[] = [];
     const refusals: string[] = [];
     const additions: OwnerDirective[] = [];
+    const outcomeAdditions: FailedDecisionOutcome[] = [];
     const nowMs = this.#now();
 
-    for (const message of messages(ownerDesk).filter((entry) => entry.role === "user" && !entry.hidden)) {
+    const refuse = (message: CraftMessage, content: string, stage: string, reason: string): void => {
+      const outcome = failedDecisionOutcomeForMessage(
+        this.config.ownerSessionId,
+        message,
+        content,
+        null,
+        null,
+        null,
+        "refused",
+        stage,
+        reason,
+        nowMs,
+      );
+      if (!this.#failedDecisionOutcomes.has(outcome.id) && !outcomeAdditions.some((entry) => entry.id === outcome.id)) {
+        outcomeAdditions.push(outcome);
+      }
+      refusals.push(`Project Desk message ${message.id}: ${reason}`);
+    };
+
+    // Read the full persisted transcript in authored order. Later tool or
+    // assistant prose cannot replace an earlier direct-owner command, while a
+    // command-shaped non-user message gets an attributable author refusal.
+    for (const message of messages(ownerDesk).filter((entry) => !entry.hidden)) {
       const content = message.content;
       if (!content?.trim()) continue;
       const classified = classifyProjectDeskMessage(content, targets);
       if (classified.kind === "conversation") continue;
-      if (classified.kind === "refused") {
-        refusals.push(`Project Desk message ${message.id}: ${classified.reason}`);
+      const outcomeId = failedDecisionOutcomeId(this.config.ownerSessionId, message.id);
+      if (this.#failedDecisionOutcomes.has(outcomeId)) continue;
+      if (message.role !== "user") {
+        refuse(message, content, "author", `failed lifecycle command role is ${message.role}, not the configured direct owner`);
         continue;
       }
       const sourceTimestampMs = timestamp(message, Number.NaN);
       if (!Number.isFinite(sourceTimestampMs)) {
-        refusals.push(`Project Desk message ${message.id}: owner directive source timestamp is absent`);
+        refuse(message, content, "transport", "owner directive source timestamp is absent");
         continue;
       }
       const id = `directive-${digest(`${this.config.ownerSessionId}\n${message.id}`)}`;
       const existing = this.directives.get(id);
       if (existing) {
+        const expectedVerbatim = /^(REVIVE|SUPERSEDE) (\S+): ([^\n]+)$/.test(content)
+          ? content
+          : classified.kind === "directive" ? classified.verbatim : existing.verbatim;
         if (
-          existing.issueId !== classified.target.issueId
-          || existing.sourceSessionId !== this.config.ownerSessionId
+          existing.sourceSessionId !== this.config.ownerSessionId
           || existing.sourceMessageId !== message.id
-          || existing.sourceTimestampMs !== undefined && existing.sourceTimestampMs !== sourceTimestampMs
-          || existing.verbatim !== classified.verbatim
+          || existing.sourceTimestampMs !== sourceTimestampMs
+          || existing.verbatim !== expectedVerbatim
         ) throw new Error(`directive ${id} is immutable`);
+        const recorded = reconstructRecordedFailedDecision(existing, targets);
+        if (recorded.kind === "refused") {
+          refuse(message, content, recorded.stage, recorded.reason);
+          continue;
+        }
+        if (recorded.kind === "decision") {
+          directives.push({ directive: existing, gateDecision: null, failedDecision: { ...recorded.decision, evidenceId: id }, newlyIngested: false });
+          continue;
+        }
+        // Non-failed directives retain their existing behavior.
+        if (classified.kind === "refused") {
+          refusals.push(`Project Desk message ${message.id}: ${classified.reason}`);
+          continue;
+        }
         directives.push({
           directive: existing,
           gateDecision: classified.gateId ? parseOwnerGateDecision(classified.verbatim, classified.gateId) : null,
-          failedDecision: classified.failedDecision ? { ...classified.failedDecision, evidenceId: id } : null,
+          failedDecision: null,
           newlyIngested: false,
         });
+        continue;
+      }
+      if (classified.kind === "refused") {
+        refuse(message, content, failedDecisionRefusalStage(classified.reason), classified.reason);
         continue;
       }
       const acknowledgementId = `ack-${digest(`${id}\n${classified.target.issueId}\n${nowMs}\n${classified.verbatim}`)}`;
@@ -500,6 +613,7 @@ export class CraftMobileControlPlaneAdapter implements CraftControlAdapter {
         sourceSessionId: this.config.ownerSessionId,
         sourceMessageId: message.id,
         sourceTimestampMs,
+        ...(classified.failedDecision && classified.target.version !== undefined ? { sourceRevision: classified.target.version } : {}),
         acknowledgementId,
       };
       additions.push(candidate);
@@ -511,24 +625,77 @@ export class CraftMobileControlPlaneAdapter implements CraftControlAdapter {
       });
     }
 
-    if (additions.length > 0) {
-      const latest = additions.at(-1)!;
+    if (additions.length > 0 || outcomeAdditions.length > 0) {
+      const latestDirective = additions.at(-1);
       const nextBody = [
         durable.notes.trim(),
-        "## Latest owner acknowledgement",
-        `ACK ${latest.id} ${latest.acknowledgementId}`,
+        ...(latestDirective ? ["## Latest owner acknowledgement", `INGESTED ${latestDirective.id} ${latestDirective.acknowledgementId}`] : []),
         ...additions.map(directiveRecord),
+        ...outcomeAdditions.map(failedDecisionOutcomeRecord),
       ].filter(Boolean).join("\n\n");
       await this.transport.invoke("sessions:setNotes", [this.config.ownerSessionId, nextBody], this.config.deadlines.rpcMs);
       await this.verifyDeskNotes(nextBody);
       for (const addition of additions) this.directives.append(addition);
+      for (const outcome of outcomeAdditions) this.#failedDecisionOutcomes.set(outcome.id, outcome);
     }
+    const allOutcomes = [...this.#failedDecisionOutcomes.values()];
     return {
       directives,
       refusals,
-      providerReadCalls: additions.length > 0 ? 5 : PROJECT_DESK_BASE_PROVIDER_READ_CALLS,
-      providerWriteCalls: additions.length > 0 ? 1 : 0,
+      latestFailedDecisionOutcome: allOutcomes.at(-1) ?? null,
+      providerReadCalls: additions.length > 0 || outcomeAdditions.length > 0 ? 5 : PROJECT_DESK_BASE_PROVIDER_READ_CALLS,
+      providerWriteCalls: additions.length > 0 || outcomeAdditions.length > 0 ? 1 : 0,
     };
+  }
+
+  /** Append the one terminal lifecycle outcome after exact provider/ledger readback. */
+  async acknowledgeFailedDecision(
+    directive: Readonly<OwnerDirective>,
+    input: {
+      issueIdentifier: string;
+      decisionKind: "revive" | "supersede";
+      status: FailedDecisionOutcomeStatus;
+      stage: string;
+      reason: string;
+    },
+  ): Promise<FailedDecisionOutcome> {
+    await this.verifyRuntime();
+    await this.verifyOwnerDesk();
+    const durable = await this.loadDirectiveLedger();
+    if (directive.sourceSessionId !== this.config.ownerSessionId || !directive.sourceMessageId) {
+      throw new Error("failed decision acknowledgement lacks exact configured Desk source evidence");
+    }
+    const id = failedDecisionOutcomeId(this.config.ownerSessionId, directive.sourceMessageId);
+    const existing = this.#failedDecisionOutcomes.get(id);
+    if (existing) {
+      if (existing.directiveId !== directive.id || existing.verbatim !== directive.verbatim) {
+        throw new Error(`failed decision outcome ${id} is immutable`);
+      }
+      return existing;
+    }
+    const candidate = validateFailedDecisionOutcome({
+      id,
+      sourceSessionId: this.config.ownerSessionId,
+      sourceMessageId: directive.sourceMessageId,
+      sourceTimestampMs: directive.sourceTimestampMs ?? null,
+      verbatim: directive.verbatim,
+      directiveId: directive.id,
+      issueId: directive.issueId,
+      issueIdentifier: input.issueIdentifier,
+      decisionKind: input.decisionKind,
+      status: input.status,
+      stage: input.stage,
+      reason: input.reason,
+      recordedAtMs: this.#now(),
+    });
+    const nextBody = [
+      durable.notes.trim(),
+      failedDecisionOutcomeRecord(candidate),
+    ].filter(Boolean).join("\n\n");
+    await this.transport.invoke("sessions:setNotes", [this.config.ownerSessionId, nextBody], this.config.deadlines.rpcMs);
+    await this.verifyDeskNotes(nextBody);
+    this.#failedDecisionOutcomes.set(candidate.id, candidate);
+    return candidate;
   }
 
   async ingestOwnerDirective(input: DirectOwnerDirectiveInput): Promise<{
@@ -642,8 +809,16 @@ export class CraftMobileControlPlaneAdapter implements CraftControlAdapter {
     );
     if (typeof notes !== "string") throw new Error("Project Desk notes response is ambiguous");
     const records = directiveRecords(notes);
+    const outcomes = failedDecisionOutcomeRecords(notes);
     for (const record of records) this.directives.append(record.entry);
-    return { notes, blocks: records.map((record) => record.block) };
+    for (const record of outcomes) {
+      const existing = this.#failedDecisionOutcomes.get(record.entry.id);
+      if (existing && JSON.stringify(existing) !== JSON.stringify(record.entry)) {
+        throw new Error(`failed decision outcome ${record.entry.id} is immutable`);
+      }
+      this.#failedDecisionOutcomes.set(record.entry.id, record.entry);
+    }
+    return { notes, blocks: [...records.map((record) => record.block), ...outcomes.map((record) => record.block)] };
   }
 
   private async verifyDeskNotes(expected: string): Promise<void> {
@@ -873,6 +1048,91 @@ export class CraftMobileControlPlaneAdapter implements CraftControlAdapter {
   }
 }
 
+function failedDecisionOutcomeId(ownerSessionId: string, sourceMessageId: string): string {
+  return `failed-decision-${digest(`${ownerSessionId}\n${sourceMessageId}`)}`;
+}
+
+function failedDecisionOutcomeForMessage(
+  ownerSessionId: string,
+  message: CraftMessage,
+  verbatim: string,
+  directiveId: string | null,
+  issueId: string | null,
+  issueIdentifier: string | null,
+  status: FailedDecisionOutcomeStatus,
+  stage: string,
+  reason: string,
+  recordedAtMs: number,
+): FailedDecisionOutcome {
+  const intent = /\b(REVIVE|SUPERSEDE)\b/i.exec(verbatim)?.[1]?.toLowerCase();
+  return validateFailedDecisionOutcome({
+    id: failedDecisionOutcomeId(ownerSessionId, message.id),
+    sourceSessionId: ownerSessionId,
+    sourceMessageId: message.id,
+    sourceTimestampMs: Number.isFinite(timestamp(message, Number.NaN)) ? timestamp(message, Number.NaN) : null,
+    verbatim,
+    directiveId,
+    issueId,
+    issueIdentifier,
+    decisionKind: intent === "revive" || intent === "supersede" ? intent : null,
+    status,
+    stage,
+    reason,
+    recordedAtMs,
+  });
+}
+
+function failedDecisionOutcomeAcknowledgement(outcome: FailedDecisionOutcome): string {
+  return `ACK ${outcome.id} ${outcome.status.toUpperCase()} ${outcome.stage}: ${outcome.reason}`;
+}
+
+function failedDecisionRefusalStage(reason: string): string {
+  if (reason.includes("syntax")) return "syntax";
+  if (reason.includes("source ") || reason.includes("successor ") || reason.includes("configured repository and Project")) return "target";
+  return "preflight";
+}
+
+type RecordedFailedDecision =
+  | { kind: "revive"; issueId: string; justification: string; sourceVersion?: number }
+  | { kind: "supersede"; issueId: string; successorIssueId: string; successor: string; sourceVersion?: number };
+
+type ReconstructedFailedDecision =
+  | { kind: "not-failed-decision" }
+  | { kind: "refused"; stage: string; reason: string }
+  | { kind: "decision"; decision: RecordedFailedDecision };
+
+/** Rebuild immutable intent after a restart without re-running mutable lifecycle preconditions. */
+function reconstructRecordedFailedDecision(
+  directive: Readonly<OwnerDirective>,
+  targets: readonly ProjectDeskDirectiveTarget[],
+): ReconstructedFailedDecision {
+  const failed = /^(REVIVE|SUPERSEDE) (\S+): ([^\n]+)$/.exec(directive.verbatim);
+  if (!failed) return { kind: "not-failed-decision" };
+  const kind = failed[1] === "REVIVE" ? "revive" : "supersede";
+  const sourceMatches = targets.filter((target) => target.issueId === directive.issueId && target.issueIdentifier === failed[2]);
+  if (sourceMatches.length !== 1) {
+    return { kind: "refused", stage: "target", reason: `${kind} source ${failed[2]} changed identity or is missing from the configured repository and Project` };
+  }
+  const argument = failed[3]!.trim();
+  if (kind === "revive") {
+    return {
+      kind: "decision",
+      decision: { kind, issueId: directive.issueId, justification: argument, ...(directive.sourceRevision === undefined ? {} : { sourceVersion: directive.sourceRevision }) },
+    };
+  }
+  const successorMatches = targets.filter((target) => target.issueIdentifier === argument);
+  if (successorMatches.length !== 1) {
+    return { kind: "refused", stage: "target", reason: `supersede successor ${argument} changed identity, is missing, or is ambiguous in the configured repository and Project` };
+  }
+  return {
+    kind: "decision",
+    decision: {
+      kind, issueId: directive.issueId, successorIssueId: successorMatches[0]!.issueId, successor: argument,
+      ...(directive.sourceRevision === undefined ? {} : { sourceVersion: directive.sourceRevision }),
+    },
+  };
+}
+
 type ClassifiedDeskMessage =
   | { kind: "conversation" }
   | { kind: "refused"; reason: string }
@@ -913,7 +1173,10 @@ export function classifyProjectDeskMessage(
         kind: "directive",
         target: source,
         verbatim: content,
-        failedDecision: { kind, issueId: source.issueId, justification: argument, evidenceId: "owner-command" },
+        failedDecision: {
+          kind, issueId: source.issueId, justification: argument, evidenceId: "owner-command",
+          ...(source.version === undefined ? {} : { sourceVersion: source.version }),
+        },
       };
     }
     const successorMatches = targets.filter((target) => target.issueIdentifier === argument);
@@ -937,6 +1200,7 @@ export function classifyProjectDeskMessage(
         successorIssueId: successorMatches[0]!.issueId,
         successor: argument,
         evidenceId: "owner-command",
+        ...(source.version === undefined ? {} : { sourceVersion: source.version }),
       },
     };
   }

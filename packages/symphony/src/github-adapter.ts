@@ -605,6 +605,28 @@ export class GitHubIssuesProjectsAdapter implements TrackerAdapter {
   }
 
   /**
+   * Build the Desk command inventory from provider truth, not from the board's
+   * active/read projection. Failed rows are terminal and may be absent there;
+   * their managed label remains visible in the repository listing, so force an
+   * exact node + ledger hydration for every provider-open failed-labelled issue.
+   */
+  async fetchFailedDecisionTargets(): Promise<TrackerIssueSnapshot[]> {
+    const ordinary = await this.loadAll(false);
+    const failedLabel = normalizeLabel(this.config.states.failed.label);
+    const failedIds = [...this.#records.values()].filter((record) => (
+      record.state === "OPEN"
+      && (record.labelNames === null || record.labelNames === undefined
+        // Unknown listing labels are candidates, never evidence of absence.
+        // Strict hydration below asks their exact labels/Project/ledger and
+        // harmlessly drops genuinely unmanaged issues.
+        ? true
+        : record.labelNames.map(normalizeLabel).includes(failedLabel))
+    )).map((record) => record.id);
+    const refreshed = failedIds.length > 0 ? await this.loadAll(true, new Set(failedIds)) : ordinary;
+    return [...refreshed.values()].map((entry) => entry.snapshot);
+  }
+
+  /**
    * Open issues the lane does not manage, built from the same repository listing
    * that discovery uses. Labels, body, creation time, priority and parent ride
    * on that listing; native blocker edges are read only for the resulting

@@ -343,6 +343,19 @@ function attachPr(
 }
 
 describe("v4.2 GitHub Issues and Projects adapter", () => {
+  test("force-refreshes every provider-open failed-labelled Desk target even when ordinary requested states omit it", async () => {
+    const { transport, adapter } = setup();
+    transport.addIssue(29, "failed");
+
+    expect(await adapter.fetchIssuesByStates(["ready"])).toEqual([]);
+    const nodeReadsBefore = transport.calls.get("issue-nodes") ?? 0;
+    const targets = await adapter.fetchFailedDecisionTargets();
+
+    expect(targets).toHaveLength(1);
+    expect(targets[0]).toMatchObject({ issue: { id: "I_29", state: "failed", closed: false } });
+    expect(transport.calls.get("issue-nodes")).toBe(nodeReadsBefore + 1);
+  });
+
   test("creates one bounded successor and supersedes the open authored source before any claim", async () => {
     const { transport, truth, adapter } = setup();
     const sourceRecord = transport.addIssue(1);

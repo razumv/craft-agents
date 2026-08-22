@@ -28,8 +28,8 @@ export type FailedSupersessionValidation =
   | { accepted: false; reason: string };
 
 export type FailedLifecycleDecision =
-  | { kind: "revive"; issueId: string; justification: string; evidenceId: string }
-  | { kind: "supersede"; issueId: string; successorIssueId: string; successor: string; evidenceId: string };
+  | { kind: "revive"; issueId: string; justification: string; evidenceId: string; sourceVersion?: number }
+  | { kind: "supersede"; issueId: string; successorIssueId: string; successor: string; evidenceId: string; sourceVersion?: number };
 
 export interface FailedDecisionReceiptPoll {
   decisions: FailedLifecycleDecision[];
@@ -81,6 +81,12 @@ export interface TrackerBacklogIssue {
 
 export interface TrackerAdapter {
   fetchIssuesByStates(states: readonly LifecycleState[]): Promise<TrackerIssueSnapshot[]>;
+  /**
+   * Exact command target inventory. Unlike ordinary board/backlog projections,
+   * this must force-refresh every provider-open issue carrying the managed
+   * failed label, while retaining configured-Project successors of any state.
+   */
+  fetchFailedDecisionTargets?(): Promise<TrackerIssueSnapshot[]>;
   /** Open, unmanaged issues. Optional: a tracker may have no notion of them. */
   fetchBacklog?(): Promise<TrackerBacklogIssue[]>;
   /**
