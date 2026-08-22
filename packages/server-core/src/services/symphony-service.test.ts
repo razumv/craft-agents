@@ -1,13 +1,25 @@
 import { afterEach, describe, expect, it } from 'bun:test'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
+import {
+  GITHUB_WARM_OBSERVATION_SCHEMA,
+  WARM_RESTART_PAYLOAD_SCHEMA,
+  type WarmRestartBinding,
+  type WarmRestartPayload,
+} from '@craft-agent/symphony'
 import {
   NativeSymphonyService,
   createDisabledSymphonyService,
   parseSymphonyServerConfig,
   type SymphonyRunnerLike,
 } from './symphony-service'
+import {
+  makeSymphonyWarmCache,
+  readSymphonyWarmCache,
+  symphonyWarmCachePath,
+  writeSymphonyWarmCache,
+} from './symphony-warm-cache'
 
 const tempDirs: string[] = []
 
@@ -38,6 +50,30 @@ function config(configPath: string, enabled = false) {
     enabled,
     stopTimeoutMs: 25,
     projects: [{ id: 'alpha', configPath }],
+  }
+}
+
+const warmBinding: WarmRestartBinding = {
+  repository: 'acme/repo',
+  projectId: 'PROJECT',
+  configHash: 'c'.repeat(64),
+  workflowHash: 'a'.repeat(64),
+  lifecycleHash: 'b'.repeat(64),
+}
+
+function warmPayload(): WarmRestartPayload {
+  return {
+    schema: WARM_RESTART_PAYLOAD_SCHEMA,
+    binding: warmBinding,
+    providerWatermark: '2026-08-22T08:00:00Z',
+    provider: {
+      schema: GITHUB_WARM_OBSERVATION_SCHEMA,
+      repository: warmBinding.repository,
+      projectId: warmBinding.projectId,
+      watermark: '2026-08-22T08:00:00Z',
+      records: [],
+      backlog: [],
+    },
   }
 }
 
@@ -185,6 +221,148 @@ describe('NativeSymphonyService', () => {
       writes: 0,
     })
     expect(ticks).toBe(0)
+  })
+
+  it('shows the cached board as stale before the first provider call and accepts nothing until reconcile', async () => {
+    const path = await runnerConfigPath()
+    const cachePath = symphonyWarmCachePath(path)
+    const cachedBoard = {
+      statuses: [{ issueId: 'I_1', issueIdentifier: 'acme/repo#1', state: 'running' }],
+      snapshot: { issue: { id: 'I_1', description: 'must not persist' } },
+      backlog: [{ id: 'I_2', identifier: 'acme/repo#2', number: 2, title: 'Backlog', description: 'private body', url: null, labels: [] }],
+      execution: { issueId: 'I_1', status: 'running', contextTokens: 42, finalResponse: 'private final response', sessionId: 'secret-session' },
+    }
+    await writeSymphonyWarmCache(cachePath, makeSymphonyWarmCache('alpha', warmPayload(), cachedBoard, 1))
+    const onDisk = await readFile(cachePath, 'utf8')
+    expect(onDisk).not.toContain('private body')
+    expect(onDisk).not.toContain('private final response')
+    expect(onDisk).not.toContain('secret-session')
+
+    let release!: () => void
+    const blocked = new Promise<void>((resolve) => { release = resolve })
+    const calls: string[] = []
+    const liveBoard = { statuses: [{ issueId: 'I_1', issueIdentifier: 'acme/repo#1', state: 'review' }] }
+    const runner: SymphonyRunnerLike = {
+      async preflight() { return {} },
+      async readStatus() { calls.push('cold-listing'); return liveBoard },
+      async projectDesk() { return {} },
+      async shadow() { return { writes: 0 } },
+      async tick() { calls.push('tick'); return liveBoard },
+      warmRestartBinding() { return warmBinding },
+      restoreWarmRestart(payload) { calls.push('restore'); expect(payload).toEqual(warmPayload()) },
+      async reconcileWarmRestart() { calls.push('since-watermark'); await blocked; return liveBoard },
+      exportWarmRestart() { return warmPayload() },
+    }
+    const service = new NativeSymphonyService(config(path, true), path, async () => runner)
+    const starting = service.start()
+    for (let index = 0; index < 50 && !calls.includes('since-watermark'); index += 1) await Bun.sleep(1)
+
+    expect(calls).toEqual(['restore', 'since-watermark'])
+    expect(service.status()).toMatchObject({ acceptingOperations: false })
+    expect(service.status().projects[0]).toMatchObject({
+      freshness: 'stale',
+      reconciling: true,
+      snapshot: { statuses: [{ issueIdentifier: 'acme/repo#1', state: 'running' }] },
+    })
+    await expect(service.tick('alpha')).rejects.toThrow('not accepting')
+
+    release()
+    const started = await starting
+    expect(started.projects[0]).toMatchObject({
+      freshness: 'live',
+      reconciling: false,
+      cacheError: null,
+      snapshot: liveBoard,
+    })
+    expect(calls).not.toContain('cold-listing')
+    const replaced = await readSymphonyWarmCache(cachePath, 'alpha')
+    expect(replaced.cache?.board).toEqual({ snapshot: null, status: null, statuses: liveBoard.statuses, execution: null })
+    await service.stop()
+  })
+
+  it('hydrates every configured lane before the first lane begins provider reconciliation', async () => {
+    const alphaPath = await runnerConfigPath()
+    const betaPath = await runnerConfigPath()
+    await writeSymphonyWarmCache(
+      symphonyWarmCachePath(alphaPath),
+      makeSymphonyWarmCache('alpha', warmPayload(), { statuses: [{ issueIdentifier: 'acme/repo#1', state: 'running' }] }, 1),
+    )
+    await writeSymphonyWarmCache(
+      symphonyWarmCachePath(betaPath),
+      makeSymphonyWarmCache('beta', warmPayload(), { statuses: [{ issueIdentifier: 'acme/repo#2', state: 'ready' }] }, 1),
+    )
+    let release!: () => void
+    const blocked = new Promise<void>((resolve) => { release = resolve })
+    const calls: string[] = []
+    let factoryIndex = 0
+    const makeRunner = (lane: 'alpha' | 'beta'): SymphonyRunnerLike => ({
+      async preflight() { return {} },
+      async readStatus() { throw new Error('cold listing must not run') },
+      async projectDesk() { return {} },
+      async shadow() { return { writes: 0 } },
+      async tick() { return {} },
+      warmRestartBinding() { return warmBinding },
+      restoreWarmRestart() { calls.push(`restore:${lane}`) },
+      async reconcileWarmRestart() {
+        calls.push(`provider:${lane}`)
+        if (lane === 'alpha') await blocked
+        return { statuses: [{ issueIdentifier: `acme/repo#${lane === 'alpha' ? 1 : 2}`, state: 'review' }] }
+      },
+      exportWarmRestart() { return warmPayload() },
+    })
+    const service = new NativeSymphonyService({
+      version: 1,
+      enabled: false,
+      stopTimeoutMs: 25,
+      projects: [{ id: 'alpha', configPath: alphaPath }, { id: 'beta', configPath: betaPath }],
+    }, null, async () => makeRunner(factoryIndex++ === 0 ? 'alpha' : 'beta'))
+
+    const starting = service.start()
+    for (let index = 0; index < 50 && !calls.includes('provider:alpha'); index += 1) await Bun.sleep(1)
+
+    expect(calls).toEqual(['restore:alpha', 'restore:beta', 'provider:alpha'])
+    expect(service.status().projects).toMatchObject([
+      { projectId: 'alpha', freshness: 'stale', reconciling: true, snapshot: { statuses: [{ state: 'running' }] } },
+      { projectId: 'beta', freshness: 'stale', reconciling: true, snapshot: { statuses: [{ state: 'ready' }] } },
+    ])
+    release()
+    await starting
+    expect(calls).toEqual(['restore:alpha', 'restore:beta', 'provider:alpha', 'provider:beta'])
+    await service.stop()
+  })
+
+  it('falls back cold on a truncated cache, keeps the reason visible, and atomically replaces it', async () => {
+    const path = await runnerConfigPath()
+    const cachePath = symphonyWarmCachePath(path)
+    await writeFile(cachePath, '{"schema":')
+    let coldReads = 0
+    let restores = 0
+    const coldBoard = { statuses: [{ issueIdentifier: 'acme/repo#3', state: 'ready' }] }
+    const runner: SymphonyRunnerLike = {
+      async preflight() { return {} },
+      async readStatus() { coldReads += 1; return coldBoard },
+      async projectDesk() { return {} },
+      async shadow() { return { writes: 0 } },
+      async tick() { return coldBoard },
+      warmRestartBinding() { return warmBinding },
+      restoreWarmRestart() { restores += 1 },
+      async reconcileWarmRestart() { throw new Error('must not reconcile corrupt cache') },
+      exportWarmRestart() { return warmPayload() },
+    }
+    const service = new NativeSymphonyService(config(path), path, async () => runner)
+
+    const started = await service.start()
+
+    expect(coldReads).toBe(1)
+    expect(restores).toBe(0)
+    expect(started.projects[0]).toMatchObject({
+      freshness: 'live',
+      reconciling: false,
+      snapshot: coldBoard,
+    })
+    expect(started.projects[0]!.cacheError).toContain('corrupt or truncated')
+    expect((await readSymphonyWarmCache(cachePath, 'alpha')).cache).not.toBeNull()
+    await service.stop()
   })
 
   it('a project that fails to reconstruct is refused without failing the service', async () => {

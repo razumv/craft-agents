@@ -65,6 +65,12 @@ export interface SymphonyProjectServiceStatus {
   reconstructedAt: number | null
   updatedAt: number
   lastError: string | null
+  /** `stale` is a local warm snapshot; only `live` may accompany accepted operations. */
+  freshness: 'cold' | 'stale' | 'live'
+  /** True while a cached board is visible but provider/Craft reconciliation is incomplete. */
+  reconciling: boolean
+  /** Missing/rejected cache reason remains visible even after successful cold fallback. */
+  cacheError: string | null
   /** Provider-neutral status from the native runner; never transcript content. */
   snapshot: unknown | null
   /** Owner desk session id from the runner config — the ONLY valid target for owner-gate directives. */

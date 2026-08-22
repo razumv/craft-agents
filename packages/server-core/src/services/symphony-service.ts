@@ -12,7 +12,15 @@ import {
   loadLiveRunnerConfig,
   type LiveRunnerConfig,
   type LiveRunnerStatus,
+  type WarmRestartBinding,
+  type WarmRestartPayload,
 } from '@craft-agent/symphony'
+import {
+  makeSymphonyWarmCache,
+  readSymphonyWarmCache,
+  symphonyWarmCachePath,
+  writeSymphonyWarmCache,
+} from './symphony-warm-cache'
 
 export interface SymphonyProjectConfig {
   id: string
@@ -58,14 +66,21 @@ export interface SymphonyRunnerLike {
    */
   shadowWithPreflight?(): Promise<unknown>
   tick(): Promise<LiveRunnerStatus | unknown>
+  /** Provider-free exact config binding and cache checkpoint surfaces. */
+  warmRestartBinding?(): WarmRestartBinding
+  restoreWarmRestart?(payload: unknown): void
+  reconcileWarmRestart?(): Promise<LiveRunnerStatus | unknown>
+  exportWarmRestart?(): WarmRestartPayload
 }
 
 export type SymphonyRunnerFactory = (config: LiveRunnerConfig) => Promise<SymphonyRunnerLike>
 
 interface ProjectRuntime {
   config: SymphonyProjectConfig
+  cachePath: string
   runnerConfig: LiveRunnerConfig | null
   runner: SymphonyRunnerLike | null
+  warmRestored: boolean
   status: SymphonyProjectServiceStatus
 }
 
@@ -177,8 +192,10 @@ export class NativeSymphonyService implements SymphonyServiceControl {
     for (const project of config.projects) {
       this.#projects.set(project.id, {
         config: project,
+        cachePath: symphonyWarmCachePath(project.configPath),
         runnerConfig: null,
         runner: null,
+        warmRestored: false,
         status: {
           projectId: project.id,
           phase: 'configured',
@@ -186,6 +203,9 @@ export class NativeSymphonyService implements SymphonyServiceControl {
           reconstructedAt: null,
           updatedAt: now,
           lastError: null,
+          freshness: 'cold',
+          reconciling: true,
+          cacheError: null,
           snapshot: null,
           ownerSessionId: null,
           craftProjectId: null,
@@ -202,6 +222,87 @@ export class NativeSymphonyService implements SymphonyServiceControl {
     if (this.#startPromise) return this.#startPromise
     this.#startPromise = this.#reconstruct()
     return this.#startPromise
+  }
+
+  #supportsWarmRestart(runner: SymphonyRunnerLike): runner is SymphonyRunnerLike & Required<Pick<SymphonyRunnerLike,
+    'warmRestartBinding' | 'restoreWarmRestart' | 'reconcileWarmRestart' | 'exportWarmRestart'>> {
+    return Boolean(runner.warmRestartBinding && runner.restoreWarmRestart && runner.reconcileWarmRestart && runner.exportWarmRestart)
+  }
+
+  async #persistWarmSnapshot(runtime: ProjectRuntime, runner: SymphonyRunnerLike, snapshot: unknown): Promise<void> {
+    if (!this.#supportsWarmRestart(runner)) return
+    const cache = makeSymphonyWarmCache(runtime.config.id, runner.exportWarmRestart(), snapshot)
+    await writeSymphonyWarmCache(runtime.cachePath, cache)
+  }
+
+  /**
+   * Provider-free phase. Every configured lane completes this phase before any
+   * lane begins reconciliation, so a slow first repository cannot leave later
+   * boards blank. Invalid bindings get a fresh runner before provider I/O.
+   */
+  async #prepareRuntime(runtime: ProjectRuntime, runnerConfig: LiveRunnerConfig): Promise<void> {
+    runtime.status = {
+      ...runtime.status,
+      ownerSessionId: runnerConfig.craft?.ownerSessionId ?? null,
+      craftProjectId: runnerConfig.craft?.projectId ?? null,
+      mode: runnerConfig.mode === 'discovery' ? 'discovery' : 'issue',
+      repository: runnerConfig.github?.repository ?? null,
+      allowedProfiles: [...(runnerConfig.model?.allowedProfiles ?? [])],
+      verificationBudget: runnerConfig.verificationBudget ?? null,
+    }
+    let runner = await this.runnerFactory(runnerConfig)
+    const cached = await readSymphonyWarmCache(runtime.cachePath, runtime.config.id)
+    runtime.warmRestored = false
+    if (cached.cache && this.#supportsWarmRestart(runner)) {
+      try {
+        runner.restoreWarmRestart(cached.cache.runner)
+        runtime.runner = runner
+        runtime.warmRestored = true
+        runtime.status = {
+          ...runtime.status,
+          snapshot: cached.cache.board,
+          freshness: 'stale',
+          reconciling: true,
+          cacheError: null,
+          updatedAt: Date.now(),
+        }
+        return
+      } catch (error) {
+        const reason = `warm cache rejected; cold reconstruction used: ${error instanceof Error ? error.message : String(error)}`
+        // Discard the partially restored runner before any provider call.
+        runner = await this.runnerFactory(runnerConfig)
+        runtime.runner = runner
+        runtime.status = { ...runtime.status, freshness: 'cold', reconciling: true, cacheError: reason, updatedAt: Date.now() }
+        return
+      }
+    }
+
+    runtime.runner = runner
+    const reason = cached.reason ?? 'warm cache unsupported by runner'
+    runtime.status = { ...runtime.status, freshness: 'cold', reconciling: true, cacheError: reason, updatedAt: Date.now() }
+  }
+
+  /** Provider phase; only successful live truth is allowed to replace the cache. */
+  async #observePreparedRuntime(runtime: ProjectRuntime): Promise<{ snapshot: unknown; cacheError: string | null }> {
+    const runner = runtime.runner
+    if (!runner) throw new Error(`Symphony runner was not prepared: ${runtime.config.id}`)
+    const snapshot = runtime.warmRestored && runner.reconcileWarmRestart
+      ? await runner.reconcileWarmRestart()
+      : await runner.readStatus()
+    await this.#persistWarmSnapshot(runtime, runner, snapshot)
+    runtime.warmRestored = false
+    return { snapshot, cacheError: runtime.status.cacheError }
+  }
+
+  /** Retry helper; startup itself uses the two phases fleet-wide. */
+  async #reconstructRuntime(runtime: ProjectRuntime, runnerConfig: LiveRunnerConfig): Promise<{
+    runner: SymphonyRunnerLike
+    snapshot: unknown
+    cacheError: string | null
+  }> {
+    await this.#prepareRuntime(runtime, runnerConfig)
+    const observed = await this.#observePreparedRuntime(runtime)
+    return { runner: runtime.runner!, ...observed }
   }
 
   async #reconstruct(): Promise<SymphonyServiceStatus> {
@@ -232,13 +333,31 @@ export class NativeSymphonyService implements SymphonyServiceControl {
         }
       }
     }
+    // Provider-free preparation is fleet-wide: every valid cached board is
+    // bound and visible before the first lane starts a provider request.
     for (const runtime of this.#projects.values()) {
       const loadedConfig = runtime.runnerConfig
       if (!loadedConfig) continue
       try {
-        const runnerConfig = this.#withConfiguredLaneFences(loadedConfig)
-        runtime.runner = await this.runnerFactory(runnerConfig)
-        const snapshot = await runtime.runner.readStatus()
+        await this.#prepareRuntime(runtime, this.#withConfiguredLaneFences(loadedConfig))
+      } catch (error) {
+        failed += 1
+        runtime.runner = null
+        runtime.status = {
+          ...runtime.status,
+          phase: 'error',
+          lastOperation: 'reconstruct',
+          updatedAt: Date.now(),
+          lastError: error instanceof Error ? error.message : String(error),
+          reconciling: false,
+        }
+      }
+    }
+    for (const runtime of this.#projects.values()) {
+      const loadedConfig = runtime.runnerConfig
+      if (!loadedConfig || !runtime.runner) continue
+      try {
+        const observed = await this.#observePreparedRuntime(runtime)
         const now = Date.now()
         runtime.status = {
           ...runtime.status,
@@ -247,13 +366,10 @@ export class NativeSymphonyService implements SymphonyServiceControl {
           reconstructedAt: now,
           updatedAt: now,
           lastError: null,
-          snapshot,
-          ownerSessionId: runnerConfig.craft?.ownerSessionId ?? null,
-          craftProjectId: runnerConfig.craft?.projectId ?? null,
-          mode: runnerConfig.mode === 'discovery' ? 'discovery' : 'issue',
-          repository: runnerConfig.github?.repository ?? null,
-          allowedProfiles: [...(runnerConfig.model?.allowedProfiles ?? [])],
-          verificationBudget: runnerConfig.verificationBudget ?? null,
+          freshness: 'live',
+          reconciling: false,
+          cacheError: observed.cacheError,
+          snapshot: observed.snapshot,
         }
         reconstructed += 1
       } catch (error) {
@@ -265,6 +381,7 @@ export class NativeSymphonyService implements SymphonyServiceControl {
           lastOperation: 'reconstruct',
           updatedAt: Date.now(),
           lastError: error instanceof Error ? error.message : String(error),
+          reconciling: false,
         }
         // Deliberately not rethrown. One malformed or unreachable lane must not
         // take the other repositories out of the native service.
@@ -336,8 +453,8 @@ export class NativeSymphonyService implements SymphonyServiceControl {
       if (!runtime.runnerConfig) continue
       try {
         const runnerConfig = this.#withConfiguredLaneFences(runtime.runnerConfig)
-        runtime.runner = await this.runnerFactory(runnerConfig)
-        const snapshot = await runtime.runner.readStatus()
+        const reconstructedRuntime = await this.#reconstructRuntime(runtime, runnerConfig)
+        runtime.runner = reconstructedRuntime.runner
         const now = Date.now()
         runtime.status = {
           ...runtime.status,
@@ -346,7 +463,10 @@ export class NativeSymphonyService implements SymphonyServiceControl {
           reconstructedAt: now,
           updatedAt: now,
           lastError: null,
-          snapshot,
+          freshness: 'live',
+          reconciling: false,
+          cacheError: reconstructedRuntime.cacheError,
+          snapshot: reconstructedRuntime.snapshot,
           ownerSessionId: runnerConfig.craft?.ownerSessionId ?? null,
           craftProjectId: runnerConfig.craft?.projectId ?? null,
           mode: runnerConfig.mode === 'discovery' ? 'discovery' : 'issue',
@@ -363,6 +483,7 @@ export class NativeSymphonyService implements SymphonyServiceControl {
           lastOperation: 'reconstruct',
           updatedAt: Date.now(),
           lastError: error instanceof Error ? error.message : String(error),
+          reconciling: false,
         }
       }
     }
@@ -572,11 +693,14 @@ export class NativeSymphonyService implements SymphonyServiceControl {
         // validate report, issue intake) must not clobber it — a loop shadow
         // cycle used to wipe the board until a manual refresh.
         const updatesSnapshot = operation === 'tick' || operation === 'refresh'
+        if (updatesSnapshot) await this.#persistWarmSnapshot(runtime, runtime.runner!, result)
         runtime.status = {
           ...runtime.status,
           phase: 'ready',
           updatedAt: completedAt,
           lastError: null,
+          freshness: 'live',
+          reconciling: false,
           ...(updatesSnapshot ? { snapshot: result } : {}),
         }
         if (updatesSnapshot) void this.#pushDecisionsNeeded(projectId, result)
