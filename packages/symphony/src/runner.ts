@@ -133,6 +133,8 @@ export interface GroomingReport {
 }
 
 export interface LiveRunnerStatus {
+  /** Exact configured fence issue that identifies this lane to an operator. */
+  claimFenceIssueId: string;
   snapshot: TrackerIssueSnapshot | null;
   status: ProjectStatus | null;
   execution: CraftExecutionSession | null;
@@ -645,6 +647,7 @@ export class LiveV4Runner {
     const snapshot = await this.tracker.get(this.#pinnedIssueId());
     const execution = snapshot.claim ? await this.craft.get(snapshot.claim.sessionId) : null;
     return {
+      claimFenceIssueId: this.config.claimFenceIssueId,
       snapshot,
       status: projectStatus(snapshot),
       execution,
@@ -654,24 +657,48 @@ export class LiveV4Runner {
   }
 
   /**
-   * Discovery projection: every issue the tracker can see in the configured
-   * repository, with the primary status being the active claim when one
-   * occupies WIP, else the first discovered issue, else null (empty repo).
+   * Discovery projection: every issue remains in `statuses`, while the headline
+   * snapshot/status/execution describe only the claim held on this lane's own
+   * configured fence. An idle lane has no headline instead of borrowing a
+   * foreign lane's claim.
    */
   private async readDiscoveryStatus(): Promise<LiveRunnerStatus> {
     const allStates = Object.keys(this.config.github.states) as (keyof typeof this.config.github.states)[];
-    const [snapshots, backlog] = await Promise.all([
-      this.tracker.fetchIssuesByStates(allStates),
+    const [observation, backlog] = await Promise.all([
+      this.tracker.statusObservation
+        ? this.tracker.statusObservation(allStates)
+        // Compatibility for injected legacy/test adapters. Production GitHub
+        // always uses the one-observation method above.
+        : Promise.all([
+            this.tracker.fetchIssuesByStates(allStates),
+            this.tracker.activeClaims(),
+          ]).then(([snapshots, activeClaims]) => {
+            // Legacy doubles sometimes return only a WIP sentinel from
+            // activeClaims(). Never project that partial object as status;
+            // select the complete snapshot from the loaded board by identity.
+            const ownedIds = new Set(activeClaims.flatMap((entry) => entry?.issue?.id ? [entry.issue.id] : []));
+            const complete = snapshots.filter((entry) => ownedIds.has(entry.issue.id));
+            // A single-issue legacy adapter may expose only a WIP sentinel. It
+            // is still unambiguous when the complete board has exactly one row.
+            const compatible = complete.length === 0 && activeClaims.length === 1 && snapshots.length === 1
+              ? snapshots
+              : complete;
+            return { snapshots, activeClaims: compatible };
+          }),
       // Free within one operation: the read scope has already answered the
       // listing pages this walks. A tracker without the notion returns nothing.
       this.tracker.fetchBacklog?.() ?? Promise.resolve([]),
     ]);
+    const { snapshots, activeClaims } = observation;
+    if (activeClaims.length > 1) {
+      this.onDiagnostic(`lane status refused an ambiguous headline: ${activeClaims.length} claims are held on configured fence ${this.config.claimFenceIssueId}`);
+    }
     const statuses = snapshots.map((snapshot) => projectStatus(snapshot));
-    const active = snapshots.find((snapshot) => snapshot.claim !== null && snapshot.claim !== undefined);
-    const primary = active ?? snapshots[0] ?? null;
-    const execution = active?.claim ? await this.craft.get(active.claim.sessionId) : null;
+    const primary = activeClaims.length === 1 ? activeClaims[0]! : null;
+    const execution = primary?.claim ? await this.craft.get(primary.claim.sessionId) : null;
     this.#reconcileGroomingRefusals(backlog);
     return {
+      claimFenceIssueId: this.config.claimFenceIssueId,
       snapshot: primary,
       status: primary ? projectStatus(primary) : null,
       execution,

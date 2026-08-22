@@ -50,6 +50,13 @@ export class FakeGitHubAdapter {
     return [...this.#issues.values()].filter((entry) => wanted.has(entry.issue.state)).map(clone);
   }
 
+  async statusObservation(states: readonly LifecycleState[]) {
+    return {
+      snapshots: await this.fetchIssuesByStates(states),
+      activeClaims: this.activeClaims(),
+    };
+  }
+
   async fetchIssuesByIds(ids: readonly string[]): Promise<TrackerIssueSnapshot[]> {
     if (ids.length === 0) return [];
     return [...new Set(ids)].flatMap((id) => {

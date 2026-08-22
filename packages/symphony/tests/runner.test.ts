@@ -908,6 +908,86 @@ describe("v4 live runner mutation scope", () => {
     expect(handover!.message).toContain(failure.output);
     expect(handover!.message).toContain("first diagnosis\nsecond diagnosis");
   });
+
+  test("reports each shared-repository lane's own claim and reports no claim for an idle peer", async () => {
+    const source = (await transitionFixture("running").runner.readStatus()).snapshot!;
+    const claimed = (issueId: string, number: number, fence: string, sessionId: string): TrackerIssueSnapshot => {
+      const snapshot = structuredClone(source);
+      snapshot.issue.id = issueId;
+      snapshot.issue.identifier = `acme/shared#${number}`;
+      snapshot.issue.title = `Lane issue ${number}`;
+      snapshot.contract.repository = "acme/shared";
+      snapshot.claim = { ...snapshot.claim!, issueId, issueIdentifier: snapshot.issue.identifier, fence, sessionId };
+      return snapshot;
+    };
+    const alphaIssue = claimed("I_ALPHA", 117, "claim-alpha", "session-alpha");
+    const betaIssue = claimed("I_BETA", 118, "claim-beta", "session-beta");
+    const all = [alphaIssue, betaIssue];
+
+    const lane = (claimFenceIssueId: string, own: TrackerIssueSnapshot | TrackerIssueSnapshot[] | null) => {
+      let providerObservations = 0;
+      const diagnostics: string[] = [];
+      const owned = Array.isArray(own) ? own : own ? [own] : [];
+      const tracker = {
+        statusObservation: async () => {
+          providerObservations += 1;
+          return { snapshots: structuredClone(all), activeClaims: structuredClone(owned) };
+        },
+        fetchBacklog: async () => [],
+      } as unknown as GitHubIssuesProjectsAdapter;
+      const craft = {
+        get: async (sessionId: string) => ({ sessionId, issueId: owned[0]?.issue.id ?? "", status: "running" }),
+      } as unknown as CraftMobileControlPlaneAdapter;
+      const runner = new LiveV4Runner(
+        {
+          mode: "discovery",
+          claimFenceIssueId,
+          github: { repository: "acme/shared", states: { running: {} } },
+        } as unknown as LiveRunnerConfig,
+        {} as WorkflowConfig,
+        tracker,
+        craft,
+        {} as CraftCliRpcTransport,
+        {} as DeterministicScheduler,
+        undefined,
+        undefined,
+        undefined,
+        (message) => diagnostics.push(message),
+      );
+      return { runner, diagnostics, providerObservations: () => providerObservations };
+    };
+
+    const alpha = lane("FENCE_ALPHA", alphaIssue);
+    const beta = lane("FENCE_BETA", betaIssue);
+    const idle = lane("FENCE_IDLE", null);
+    const ambiguous = lane("FENCE_AMBIGUOUS", [alphaIssue, betaIssue]);
+    const [alphaStatus, betaStatus, idleStatus, ambiguousStatus] = await Promise.all([
+      alpha.runner.readStatus(), beta.runner.readStatus(), idle.runner.readStatus(), ambiguous.runner.readStatus(),
+    ]);
+
+    expect(alphaStatus).toMatchObject({
+      claimFenceIssueId: "FENCE_ALPHA",
+      snapshot: { issue: { identifier: "acme/shared#117" }, claim: { fence: "claim-alpha", sessionId: "session-alpha" } },
+      execution: { sessionId: "session-alpha", issueId: "I_ALPHA" },
+    });
+    expect(betaStatus).toMatchObject({
+      claimFenceIssueId: "FENCE_BETA",
+      snapshot: { issue: { identifier: "acme/shared#118" }, claim: { fence: "claim-beta", sessionId: "session-beta" } },
+      execution: { sessionId: "session-beta", issueId: "I_BETA" },
+    });
+    expect(alphaStatus.snapshot?.issue.identifier).not.toBe(betaStatus.snapshot?.issue.identifier);
+    expect(idleStatus).toMatchObject({ claimFenceIssueId: "FENCE_IDLE", snapshot: null, status: null, execution: null });
+    expect(ambiguousStatus).toMatchObject({ claimFenceIssueId: "FENCE_AMBIGUOUS", snapshot: null, status: null, execution: null });
+    expect(ambiguous.diagnostics).toEqual([
+      "lane status refused an ambiguous headline: 2 claims are held on configured fence FENCE_AMBIGUOUS",
+    ]);
+    expect(alphaStatus.statuses).toHaveLength(2);
+    expect(betaStatus.statuses).toHaveLength(2);
+    expect(idleStatus.statuses).toHaveLength(2);
+    expect([
+      alpha.providerObservations(), beta.providerObservations(), idle.providerObservations(), ambiguous.providerObservations(),
+    ]).toEqual([1, 1, 1, 1]);
+  });
 });
 
 describe("contract issue body", () => {
