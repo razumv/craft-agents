@@ -242,6 +242,27 @@ export class GitWorktreeAdapter {
       : { claimable: true, reason: "branch is held by an earlier empty attempt and can be released" };
   }
 
+  /**
+   * Preserve the exact current attempt before its failure is written. Unlike
+   * stale-attempt reclamation this never removes the worktree or branch; it
+   * returns the exact commit even when there is no work beyond the base.
+   */
+  async preserveInterrupted(identity: RunIdentity, context?: CraftStartContext): Promise<{
+    branch: string;
+    commit: string;
+    preservedBranch: string | null;
+  }> {
+    if (!context) throw new Error("terminal preservation requires frozen issue/run context");
+    const { claim, contract } = context;
+    this.assertIdentity(identity, claim);
+    const branch = validateBranch(contract.requiredBranch);
+    const workspacePath = resolve(identity.workspacePath);
+    await this.verifyExisting(workspacePath, branch, claim);
+    const preserved = await this.#preserveHolderWork(workspacePath, claim, branch);
+    const commit = (await this.git(["-C", workspacePath, "rev-parse", "HEAD"])).trim();
+    return { branch, commit, preservedBranch: preserved?.preservedBranch ?? null };
+  }
+
   private async releaseStaleAttemptBranch(branch: string, claim: Claim): Promise<boolean> {
     const holder = await this.#staleHolder(branch, claim);
     if (holder === null) return false;
@@ -271,7 +292,7 @@ export class GitWorktreeAdapter {
    * silent rescue failure would be indistinguishable from the data loss this is
    * here to prevent.
    */
-  async #preserveHolderWork(holder: string, binding: Claim, branch: string): Promise<void> {
+  async #preserveHolderWork(holder: string, binding: Claim, branch: string): Promise<PreservedWork | null> {
     const dirty = (await this.git(["-C", holder, "status", "--porcelain"])).trim() !== "";
     if (dirty) {
       await this.git(["-C", holder, "add", "-A"]);
@@ -289,7 +310,7 @@ export class GitWorktreeAdapter {
     }
 
     const head = (await this.git(["-C", holder, "rev-parse", "HEAD"])).trim();
-    if (head === binding.baseSha) return; // Nothing survived the commit; there is nothing to preserve.
+    if (head === binding.baseSha) return null; // Nothing survived the commit; there is nothing to preserve.
     const preserved = `v4-preserved/${stripRefPrefix(branch)}-a${binding.attempt}-${head.slice(0, 7)}`;
 
     const existing = await this.git(["rev-parse", "--verify", `refs/heads/${preserved}`], true);
@@ -323,13 +344,15 @@ export class GitWorktreeAdapter {
       );
     }
 
-    await this.config.onPreserved?.({
+    const record = {
       issueId: binding.issueId,
       attempt: binding.attempt,
       branch,
       preservedBranch: preserved,
       commit: head,
-    });
+    };
+    await this.config.onPreserved?.(record);
+    return record;
   }
 
   private async trackerRemote(): Promise<string> {

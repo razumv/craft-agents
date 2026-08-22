@@ -190,6 +190,121 @@ describe("v4.1 deterministic scheduler core", () => {
     expect(simulator.workspaces.count()).toBe(workflow.config.scheduler.maxAttempts);
   });
 
+  test("each silent-run cause reaches the ledger with its own detection wording and exact preserved commit", async () => {
+    const cases = [
+      {
+        cause: "provider-or-connection-failure" as const,
+        status: "failed" as const,
+        lastObserved: "error message err-1: Provider connection reset while streaming",
+      },
+      {
+        cause: "no-output" as const,
+        status: "ended-without-response" as const,
+        lastObserved: "frozen prompt accepted; session stopped with workflow status stopped and produced no persisted output",
+      },
+      {
+        cause: "ending-lost" as const,
+        status: "ended-without-response" as const,
+        lastObserved: "assistant message progress-1: Implemented 242 lines and started focused tests",
+      },
+    ];
+
+    for (const item of cases) {
+      const simulator = new CrashRestartSimulator(workflow);
+      simulator.seed(issue(), contract());
+      await simulator.scheduler.tick();
+      const running = simulator.github.get("issue-45");
+      simulator.craft.setStatus(running.claim!.sessionId, item.status, item);
+      simulator.clock.advance(workflow.config.scheduler.staleRunMs);
+      const workspaces = item.cause === "ending-lost"
+        ? {
+            ensure: simulator.workspaces.ensure.bind(simulator.workspaces),
+            preserveInterrupted: async () => ({
+              branch: "v4/CP-45",
+              commit: "2".repeat(40),
+              preservedBranch: "v4-preserved/v4-CP-45-a1-2222222",
+            }),
+          }
+        : simulator.workspaces;
+      const scheduler = new DeterministicScheduler(
+        workflow.config,
+        { github: simulator.github, craft: simulator.craft, workspaces },
+        simulator.clock,
+      );
+      await scheduler.tick();
+
+      const failed = simulator.github.get("issue-45");
+      const message = failed.events.at(-1)!.message;
+      expect(message).toContain(`silent run cause ${item.cause}`);
+      expect(message).toContain(`last observed: ${item.lastObserved}`);
+      if (item.cause === "ending-lost") {
+        expect(message).toContain(`branch commit ${"2".repeat(40)} preserved as v4-preserved/v4-CP-45-a1-2222222`);
+        expect(failed.evidence).toMatchObject({
+          silentRunCommit: "2".repeat(40),
+          silentRunPreservedBranch: "v4-preserved/v4-CP-45-a1-2222222",
+        });
+      } else {
+        expect(message).toContain(`branch commit ${running.claim!.baseSha} equals the attempt base`);
+      }
+    }
+  });
+
+  test("the third identical silent death is reported instead of consuming another attempt", async () => {
+    const fourAttemptWorkflow: WorkflowDefinition = {
+      ...workflow,
+      config: {
+        ...workflow.config,
+        scheduler: { ...workflow.config.scheduler, maxAttempts: 4 },
+      },
+    };
+    const simulator = new CrashRestartSimulator(fourAttemptWorkflow);
+    simulator.seed(issue(), contract());
+    const observation = {
+      cause: "no-output" as const,
+      lastObserved: "frozen prompt accepted; session stopped with workflow status stopped and produced no persisted output",
+    };
+
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      await simulator.scheduler.tick();
+      const running = simulator.github.get("issue-45");
+      expect(running.claim?.attempt).toBe(attempt);
+      simulator.craft.setStatus(running.claim!.sessionId, "ended-without-response", observation);
+      simulator.clock.advance(fourAttemptWorkflow.config.scheduler.staleRunMs);
+      await simulator.scheduler.tick();
+      const terminal = simulator.github.get("issue-45");
+      if (attempt < 3) {
+        expect(terminal.issue.state).toBe("retry-wait");
+        simulator.clock.advance(terminal.retry!.dueAtMs - simulator.clock.nowMs());
+      } else {
+        expect(terminal.issue.state).toBe("failed");
+        expect(terminal.retry).toBeNull();
+        expect(terminal.events.at(-1)?.message).toContain("unchanged terminal evidence observed 3 times, so another attempt is suppressed");
+      }
+    }
+
+    await simulator.scheduler.tick();
+    expect(simulator.github.claimSuccessCount).toBe(3);
+  });
+
+  test("a transient provider transport failure still schedules an ordinary retry", async () => {
+    const simulator = new CrashRestartSimulator(workflow);
+    simulator.seed(issue(), contract());
+    await simulator.scheduler.tick();
+    const running = simulator.github.get("issue-45");
+    simulator.craft.setStatus(running.claim!.sessionId, "failed", {
+      cause: "provider-or-connection-failure",
+      lastObserved: "error message transport-1: transient provider connection reset",
+    });
+    simulator.clock.advance(workflow.config.scheduler.staleRunMs);
+    await simulator.scheduler.tick();
+
+    expect(simulator.github.get("issue-45")).toMatchObject({
+      issue: { state: "retry-wait" },
+      retry: { attempt: 2, failureClass: "runtime" },
+      evidence: { silentRunOccurrences: 1, silentRunCause: "provider-or-connection-failure" },
+    });
+  });
+
   test("a revived issue is claimed through the unchanged ready scheduler path as attempt one", async () => {
     const oneAttemptWorkflow: WorkflowDefinition = {
       ...workflow,

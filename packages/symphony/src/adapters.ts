@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+import type { CraftStartContext, SilentRunObservation } from "./craft-adapter";
 import type { LifecycleDecisionResult } from "./tracker";
 import {
   assertLifecycleTransition,
@@ -262,18 +263,32 @@ export class FakeWorkspaceAdapter {
     return clone(workspace);
   }
 
+  async preserveInterrupted(identity: RunIdentity, context?: CraftStartContext): Promise<{
+    branch: string;
+    commit: string;
+    preservedBranch: string | null;
+  }> {
+    if (!context) throw new Error("fake terminal preservation requires context");
+    const existing = this.#byId.get(identity.workspaceId);
+    if (!existing || existing.issueId !== identity.issueId || existing.attempt !== identity.attempt) {
+      throw new Error("fake terminal preservation identity mismatch");
+    }
+    return { branch: context.contract.requiredBranch, commit: context.claim.baseSha, preservedBranch: null };
+  }
+
   count(): number {
     return this.#byId.size;
   }
 }
 
-export type FakeSessionStatus = "running" | "succeeded" | "failed";
+export type FakeSessionStatus = "running" | "succeeded" | "failed" | "ended-without-response";
 export interface FakeCraftSession {
   sessionId: string;
   issueId: string;
   attempt: number;
   workspaceId: string;
   status: FakeSessionStatus;
+  silentRunObservation?: SilentRunObservation;
 }
 
 export class FakeCraftAdapter {
@@ -307,10 +322,17 @@ export class FakeCraftAdapter {
     return session ? clone(session) : null;
   }
 
-  setStatus(sessionId: string, status: FakeSessionStatus): void {
+  setStatus(sessionId: string, status: FakeSessionStatus, silentRunObservation?: SilentRunObservation): void {
     const session = this.#byId.get(sessionId);
     if (!session) throw new Error(`unknown fake Craft session ${sessionId}`);
     session.status = status;
+    session.silentRunObservation = silentRunObservation;
+  }
+
+  async cancel(sessionId: string): Promise<FakeCraftSession> {
+    const session = this.#byId.get(sessionId);
+    if (!session) throw new Error(`unknown fake Craft session ${sessionId}`);
+    return clone(session);
   }
 
   count(): number {

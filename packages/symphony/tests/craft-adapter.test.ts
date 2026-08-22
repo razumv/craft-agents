@@ -532,6 +532,73 @@ describe("v4.3 Craft mobile control-plane adapter", () => {
     expect(() => parseOwnerGateDecision("approve gate-47", "gate-47")).toThrow("exactly match");
   });
 
+  test("distinguishes provider failure, no output, and work that lost its ending from persisted session truth", async () => {
+    const provider = adapterFixture();
+    const providerRun = identity();
+    const providerStarted = await provider.adapter.ensure(providerRun, startContext(providerRun));
+    provider.transport.byId(providerStarted.rpcSessionId).messages!.push({
+      id: "provider-error",
+      role: "error",
+      content: "Provider connection reset while streaming the response",
+      timestamp: ++provider.transport.now,
+    });
+    provider.transport.finish(providerStarted.rpcSessionId);
+    expect(await provider.adapter.get(providerRun.sessionId)).toMatchObject({
+      status: "failed",
+      silentRunObservation: {
+        cause: "provider-or-connection-failure",
+        lastObserved: "error message provider-error: Provider connection reset while streaming the response",
+      },
+    });
+
+    const empty = adapterFixture();
+    const emptyRun = identity();
+    const emptyStarted = await empty.adapter.ensure(emptyRun, startContext(emptyRun));
+    empty.transport.finish(emptyStarted.rpcSessionId);
+    expect(await empty.adapter.get(emptyRun.sessionId)).toMatchObject({
+      status: "ended-without-response",
+      silentRunObservation: {
+        cause: "no-output",
+        lastObserved: expect.stringContaining("produced no persisted output"),
+      },
+    });
+
+    const worked = adapterFixture();
+    const workedRun = identity();
+    const workedStarted = await worked.adapter.ensure(workedRun, startContext(workedRun));
+    worked.transport.byId(workedStarted.rpcSessionId).messages!.push({
+      id: "assistant-progress",
+      role: "assistant",
+      content: "Implemented 242 lines and started focused tests",
+      timestamp: ++worked.transport.now,
+      hidden: true,
+    });
+    worked.transport.finish(workedStarted.rpcSessionId);
+    expect(await worked.adapter.get(workedRun.sessionId)).toMatchObject({
+      status: "ended-without-response",
+      silentRunObservation: {
+        cause: "ending-lost",
+        lastObserved: "assistant message assistant-progress: Implemented 242 lines and started focused tests",
+      },
+    });
+
+    const overlap = adapterFixture();
+    const overlapRun = identity();
+    const overlapStarted = await overlap.adapter.ensure(overlapRun, startContext(overlapRun));
+    overlap.transport.byId(overlapStarted.rpcSessionId).messages!.push(
+      { id: "tool-progress", role: "tool", content: "wrote implementation", timestamp: ++overlap.transport.now },
+      { id: "late-transport-error", role: "error", content: "provider connection reset", timestamp: ++overlap.transport.now },
+    );
+    overlap.transport.finish(overlapStarted.rpcSessionId);
+    expect(await overlap.adapter.get(overlapRun.sessionId)).toMatchObject({
+      status: "failed",
+      silentRunObservation: {
+        cause: "ending-lost",
+        lastObserved: "error message late-transport-error: provider connection reset",
+      },
+    });
+  });
+
   test("enforces turn, context, and bounded cancellation deadlines", async () => {
     const { adapter, transport } = adapterFixture();
     const run = identity();
