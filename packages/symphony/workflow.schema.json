@@ -41,6 +41,7 @@
         "claim_ttl_ms": { "type": "integer", "minimum": 1 },
         "stale_run_ms": { "type": "integer", "minimum": 1 },
         "max_attempts": { "type": "integer", "minimum": 1 },
+        "executable_acceptance_limit": { "type": "integer", "minimum": 1, "default": 1 },
         "max_revivals": { "type": "integer", "minimum": 0 },
         "pr_open_stuck_cycles": { "type": "integer", "minimum": 1, "default": 3 },
         "retry_base_ms": { "type": "integer", "minimum": 1 },

@@ -23,6 +23,13 @@ import {
 } from "./deadline-apply";
 import type { DeadlineSuccessorProposal } from "./deadline-triage";
 import {
+  PRECLAIM_SCOPE_PROPOSAL_SCHEMA,
+  preclaimScopeAttribution,
+  proposePreclaimScope,
+  type PreclaimScopeApplyResult,
+  type PreclaimScopeProposal,
+} from "./preclaim-scope";
+import {
   appliedGroomingBody,
   groomingAttributionComment,
   type GroomingApplyReport,
@@ -195,6 +202,144 @@ export class GitHubIssuesProjectsAdapter implements TrackerAdapter {
 
   async applyDeadlineSuccessor(proposal: DeadlineSuccessorProposal | null): Promise<DeadlineSuccessorApplyReport> {
     return applyDeadlineSuccessor(proposal, this.config, this.transport);
+  }
+
+  /** Resume one interrupted reservation. Only the deterministic owner lane scans. */
+  async reconcilePreclaimScopes(nowMs: number): Promise<PreclaimScopeApplyResult | null> {
+    const ownerFence = [...(this.config.configuredClaimFenceIssueIds ?? [this.config.claimFenceIssueId])]
+      .sort((left, right) => left.localeCompare(right))[0];
+    if (ownerFence !== this.config.claimFenceIssueId) return null;
+    const snapshots = await this.fetchIssuesByStates(lifecycleStates);
+    const managedContractIds = new Set(snapshots.map((snapshot) => snapshot.contract.id));
+    const cancelled = snapshots.filter((snapshot) => snapshot.issue.state === "cancelled");
+    for (const source of cancelled.sort((left, right) => left.issue.identifier.localeCompare(right.issue.identifier))) {
+      const proposal = proposePreclaimScope(source, this.config.workflow);
+      if (proposal?.sourceState === "cancelled" && !managedContractIds.has(proposal.contract.id)) {
+        return this.applyPreclaimScope(proposal, nowMs);
+      }
+    }
+    return null;
+  }
+
+  /**
+   * First supersede/reserve the authored source by deterministic contract ID.
+   * Only that CAS winner may create or publish the successor. A crash leaves a
+   * cancelled, open, unchanged source that reconcilePreclaimScopes can resume.
+   */
+  async applyPreclaimScope(
+    proposal: Readonly<PreclaimScopeProposal>,
+    nowMs: number,
+  ): Promise<PreclaimScopeApplyResult> {
+    if (proposal.schema !== PRECLAIM_SCOPE_PROPOSAL_SCHEMA) return { outcome: "refused", reason: "invalid pre-claim scope proposal schema" };
+    if (!Number.isInteger(proposal.acceptanceLimit) || proposal.acceptanceLimit < 1) return { outcome: "refused", reason: "invalid executable acceptance limit" };
+    if (proposal.contract.repository !== this.config.repository) return { outcome: "refused", reason: "successor repository does not match configured repository" };
+    if (!this.transport.createIssue || !this.transport.addIssueToProject) return { outcome: "refused", reason: "GitHub transport cannot create issues and Project items" };
+    const parsed = parseIssueContract(proposal.contractMarkdown, `${proposal.sourceIssueIdentifier}-preclaim`, this.config.workflow);
+    if (canonicalValue(parsed) !== canonicalValue(proposal.contract)) return { outcome: "refused", reason: "successor body is not parser-valid exactly as proposed" };
+    if (canonicalValue(proposal.covers) !== canonicalValue(proposal.contract.acceptance)) return { outcome: "refused", reason: "successor acceptance trace differs from its contract" };
+    if (proposal.covers.length !== proposal.acceptanceLimit || proposal.remains.length === 0) return { outcome: "refused", reason: "proposal is not a strict configured-width prefix" };
+
+    let source = await this.detailed(proposal.sourceIssueId);
+    const resuming = proposal.sourceState === "cancelled";
+    const exactReservation = source.snapshot.events.some((event) => event.kind === "supersession" && event.successor === proposal.contract.id);
+    if (
+      source.snapshot.version !== proposal.sourceVersion
+      || source.snapshot.issue.identifier !== proposal.sourceIssueIdentifier
+      || source.snapshot.issue.state !== proposal.sourceState
+      || source.snapshot.claim !== null
+      || source.snapshot.retry !== null
+      || source.record.state !== "OPEN"
+      || source.record.body !== proposal.inheritedIssueBody
+      || canonicalValue(source.snapshot.contract.acceptance) !== canonicalValue([...proposal.covers, ...proposal.remains])
+      || (resuming && !exactReservation)
+    ) return { outcome: "refused", reason: "authored source changed, became claimed, or lacks the exact pre-claim reservation" };
+
+    if (!resuming) {
+      const reservation = nextEvent(source.snapshot, "supersession", "cancelled", nowMs, null, {
+        claim: null,
+        retry: null,
+        evidence: source.snapshot.evidence,
+        message: `cancelled before attempt one because executable scope continues at contract ${proposal.contract.id}`,
+        successor: proposal.contract.id,
+      });
+      try {
+        await this.requiredCommit(source, reservation);
+      } catch (error) {
+        return { outcome: "refused", reason: `pre-claim reservation lost compare-and-set: ${errorMessage(error)}` };
+      }
+      source = await this.detailed(proposal.sourceIssueId);
+    }
+
+    const records = await collectPages((cursor) => this.transport.listIssues(this.config.repository, cursor));
+    const matching = records.filter((record) => {
+      try {
+        return parseIssueContract(record.body, `${this.config.repository}#${record.number}`, this.config.workflow).id === proposal.contract.id;
+      } catch {
+        return false;
+      }
+    });
+    if (matching.length > 1) return { outcome: "refused", reason: `successor contract id is ambiguous across ${matching.length} issues` };
+    let created = false;
+    let successorRecord = matching[0] ?? null;
+    if (successorRecord && (successorRecord.state !== "OPEN" || successorRecord.body !== proposal.contractMarkdown)) {
+      return { outcome: "refused", reason: "existing successor is closed or has a non-exact body" };
+    }
+    if (!successorRecord) {
+      const result = await this.transport.createIssue(
+        this.config.repository,
+        `Pre-claim successor for ${proposal.sourceIssueIdentifier}`,
+        proposal.contractMarkdown,
+        [],
+      );
+      created = true;
+      const [readback] = await this.transport.getIssuesByNodeIds([result.id]);
+      if (!readback || readback.state !== "OPEN" || readback.body !== proposal.contractMarkdown) {
+        throw new Error("created pre-claim successor did not read back exactly");
+      }
+      successorRecord = readback;
+    }
+
+    const attribution = preclaimScopeAttribution(proposal);
+    let comments = await collectPages((cursor) => this.transport.listComments(successorRecord!.id, cursor));
+    const exactAttributions = comments.filter((comment) => comment.body === attribution);
+    if (exactAttributions.length > 1) return { outcome: "refused", reason: "successor attribution is duplicated" };
+    if (exactAttributions.length === 0) await this.transport.appendComment(successorRecord.id, attribution);
+    comments = await collectPages((cursor) => this.transport.listComments(successorRecord!.id, cursor));
+    if (comments.filter((comment) => comment.body === attribution).length !== 1) throw new Error("successor attribution did not read back exactly once");
+
+    let items = (await collectPages((cursor) => this.transport.listProjectItems(successorRecord!.id, cursor)))
+      .filter((item) => item.projectId === this.config.projectId);
+    if (items.length > 1) return { outcome: "refused", reason: "successor configured Project item is ambiguous" };
+    const itemId = items[0]?.id ?? await this.transport.addIssueToProject(this.config.projectId, successorRecord.id);
+    items = (await collectPages((cursor) => this.transport.listProjectItems(successorRecord!.id, cursor)))
+      .filter((item) => item.projectId === this.config.projectId);
+    if (items.length !== 1 || items[0]!.id !== itemId) throw new Error("successor configured Project item did not read back exactly once");
+
+    const ready = this.config.states.ready;
+    await this.transport.updateProjectSingleSelect(this.config.projectId, itemId, this.config.statusFieldId, ready.projectStatusOptionId);
+    const existingLabels = await collectPages((cursor) => this.transport.listLabels(successorRecord!.id, cursor));
+    await this.transport.replaceLabels(
+      this.config.repository,
+      successorRecord.number,
+      [...new Set([...existingLabels.filter((label) => !this.#managedLabels.has(normalizeLabel(label))), ...this.config.requiredLabels, ready.label])],
+    );
+    const successor = await this.detailed(successorRecord.id);
+    if (successor.snapshot.issue.state !== "ready" || successor.snapshot.issue.closed || successor.snapshot.contract.acceptance.length > proposal.acceptanceLimit) {
+      throw new Error("bounded successor did not reconstruct as open and ready within the executable limit");
+    }
+
+    const sourceReadback = await this.detailed(proposal.sourceIssueId);
+    if (sourceReadback.record.state !== "OPEN" || sourceReadback.record.body !== proposal.inheritedIssueBody || sourceReadback.snapshot.claim) {
+      throw new Error("pre-claim source was rewritten, closed, or claimed during supersession");
+    }
+    if (sourceReadback.snapshot.issue.state !== "cancelled" || !sourceReadback.snapshot.events.some((event) => event.kind === "supersession" && event.successor === proposal.contract.id)) {
+      throw new Error("source supersession did not reconstruct with the exact successor contract link");
+    }
+    return {
+      outcome: created ? "applied" : "already-applied",
+      source: sourceReadback.snapshot,
+      successor: successor.snapshot,
+    };
   }
 
   /**
@@ -1618,9 +1763,10 @@ function reduceLedgerEvent(snapshot: TrackerIssueSnapshot, event: LedgerEvent, s
       break;
     }
     case "supersession": {
-      if (claim || snapshot.issue.state !== "failed" || event.to !== "cancelled" || event.fence !== null || event.claim !== null || event.retry !== null) {
+      if (claim || !["ready", "failed"].includes(snapshot.issue.state) || event.to !== "cancelled" || event.fence !== null || event.claim !== null || event.retry !== null) {
         throw new Error("invalid supersession ledger event");
       }
+      if (snapshot.issue.state === "ready") assertLifecycleTransition(snapshot.issue.state, event.to);
       const successor = decisionReference(event.successor ?? "");
       if (!successor || successor !== event.successor) throw new Error("supersession requires an exact successor reference");
       break;
@@ -1937,6 +2083,14 @@ function claimBindingsStable(left: Claim, right: Claim): boolean {
     && left.modelConnection === right.modelConnection
     && left.modelProfile === right.modelProfile
     && left.claimedAtMs === right.claimedAtMs;
+}
+
+function canonicalValue(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalValue).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.entries(value as Record<string, unknown>).sort(([left], [right]) => left.localeCompare(right)).map(([key, entry]) => `${JSON.stringify(key)}:${canonicalValue(entry)}`).join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
 }
 
 function errorMessage(error: unknown): string {

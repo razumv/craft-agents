@@ -4,6 +4,7 @@ import type { CraftStartContext, SilentRunObservation } from "./craft-adapter";
 import type { Claim, MaterialEvidence, ProjectStatus, RiskTier, RunIdentity, TrackerIssueSnapshot, WorkflowConfig } from "./domain";
 import { IdentityFactory } from "./identity";
 import { ModelPolicy, RiskPolicy } from "./policy";
+import { proposePreclaimScope } from "./preclaim-scope";
 import { projectStatus } from "./status";
 import type { TrackerAdapter } from "./tracker";
 
@@ -113,11 +114,39 @@ export class DeterministicScheduler {
       this.#startupReconciled = true;
     }
     await this.reconcile(crashAfter);
+    if (this.adapters.github.reconcilePreclaimScopes) {
+      try {
+        const resumed = await this.adapters.github.reconcilePreclaimScopes(this.clock.nowMs());
+        if (resumed) this.adapters.onDiagnostic?.(resumed.outcome === "refused"
+          ? `pre-claim scope recovery refused: ${resumed.reason}`
+          : `pre-claim scope recovery ${resumed.outcome} -> ${resumed.successor.issue.identifier}`);
+      } catch (error) {
+        this.adapters.onDiagnostic?.(`pre-claim scope recovery failed without claiming: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
     if ((await this.adapters.github.activeClaims()).length >= this.config.scheduler.wipLimit) return;
 
     const candidates = await this.adapters.github.fetchIssuesByStates(["ready", "retry-wait"]);
     for (const candidate of candidates.sort(compareForDispatch)) {
       if (!this.dispatchable(candidate)) continue;
+      const scope = proposePreclaimScope(candidate, this.config);
+      if (scope) {
+        if (!this.adapters.github.applyPreclaimScope) {
+          this.adapters.onDiagnostic?.(`skipping ${candidate.issue.identifier} without claiming: tracker cannot apply pre-claim scope`);
+          continue;
+        }
+        try {
+          const result = await this.adapters.github.applyPreclaimScope(scope, this.clock.nowMs());
+          this.adapters.onDiagnostic?.(result.outcome === "refused"
+            ? `pre-claim scope refused ${candidate.issue.identifier}: ${result.reason}`
+            : `pre-claim scope ${result.outcome} ${candidate.issue.identifier} -> ${result.successor.issue.identifier}`);
+        } catch (error) {
+          this.adapters.onDiagnostic?.(`pre-claim scope failed ${candidate.issue.identifier} without claiming: ${error instanceof Error ? error.message : String(error)}`);
+        }
+        // The source was never claimed. Continue through the frozen candidate
+        // observation so later ready work is not starved by scope handling.
+        continue;
+      }
       this.#models.assertAllowed(candidate.contract.modelProfile);
       this.#risk.budgetFor(candidate.contract);
       const attempt = candidate.retry?.attempt ?? 1;
@@ -300,6 +329,13 @@ export class DeterministicScheduler {
         .map((blocker) => blocker.identifier ?? blocker.id ?? "unknown blocker")
         .join(", ");
       return this.observation(snapshot, blockers ? `blocked by ${blockers}` : "issue contract is not dispatchable");
+    }
+    const scope = proposePreclaimScope(snapshot, this.config);
+    if (scope) {
+      return this.observation(
+        snapshot,
+        `acceptance count ${snapshot.contract.acceptance.length} exceeds executable limit ${scope.acceptanceLimit}; next tick would create or reuse ${scope.contract.id} before claiming`,
+      );
     }
     this.#models.assertAllowed(snapshot.contract.modelProfile);
     this.#risk.budgetFor(snapshot.contract);

@@ -65,6 +65,35 @@ acceptance:
 }
 
 describe("v4.1 deterministic scheduler core", () => {
+  test("handles over-wide scope before claim and still dispatches later ready work", async () => {
+    const boundedWorkflow = {
+      ...workflow,
+      config: {
+        ...workflow.config,
+        scheduler: { ...workflow.config.scheduler, executableAcceptanceLimit: 1 },
+      },
+    };
+    const simulator = new CrashRestartSimulator(boundedWorkflow);
+    const wide = simulator.seed(issue("issue-wide", "CP-1"), contract());
+    const narrowBody = contract().replace("  - deterministic restart recovery\n", "");
+    const later = simulator.seed({ ...issue("issue-later", "CP-2"), priority: 2 }, narrowBody);
+    let scopeCalls = 0;
+    Object.assign(simulator.github, {
+      applyPreclaimScope: async () => {
+        scopeCalls += 1;
+        return { outcome: "refused" as const, reason: "simulated provider refusal" };
+      },
+    });
+
+    await simulator.scheduler.tick();
+
+    expect(scopeCalls).toBe(1);
+    expect(simulator.github.get(wide.id).issue.state).toBe("ready");
+    expect(simulator.github.get(wide.id).events.map((event) => event.kind)).not.toContain("claim");
+    expect(simulator.github.get(later.id)).toMatchObject({ issue: { state: "running" }, claim: { attempt: 1 } });
+    expect(simulator.github.claimSuccessCount).toBe(1);
+  });
+
   test("exactly-once claim under concurrent ticks", async () => {
     const simulator = new CrashRestartSimulator(workflow);
     simulator.seed(issue(), contract());
