@@ -30,6 +30,7 @@ scheduler:
   stale_run_ms: 120000
   max_attempts: 3
   max_revivals: 2
+  pr_open_stuck_cycles: 3
   retry_base_ms: 1000
   retry_max_ms: 4000
 workspace:

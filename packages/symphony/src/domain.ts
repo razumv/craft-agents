@@ -98,6 +98,8 @@ export interface WorkflowConfig {
     maxAttempts: number;
     /** Maximum fresh attempt budgets an owner may grant after terminal failure. */
     maxRevivals: number;
+    /** Consecutive observations of one self-unchanging PR verdict before the lane parks. */
+    prOpenStuckCycles: number;
     retryBaseMs: number;
     retryMaxMs: number;
   };
@@ -181,6 +183,10 @@ export interface MaterialEvidence {
   deploymentUrl?: string;
   blocker?: string;
   ownerGateId?: string;
+  /** Exact provider verdict observed on the latest pr-open reconciliation cycle. */
+  prOpenVerdict?: string;
+  /** Consecutive cycles carrying that exact self-unchanging verdict; zero for wait states. */
+  prOpenVerdictCycles?: number;
 }
 
 export type LifecycleEventKind =

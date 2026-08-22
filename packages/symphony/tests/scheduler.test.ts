@@ -335,6 +335,108 @@ describe("v4.1 deterministic scheduler core", () => {
     expect(red.state).toBe("pr-open");
   });
 
+  test("an unchanged stuck PR verdict parks at the cycle bound and frees WIP without closing work", async () => {
+    const simulator = new CrashRestartSimulator(workflow);
+    const first = simulator.seed(issue(), contract());
+    simulator.seed(issue("issue-46", "CP-46"), contract());
+    const verdict = {
+      disposition: "stuck" as const,
+      verdict: "mergeability is CONFLICTING",
+      resumeCondition: "the branch must be updated to resolve conflicts with main",
+    };
+    Object.assign(simulator.github, { pullRequestVerdict: async () => verdict });
+
+    await simulator.scheduler.tick();
+    const claim = simulator.github.get(first.id).claim!;
+    simulator.github.transition(first.id, "pr-open", simulator.clock.nowMs(), {
+      fence: claim.fence,
+      evidence: {
+        branchUrl: "https://github.test/acme/repo/tree/v4/acme-repo-45",
+        prUrl: "https://github.test/acme/repo/pull/45",
+      },
+    });
+
+    await simulator.scheduler.tick();
+    expect(simulator.github.get(first.id).evidence.prOpenVerdictCycles).toBe(1);
+    // Replacing the scheduler proves the count is durable evidence, not process memory.
+    simulator.restart();
+    await simulator.scheduler.tick();
+    expect(simulator.github.get(first.id).evidence.prOpenVerdictCycles).toBe(2);
+    await simulator.scheduler.tick();
+
+    const parked = simulator.github.get(first.id);
+    expect(parked.issue.state).toBe("blocked");
+    expect(parked.issue.closed).toBeFalse();
+    expect(parked.claim).toBeNull();
+    expect(parked.evidence.branchUrl).toBe("https://github.test/acme/repo/tree/v4/acme-repo-45");
+    expect(parked.evidence.prUrl).toBe("https://github.test/acme/repo/pull/45");
+    expect(parked.evidence.blocker).toContain(verdict.verdict);
+    expect(parked.evidence.blocker).toContain(`To resume: ${verdict.resumeCondition}`);
+    // The same threshold tick can spend the released WIP slot on the next issue.
+    expect(simulator.github.get("issue-46")).toMatchObject({ issue: { state: "running" }, claim: { issueId: "issue-46" } });
+  });
+
+  test("the stuck count resets when the exact verdict changes", async () => {
+    const simulator = new CrashRestartSimulator(workflow);
+    const seeded = simulator.seed(issue(), contract());
+    const conflict = {
+      disposition: "stuck" as const, verdict: "mergeability is CONFLICTING",
+      resumeCondition: "resolve conflicts",
+    };
+    const noChecks = {
+      disposition: "stuck" as const, verdict: "no checks ran on the head commit",
+      resumeCondition: "run and pass a required check",
+    };
+    const observations = [conflict, conflict, noChecks, conflict, conflict, conflict];
+    Object.assign(simulator.github, { pullRequestVerdict: async () => observations.shift() ?? conflict });
+    await simulator.scheduler.tick();
+    const claim = simulator.github.get(seeded.id).claim!;
+    simulator.github.transition(seeded.id, "pr-open", simulator.clock.nowMs(), {
+      fence: claim.fence, evidence: { prUrl: "https://github.test/acme/repo/pull/45" },
+    });
+
+    for (const expected of [1, 2, 1, 1, 2]) {
+      await simulator.scheduler.tick();
+      expect(simulator.github.get(seeded.id)).toMatchObject({
+        issue: { state: "pr-open" }, evidence: { prOpenVerdictCycles: expected },
+      });
+    }
+    await simulator.scheduler.tick();
+    expect(simulator.github.get(seeded.id).issue.state).toBe("blocked");
+  });
+
+  test("queued, running, review-requested, and behind PRs wait by cycles regardless of elapsed time", async () => {
+    const waiting = [
+      ["checks are QUEUED", "queued checks must finish"],
+      ["checks are RUNNING", "running checks must finish"],
+      ["review is REQUESTED", "the requested review must approve"],
+      ["base branch is BEHIND", "the branch must catch up with main"],
+    ] as const;
+    for (const [verdict, resumeCondition] of waiting) {
+      const simulator = new CrashRestartSimulator(workflow);
+      const seeded = simulator.seed(issue(), contract());
+      Object.assign(simulator.github, {
+        pullRequestVerdict: async () => ({
+          disposition: "waiting" as const, verdict, resumeCondition,
+        }),
+      });
+      await simulator.scheduler.tick();
+      const claim = simulator.github.get(seeded.id).claim!;
+      simulator.github.transition(seeded.id, "pr-open", simulator.clock.nowMs(), {
+        fence: claim.fence, evidence: { prUrl: "https://github.test/acme/repo/pull/45" },
+      });
+      for (let cycle = 0; cycle < workflow.config.scheduler.prOpenStuckCycles + 1; cycle += 1) {
+        simulator.clock.advance(24 * 60 * 60 * 1_000);
+        await simulator.scheduler.tick();
+      }
+      expect(simulator.github.get(seeded.id)).toMatchObject({
+        issue: { state: "pr-open" },
+        claim: { issueId: seeded.id },
+        evidence: { prOpenVerdict: verdict, prOpenVerdictCycles: 0 },
+      });
+    }
+  });
+
   test("owner directives are immutable and gates require exact IDs", () => {
     const ledger = new OwnerDirectiveLedger();
     const entry = ledger.append({

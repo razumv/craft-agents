@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import type { CraftStartContext } from "./craft-adapter";
-import type { Claim, ProjectStatus, RiskTier, RunIdentity, TrackerIssueSnapshot, WorkflowConfig } from "./domain";
+import type { Claim, MaterialEvidence, ProjectStatus, RiskTier, RunIdentity, TrackerIssueSnapshot, WorkflowConfig } from "./domain";
 import { IdentityFactory } from "./identity";
 import { ModelPolicy, RiskPolicy } from "./policy";
 import { projectStatus } from "./status";
@@ -379,8 +379,17 @@ export class DeterministicScheduler {
         continue;
       }
       if (snapshot.issue.state !== "running") {
+        const observation = snapshot.issue.state === "pr-open"
+          ? await this.observePrOpenVerdict(snapshot)
+          : { parked: false, evidence: undefined };
+        if (observation.parked) continue;
         await this.maybeAutoMerge(snapshot);
-        await this.adapters.github.heartbeat(claim.fence, now, this.config.scheduler.claimTtlMs);
+        await this.adapters.github.heartbeat(
+          claim.fence,
+          now,
+          this.config.scheduler.claimTtlMs,
+          observation.evidence,
+        );
         continue;
       }
 
@@ -453,6 +462,47 @@ export class DeterministicScheduler {
         );
       }
     }
+  }
+
+  /**
+   * Count provider verdicts by scheduler cycles, never elapsed time. Waiting
+   * states reset the stuck count; a self-unchanging verdict is parked only when
+   * the configured number of consecutive observations has actually occurred.
+   * The observation rides on the ordinary durable heartbeat, so replacing the
+   * scheduler cannot grant a stuck PR a fresh unbounded wait.
+   */
+  private async observePrOpenVerdict(snapshot: TrackerIssueSnapshot): Promise<{
+    parked: boolean;
+    evidence?: MaterialEvidence;
+  }> {
+    const readVerdict = this.adapters.github.pullRequestVerdict;
+    const claim = snapshot.claim;
+    if (!readVerdict || !claim) return { parked: false };
+    const result = await readVerdict.call(this.adapters.github, snapshot.issue.id);
+    const recordedCycles = snapshot.evidence.prOpenVerdictCycles;
+    const priorCycles = snapshot.evidence.prOpenVerdict === result.verdict
+      && typeof recordedCycles === "number"
+      && Number.isInteger(recordedCycles)
+      && recordedCycles >= 0
+      ? recordedCycles
+      : 0;
+    const cycles = result.disposition === "stuck" ? priorCycles + 1 : 0;
+    const evidence: MaterialEvidence = {
+      prOpenVerdict: result.verdict,
+      prOpenVerdictCycles: cycles,
+    };
+    if (result.disposition !== "stuck" || cycles < this.config.scheduler.prOpenStuckCycles) {
+      return { parked: false, evidence };
+    }
+
+    const blocker = `PR merge verdict: ${result.verdict}. To resume: ${result.resumeCondition}.`;
+    await this.adapters.github.transition(snapshot.issue.id, "blocked", this.clock.nowMs(), {
+      fence: claim.fence,
+      message: `parked after ${cycles} consecutive cycles with unchanged PR merge verdict: ${result.verdict}`,
+      evidence: { ...evidence, blocker },
+    });
+    this.adapters.onDiagnostic?.(`parked ${snapshot.issue.identifier}: ${blocker}`);
+    return { parked: true };
   }
 
   private async startClaim(snapshot: TrackerIssueSnapshot, crashAfter?: CrashPoint): Promise<void> {
