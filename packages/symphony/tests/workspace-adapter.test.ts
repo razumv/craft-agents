@@ -73,7 +73,7 @@ async function fixture(options: { onPreserved?: (info: PreservedInfo) => void } 
   };
   const context: CraftStartContext = { claim, issue, contract };
   const adapter = new GitWorktreeAdapter({
-    repositoryRoot: root, workspaceRoot, gitExecutable: "/usr/bin/git", trackerRemote: "tracker",
+    repositoryRoot: root, workspaceRoot, gitExecutable: "/usr/bin/git", trackerRepository: "razumv/craft-protocol", trackerRemote: "tracker",
     ...(options.onPreserved ? { onPreserved: options.onPreserved } : {}),
   });
   return { root, remote, workspaceRoot, issue, identity, claim, context, adapter };
@@ -348,6 +348,75 @@ describe("v4 live git worktree adapter", () => {
     expect(await first.adapter.auditPreservedBranches()).toContainEqual({
       branch: legacy, commit: first.claim.baseSha, remoteCommit: null, durable: false,
     });
+  });
+
+  test("retains the newest five exact done identities and removes only one oldest worktree non-force", async () => {
+    const first = await fixture();
+    const claims: Claim[] = [];
+    const settled = new Map<string, number>();
+    for (let number = 1; number <= 7; number += 1) {
+      const issue = { ...first.issue, id: `I_${number}`, identifier: `razumv/craft-protocol#${number}` };
+      const identity = new IdentityFactory(first.workspaceRoot).forAttempt(issue, 1);
+      const claim: Claim = {
+        ...first.claim, ...identity, issueId: issue.id, issueIdentifier: issue.identifier,
+        fence: `claim-${number}`, claimedAtMs: number * 100, heartbeatAtMs: number * 100, expiresAtMs: number * 100 + 60_000,
+      };
+      const contract = { ...first.context.contract, id: `DONE-${number}`, requiredBranch: `v4/done-${number}` };
+      await first.adapter.ensure(identity, { claim, issue, contract });
+      claims.push(claim);
+      settled.set(claim.workspaceId, number * 1_000);
+    }
+    const beforeBranches = await git(first.root, ["branch", "--format=%(refname:short)"]);
+    const report = await first.adapter.collectTerminalWorktrees({
+      laneIdle: async () => true,
+      verify: async (binding) => ({ accepted: true, evidence: {
+        repository: "razumv/craft-protocol", projectId: "proj-craft-protocol", issueIdentifier: binding.issueIdentifier,
+        requiredBranch: `v4/done-${binding.issueIdentifier.split("#").at(-1)}`, baseBranch: "main",
+        settledAtMs: settled.get(binding.workspaceId)!, branchSha: binding.baseSha, mergeCommitSha: binding.baseSha,
+      } }),
+    });
+
+    expect(report).toMatchObject({ registered: 7, eligible: 7, retained: 5, excluded: 0, laneIdle: true, laneError: null });
+    expect(report.lastReceipt?.workspaceId).toBe(claims[0]!.workspaceId);
+    expect((await git(first.root, ["worktree", "list", "--porcelain"])).match(/^worktree /gm)).toHaveLength(7); // root + six retained/queued
+    expect(await git(first.root, ["branch", "--format=%(refname:short)"])).toBe(beforeBranches); // GC never deletes refs
+  }, 20_000);
+
+  test("foreign lane evidence and a non-idle lane stay zero-mutation with stable reasons", async () => {
+    const first = await fixture();
+    const created = await first.adapter.ensure(first.identity, first.context);
+    await writeFile(resolve(created.workspacePath, "dirty.txt"), "must survive\n", "utf8");
+    const before = await git(first.root, ["worktree", "list", "--porcelain"]);
+    const report = await first.adapter.collectTerminalWorktrees({
+      laneIdle: async () => false,
+      verify: async () => ({ accepted: false, reason: "foreign-or-ambiguous-lane" }),
+    });
+    expect(report).toMatchObject({ registered: 1, eligible: 0, retained: 0, excluded: 1, laneIdle: false, lastReceipt: null, laneError: null });
+    expect(report.reasons).toEqual([{ reason: "foreign-or-ambiguous-lane", count: 1, workspaces: [first.claim.workspaceKey] }]);
+    expect(await git(first.root, ["worktree", "list", "--porcelain"])).toBe(before);
+    expect(await readFile(resolve(created.workspacePath, "dirty.txt"), "utf8")).toBe("must survive\n");
+  });
+
+  test("dirty and run-owned ignored content fail closed before retention", async () => {
+    const dirty = await fixture();
+    const dirtyWorktree = await dirty.adapter.ensure(dirty.identity, dirty.context);
+    await writeFile(resolve(dirtyWorktree.workspacePath, "untracked-output.txt"), "work\n", "utf8");
+    const external = async (binding: Claim) => ({ accepted: true as const, evidence: {
+      repository: "razumv/craft-protocol", projectId: "proj-craft-protocol", issueIdentifier: binding.issueIdentifier,
+      requiredBranch: dirty.context.contract.requiredBranch, baseBranch: "main", settledAtMs: 1_000,
+      branchSha: binding.baseSha, mergeCommitSha: binding.baseSha,
+    } });
+    const dirtyReport = await dirty.adapter.collectTerminalWorktrees({ laneIdle: async () => true, verify: external });
+    expect(dirtyReport.reasons.map((entry) => entry.reason)).toEqual(["staged-modified-conflicted-or-untracked"]);
+
+    const ignored = await fixture();
+    const ignoredWorktree = await ignored.adapter.ensure(ignored.identity, ignored.context);
+    const exclude = (await git(ignoredWorktree.workspacePath, ["rev-parse", "--git-path", "info/exclude"])).trim();
+    await Bun.write(exclude, `${await readFile(exclude, "utf8")}private-output.txt\n`);
+    await writeFile(resolve(ignoredWorktree.workspacePath, "private-output.txt"), "ignored work\n", "utf8");
+    const ignoredReport = await ignored.adapter.collectTerminalWorktrees({ laneIdle: async () => true, verify: external });
+    expect(ignoredReport.reasons.map((entry) => entry.reason)).toEqual(["run-owned-ignored"]);
+    expect(await readFile(resolve(ignoredWorktree.workspacePath, "private-output.txt"), "utf8")).toBe("ignored work\n");
   });
 });
 

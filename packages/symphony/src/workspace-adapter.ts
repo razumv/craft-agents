@@ -2,7 +2,7 @@
 
 import { constants } from "node:fs";
 import { access, appendFile, lstat, mkdir, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
-import { dirname, isAbsolute, relative, resolve } from "node:path";
+import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import type { CraftStartContext } from "./craft-adapter";
 import type { Claim, RunIdentity } from "./domain";
 import { claimBindingFile, claimBindingsEqual } from "./workspace-truth";
@@ -45,6 +45,59 @@ export interface GitWorktree {
   attempt: number;
   branch: string;
   baseSha: string;
+}
+
+export interface TerminalWorktreeEvidence {
+  repository: string;
+  projectId: string;
+  issueIdentifier: string;
+  requiredBranch: string;
+  baseBranch: string;
+  settledAtMs: number;
+  branchSha: string;
+  mergeCommitSha: string;
+}
+
+export interface TerminalWorktreeGcReceipt {
+  workspaceId: string;
+  workspacePath: string;
+  issueIdentifier: string;
+  attempt: number;
+  headSha: string;
+  settledAtMs: number;
+  removedAtMs: number;
+}
+
+export interface TerminalWorktreeGcReport {
+  retentionLimit: 5;
+  registered: number;
+  eligible: number;
+  retained: number;
+  excluded: number;
+  laneIdle: boolean;
+  reasons: Array<{ reason: string; count: number; workspaces: string[] }>;
+  lastReceipt: TerminalWorktreeGcReceipt | null;
+  laneError: string | null;
+}
+
+export interface TerminalWorktreeGcCallbacks {
+  /** Fresh provider, lane-ledger, and Craft-session proof. */
+  verify(binding: Claim, phase: "classify" | "pre-remove" | "post-remove"): Promise<{ accepted: true; evidence: TerminalWorktreeEvidence } | { accepted: false; reason: string }>;
+  /** Re-read immediately before removal; false protects a concurrent claim. */
+  laneIdle(): Promise<boolean>;
+}
+
+interface RegisteredWorktree {
+  path: string;
+  head: string | null;
+  branch: string | null;
+}
+
+interface EligibleTerminalWorktree {
+  registered: RegisteredWorktree;
+  binding: Claim;
+  evidence: TerminalWorktreeEvidence;
+  head: string;
 }
 
 /** Idempotent, fail-closed git worktree creation for one deterministic issue attempt. */
@@ -423,6 +476,183 @@ export class GitWorktreeAdapter {
   }
 
   /**
+   * Classify every registered direct child of this lane root and, only while
+   * the lane is still idle, remove the oldest eligible identity beyond the
+   * newest five. Classification and pre-delete verification share the same
+   * function; faults exclude, never make a worktree look clean.
+   */
+  async collectTerminalWorktrees(callbacks: TerminalWorktreeGcCallbacks): Promise<TerminalWorktreeGcReport> {
+    const retentionLimit = 5 as const;
+    const exclusions = new Map<string, string[]>();
+    const eligible: EligibleTerminalWorktree[] = [];
+    let registeredCount = 0;
+    let laneError: string | null = null;
+
+    let records: RegisteredWorktree[];
+    try {
+      records = parseWorktreeList(await this.git(["worktree", "list", "--porcelain"]));
+    } catch (error) {
+      return { retentionLimit, registered: 0, eligible: 0, retained: 0, excluded: 0, laneIdle: false, reasons: [], lastReceipt: null, laneError: message(error) };
+    }
+    const canonicalRoot = await realpath(this.#workspaceRoot).catch(() => this.#workspaceRoot);
+    for (const record of records) {
+      const rel = relative(canonicalRoot, record.path);
+      if (!rel || escapesRoot(rel)) continue;
+      registeredCount += 1;
+      const identity = rel;
+      const classified = await this.#classifyTerminalWorktree(record, canonicalRoot, callbacks, "classify");
+      if (classified.accepted) eligible.push(classified.worktree);
+      else addExclusion(exclusions, classified.reason, identity);
+    }
+
+    eligible.sort((left, right) => right.evidence.settledAtMs - left.evidence.settledAtMs
+      || left.evidence.issueIdentifier.localeCompare(right.evidence.issueIdentifier)
+      || right.binding.attempt - left.binding.attempt
+      || left.binding.workspaceId.localeCompare(right.binding.workspaceId));
+    const retained = Math.min(retentionLimit, eligible.length);
+    let lastReceipt: TerminalWorktreeGcReceipt | null = null;
+    let laneIdle = false;
+    try {
+      laneIdle = await callbacks.laneIdle();
+      const candidate = eligible.at(-1);
+      if (laneIdle && eligible.length > retentionLimit && candidate) {
+        // A second complete classification closes the provider/Craft/Git race
+        // window as far as this bounded adapter can. The non-overlapping lane
+        // operation and lane fence protect the final command itself.
+        const fresh = await this.#classifyTerminalWorktree(candidate.registered, canonicalRoot, callbacks, "pre-remove");
+        if (!fresh.accepted || fresh.worktree.binding.workspaceId !== candidate.binding.workspaceId) {
+          addExclusion(exclusions, fresh.accepted ? "identity-changed-before-remove" : `pre-remove-${fresh.reason}`, candidate.binding.workspaceKey);
+        } else if (!await callbacks.laneIdle()) {
+          addExclusion(exclusions, "concurrent-claim", candidate.binding.workspaceKey);
+          laneIdle = false;
+        } else {
+          await this.git(["worktree", "remove", candidate.registered.path]);
+          const [remaining, pathInfo, post] = await Promise.all([
+            this.worktreePaths(),
+            lstat(candidate.registered.path).catch((error) => missing(error) ? null : Promise.reject(error)),
+            callbacks.verify(candidate.binding, "post-remove"),
+          ]);
+          if (remaining.has(resolve(candidate.registered.path)) || pathInfo !== null) {
+            throw new Error("non-force worktree removal lacks exact registration/path readback");
+          }
+          if (!post.accepted || post.evidence.settledAtMs !== candidate.evidence.settledAtMs) {
+            throw new Error(`terminal ledger readback changed after removal: ${post.accepted ? "settled-time-mismatch" : post.reason}`);
+          }
+          lastReceipt = {
+            workspaceId: candidate.binding.workspaceId,
+            workspacePath: candidate.registered.path,
+            issueIdentifier: candidate.evidence.issueIdentifier,
+            attempt: candidate.binding.attempt,
+            headSha: candidate.head,
+            settledAtMs: candidate.evidence.settledAtMs,
+            removedAtMs: Date.now(),
+          };
+        }
+      }
+    } catch (error) {
+      laneError = message(error);
+    }
+
+    const reasons = [...exclusions].map(([reason, workspaces]) => ({
+      reason, count: workspaces.length, workspaces: [...workspaces].sort(),
+    })).sort((left, right) => left.reason.localeCompare(right.reason));
+    return {
+      retentionLimit,
+      registered: registeredCount,
+      eligible: eligible.length,
+      retained,
+      excluded: registeredCount - eligible.length,
+      laneIdle,
+      reasons,
+      lastReceipt,
+      laneError,
+    };
+  }
+
+  async #classifyTerminalWorktree(
+    record: RegisteredWorktree,
+    canonicalRoot: string,
+    callbacks: TerminalWorktreeGcCallbacks,
+    phase: "classify" | "pre-remove",
+  ): Promise<{ accepted: true; worktree: EligibleTerminalWorktree } | { accepted: false; reason: string }> {
+    try {
+      const rel = relative(canonicalRoot, record.path);
+      if (!rel || escapesRoot(rel) || rel.includes(sep)) return { accepted: false, reason: "not-canonical-direct-child" };
+      const info = await lstat(record.path);
+      if (!info.isDirectory() || info.isSymbolicLink()) return { accepted: false, reason: "path-not-real-directory" };
+      const canonical = await realpath(record.path);
+      if (canonical !== resolve(canonicalRoot, rel)) return { accepted: false, reason: "canonical-path-mismatch" };
+      if (!record.head || !/^[0-9a-f]{40,64}$/i.test(record.head) || !record.branch?.startsWith("refs/heads/")) {
+        return { accepted: false, reason: "detached-or-invalid-registration" };
+      }
+
+      const raw = await readFile(resolve(record.path, claimBindingFile), "utf8");
+      const binding = JSON.parse(raw) as Claim;
+      const boundCanonical = validClaimBinding(binding)
+        ? await realpath(resolve(binding.workspacePath)).catch(() => null)
+        : null;
+      if (!validClaimBinding(binding) || boundCanonical !== canonical || binding.workspaceKey !== rel) {
+        return { accepted: false, reason: "claim-binding-mismatch" };
+      }
+      const external = await callbacks.verify(binding, phase);
+      if (!external.accepted) return { accepted: false, reason: external.reason };
+      const evidence = external.evidence;
+      if (evidence.repository !== this.config.trackerRepository || evidence.issueIdentifier !== binding.issueIdentifier) {
+        return { accepted: false, reason: "repository-or-issue-mismatch" };
+      }
+      if (record.branch !== `refs/heads/${evidence.requiredBranch}`) return { accepted: false, reason: "branch-binding-mismatch" };
+
+      const [top, common, head, status, ignored, stash, submodules] = await Promise.all([
+        this.git(["-C", record.path, "rev-parse", "--show-toplevel"]),
+        this.git(["-C", record.path, "rev-parse", "--git-common-dir"]),
+        this.git(["-C", record.path, "rev-parse", "HEAD"]),
+        this.git(["-C", record.path, "status", "--porcelain=v2", "--untracked-files=all"]),
+        this.git(["-C", record.path, "status", "--porcelain=v2", "--ignored=matching"]),
+        this.git(["stash", "list", "--format=%gd"]),
+        this.git(["-C", record.path, "ls-files", "--stage"]),
+      ]);
+      if (await realpath(resolve(top.trim())) !== canonical) return { accepted: false, reason: "git-top-level-mismatch" };
+      const commonPath = resolve(record.path, common.trim());
+      const rootCommon = resolve(this.#repositoryRoot, (await this.git(["rev-parse", "--git-common-dir"])).trim());
+      if (await realpath(commonPath) !== await realpath(rootCommon)) return { accepted: false, reason: "git-common-directory-mismatch" };
+      if (head.trim() !== record.head) return { accepted: false, reason: "head-registration-mismatch" };
+      if (status.trim()) return { accepted: false, reason: "staged-modified-conflicted-or-untracked" };
+      const ignoredPaths = ignored.split(/\r?\n/).filter((line) => line.startsWith("! ")).map((line) => line.slice(2));
+      if (ignoredPaths.some((path) => path !== claimBindingFile)) return { accepted: false, reason: "run-owned-ignored" };
+      if (stash.trim()) return { accepted: false, reason: "stash-present" };
+      if (submodules.split(/\r?\n/).some((line) => /^160000\s/.test(line))) return { accepted: false, reason: "submodule-present" };
+
+      const preserved = await this.#headPreserved(record.head, evidence);
+      if (!preserved) return { accepted: false, reason: "local-only-or-unpushed-head" };
+      return { accepted: true, worktree: { registered: record, binding, evidence, head: record.head } };
+    } catch (error) {
+      return { accepted: false, reason: `classification-fault: ${message(error)}` };
+    }
+  }
+
+  async #headPreserved(head: string, evidence: TerminalWorktreeEvidence): Promise<boolean> {
+    const remote = await this.trackerRemote();
+    const refs = parseRemoteRefs(await this.git([
+      "ls-remote", "--heads", remote,
+      `refs/heads/${evidence.baseBranch}`,
+      `refs/heads/${evidence.requiredBranch}`,
+    ]));
+    const base = refs.find((entry) => entry.branch === evidence.baseBranch)?.commit;
+    for (const accepted of [base, evidence.mergeCommitSha]) {
+      if (!accepted) continue;
+      const present = await this.git(["cat-file", "-e", `${accepted}^{commit}`], true);
+      if (present.exitCode !== 0) continue;
+      const ancestor = await this.git(["merge-base", "--is-ancestor", head, accepted], true);
+      if (ancestor.exitCode === 0) return true;
+    }
+    // Squash/rebase merges need not contain the PR head. They are safe only
+    // when both immutable provider evidence and the bound remote branch expose
+    // this exact commit; a local-only or force-moved head remains excluded.
+    const remoteHead = refs.find((entry) => entry.branch === evidence.requiredBranch)?.commit;
+    return evidence.branchSha === head && remoteHead === head && /^[0-9a-f]{40,64}$/i.test(evidence.mergeCommitSha);
+  }
+
+  /**
    * The base SHA comes from the tracker, so it can easily be newer than this
    * local clone — the moment work merges, the next claim's base is a commit
    * nobody fetched here yet, and `worktree add` dies with
@@ -471,6 +701,47 @@ export class GitWorktreeAdapter {
     if (exitCode !== 0) throw new Error(`git command failed (${exitCode}): ${stderr.trim() || "no diagnostic"}`);
     return stdout;
   }
+}
+
+function parseWorktreeList(output: string): RegisteredWorktree[] {
+  const records: RegisteredWorktree[] = [];
+  let current: RegisteredWorktree | null = null;
+  for (const line of output.split(/\r?\n/)) {
+    if (line.startsWith("worktree ")) {
+      if (current) records.push(current);
+      current = { path: resolve(line.slice(9)), head: null, branch: null };
+    } else if (current && line.startsWith("HEAD ")) current.head = line.slice(5).trim();
+    else if (current && line.startsWith("branch ")) current.branch = line.slice(7).trim();
+  }
+  if (current) records.push(current);
+  const paths = new Set<string>();
+  for (const record of records) {
+    if (paths.has(record.path)) throw new Error("git returned duplicate worktree registration");
+    paths.add(record.path);
+  }
+  return records;
+}
+
+function validClaimBinding(value: unknown): value is Claim {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const claim = value as Partial<Claim>;
+  const strings: (keyof Claim)[] = [
+    "issueId", "issueIdentifier", "fence", "sessionId", "workspaceId", "workspaceKey", "workspacePath",
+    "baseSha", "modelConnection", "modelProfile",
+  ];
+  return strings.every((key) => typeof claim[key] === "string" && Boolean((claim[key] as string).trim()))
+    && Number.isInteger(claim.attempt) && claim.attempt! > 0
+    && [claim.claimedAtMs, claim.heartbeatAtMs, claim.expiresAtMs].every((entry) => typeof entry === "number" && Number.isFinite(entry) && entry! >= 0)
+    && claim.expiresAtMs! >= claim.claimedAtMs!;
+}
+
+function addExclusion(target: Map<string, string[]>, reason: string, workspace: string): void {
+  const stable = reason.trim() || "unknown-exclusion";
+  target.set(stable, [...(target.get(stable) ?? []), workspace]);
+}
+
+function escapesRoot(rel: string): boolean {
+  return isAbsolute(rel) || rel === ".." || rel.startsWith(`..${sep}`);
 }
 
 function result(identity: RunIdentity, branch: string, baseSha: string): GitWorktree {

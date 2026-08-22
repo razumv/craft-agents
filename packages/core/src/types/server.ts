@@ -73,6 +73,8 @@ export interface SymphonyProjectServiceStatus {
   cacheError: string | null
   /** Provider-neutral status from the native runner; never transcript content. */
   snapshot: unknown | null
+  /** Last lane-local terminal-worktree retention report; null before the first successful tick. */
+  terminalWorktreeGc: unknown | null
   /** Owner desk session id from the runner config — the ONLY valid target for owner-gate directives. */
   ownerSessionId: string | null
   /** Craft project id from the runner config — lets UI surfaces filter Symphony work by Craft project. */
