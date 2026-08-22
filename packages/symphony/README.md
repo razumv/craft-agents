@@ -60,6 +60,10 @@ Neither decision is delivery. Only the provider's own merge evidence can advance
 
 `LiveV4Runner.proposeGrooming()` reads one repository's existing unmanaged backlog and returns either one parser-valid contract proposal or an exact refusal. It never labels, comments, edits, claims, or updates a Project field. Candidate order is the scheduler's upstream order: priority 1 through 4 ascending; every other value and null after; creation time oldest first with null last; then identifier.
 
+After ordinary dispatch has first refusal, an idle discovery lane considers at most `GROOMING_CANDIDATE_LIMIT` (**10**) new candidates from that same backlog observation. It walks in the same dispatch order, remembers each refusal by provider issue revision, and stops at the first grounded proposal or the bound. At most one proposal is applied per cycle. A later unchanged cycle skips remembered refusals; a changed revision is reconsidered. Candidate decisions are pure and add no provider reads to the already-observed backlog.
+
+The existing `LiveRunnerStatus.grooming` lane-state surface reports `candidateLimit`, `examinedCandidates`, and every revision-current refusal with its issue identifier, relation, and exact reason. This distinguishes an empty backlog, a partially walked backlog, and a fully exhausted backlog without relying on logs. See [GROOMING-WALK-MEASUREMENT.md](./GROOMING-WALK-MEASUREMENT.md) for the large-repository result.
+
 A candidate is refused when an open blocker, open parent, or prerequisite label is present. Contract acceptance criteria are copied only from explicit issue-authored acceptance bullets and retain exact source-line mappings; unsupported additions are defects. Missing falsifiable acceptance or explicit non-goals produces a refusal rather than an invented contract.
 
 The grooming risk rubric is deterministic and evaluated in this order:
