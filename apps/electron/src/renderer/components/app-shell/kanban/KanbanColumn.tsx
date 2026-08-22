@@ -9,6 +9,7 @@ import { Popover, PopoverTrigger, PopoverContent } from '@/components/ui/popover
 import { SessionStatusMenu } from '@/components/ui/session-status-menu'
 import { TaskTile } from './TaskTile'
 import { NewTaskComposer } from './NewTaskComposer'
+import { KANBAN_COLUMN_SNAP_STYLE } from './kanban-carousel'
 import type {
   KanbanColumnMeta,
   KanbanModelProviderGroup,
@@ -90,7 +91,11 @@ export function KanbanColumn({
   const { setNodeRef, isOver } = useDroppable({ id: column.id })
 
   return (
-    <div className="flex min-w-0 flex-1 flex-col">
+    <div
+      className="flex min-w-0 flex-1 flex-col"
+      data-kanban-column-id={column.id}
+      style={KANBAN_COLUMN_SNAP_STYLE}
+    >
       <div className="flex items-center gap-2 px-0.5 pb-2">
         {/* Colored header pill carries the column identity; the count rides along
             in a translucent chip. The trailing space is a reserved WIP slot. */}
@@ -110,6 +115,7 @@ export function KanbanColumn({
 
       <div
         ref={setNodeRef}
+        data-kanban-column-scroll={column.id}
         className="flex flex-1 flex-col gap-2 overflow-y-auto rounded-lg p-2 transition-shadow"
         style={{
           backgroundColor: color?.tint,
