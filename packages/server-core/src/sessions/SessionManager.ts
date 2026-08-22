@@ -1166,8 +1166,13 @@ const DEFAULT_TOKEN_USAGE = {
  * Uses pickSessionFields() for persistent fields so new fields propagate automatically.
  */
 function managedToSession(m: ManagedSession, overrides?: Partial<Session>): Session {
+  const permissionDiagnostics = getPermissionModeDiagnostics(m.id)
   return {
     ...pickSessionFields(m),
+    // The list summary is authoritative for first render; clients no longer need
+    // one permission-state RPC per session to learn the current mode version.
+    permissionMode: permissionDiagnostics.permissionMode,
+    permissionModeVersion: permissionDiagnostics.modeVersion,
     // Pre-computed fields from header (not in SESSION_PERSISTENT_FIELDS)
     preview: m.preview,
     lastMessageRole: m.lastMessageRole,
@@ -3162,7 +3167,12 @@ export class SessionManager implements ISessionManager {
    * path, which assembles a ManagedSession by hand). The renderer handler is idempotent.
    */
   notifySessionCreated(workspaceId: string, sessionId: string): void {
-    this.sendEvent({ type: 'session_created', sessionId }, workspaceId)
+    const managed = this.sessions.get(sessionId)
+    this.sendEvent({
+      type: 'session_created',
+      sessionId,
+      ...(managed ? { summary: managedToSession(managed) } : {}),
+    }, workspaceId)
   }
 
   /** Resolved working directory of a live session (used by the Tasks Conductor so child

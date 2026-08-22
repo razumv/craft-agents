@@ -76,6 +76,15 @@ export function createWebApi(options: WebApiOptions): {
     // No token — auth is via session cookie sent on WebSocket upgrade
   })
 
+  // Authoritative timing anchor for the hard-reload contract. This is set only
+  // after handshake_ack (cookie authentication + protocol negotiation), not at
+  // TCP/WebSocket open time.
+  client.onConnectionStateChanged((state) => {
+    if (state.status === 'connected') {
+      ;(window as any).__craftPwaWebSocketConnectedAt = performance.now()
+    }
+  })
+
   // Build the API proxy from the same channel map the Electron app uses
   const baseApi = buildClientApi(
     client,

@@ -213,6 +213,8 @@ import type {
   UpdateInfo,
   WorkspaceSettings,
   PermissionModeState,
+  SessionPageRequest,
+  SessionPageResult,
   BrowserInstanceInfo,
   DeepLinkNavigation,
   TestAutomationPayload,
@@ -226,6 +228,7 @@ import type {
 export interface ElectronAPI {
   // Session management
   getSessions(): Promise<Session[]>
+  getSessionPage(request?: SessionPageRequest): Promise<SessionPageResult>
   getUnreadSummary(): Promise<UnreadSummary>
   markAllSessionsRead(workspaceId: string): Promise<void>
   getSessionMessages(sessionId: string): Promise<Session | null>

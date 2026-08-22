@@ -4,6 +4,7 @@ import { useTheme } from '@/hooks/useTheme'
 import type { ThemeOverrides } from '@config/theme'
 import { useSetAtom, useStore, useAtomValue, useAtom } from 'jotai'
 import type { Session, Workspace, SessionEvent, Message, FileAttachment, StoredAttachment, PermissionRequest, CredentialRequest, CredentialResponse, SetupNeeds, SessionStatus, NewChatActionParams, ContentBadge, LlmConnectionWithStatus, PermissionModeState } from '../shared/types'
+import { RPC_CHANNELS } from '../shared/types'
 import type { SessionDraft, DraftAttachmentRef } from '@craft-agent/shared/config'
 import type { SessionOptions, SessionOptionUpdates } from './hooks/useSessionOptions'
 import { defaultSessionOptions, mergeSessionOptions } from './hooks/useSessionOptions'
@@ -32,6 +33,7 @@ import { stripMarkdown } from './utils/text'
 import { coerceInputText } from './lib/input-text'
 import { getSessionsToRefreshAfterStaleReconnect } from './lib/reconnect-recovery'
 import { formatSessionLoadFailure, shouldTreatSessionLoadFailureAsTransportFallback } from './lib/session-load'
+import { hydrateBoundedSessions } from './lib/session-hydration'
 import { extractWorkspaceSlugFromPath } from '@craft-agent/shared/utils/workspace-slug'
 import { DEFAULT_THINKING_LEVEL } from '@craft-agent/shared/agent/thinking-levels'
 import { initRendererPerf } from './lib/perf'
@@ -331,7 +333,7 @@ export default function App() {
   const { initialSessionId, isFocusedMode } = useMemo(() => {
     const params = new URLSearchParams(window.location.search)
     return {
-      initialSessionId: params.get('sessionId'),
+      initialSessionId: params.get('sessionId') ?? params.get('session'),
       isFocusedMode: params.get('focused') === 'true',
     }
   }, [])
@@ -480,6 +482,7 @@ export default function App() {
         ...current,
         permissionMode: session.permissionMode ?? defaultSessionOptions.permissionMode,
         thinkingLevel: session.thinkingLevel ?? DEFAULT_THINKING_LEVEL,
+        permissionModeVersion: session.permissionModeVersion ?? current?.permissionModeVersion,
       }
 
       const hasNonDefaultMode = merged.permissionMode !== defaultSessionOptions.permissionMode
@@ -509,7 +512,11 @@ export default function App() {
       clearStreamingState(sessionId)
       replaceLoadedSession(nextSession)
       syncSessionOptionsFromSession(nextSession)
-      void reconcilePermissionModeState(sessionId)
+      // New summaries/full-session payloads carry authoritative mode + version.
+      // Reconcile only against older servers that do not yet provide the version.
+      if (nextSession.permissionModeVersion == null) {
+        void reconcilePermissionModeState(sessionId)
+      }
       return preservedStaleMessages ? 'preserved_stale_messages' : 'refreshed'
     } catch (err) {
       console.error(`[App] Failed to refresh session ${sessionId}:`, err)
@@ -520,38 +527,89 @@ export default function App() {
   const loadSessionsFromServer = useCallback(async () => {
     setSessionLoadError(null)
 
-    try {
-      const loadedSessions = await window.electronAPI.getSessions()
-
-      // Initialize per-session atoms and metadata map
-      // NOTE: No sessionsAtom used - sessions are only in per-session atoms
-      initializeSessions(loadedSessions)
-
-      // Initialize unified sessionOptions from session data
+    const optionsFromSummaries = (sessions: Session[]) => {
       const optionsMap = new Map<string, SessionOptions>()
-      for (const s of loadedSessions) {
-        const hasNonDefaultMode = s.permissionMode && s.permissionMode !== 'ask'
-        const hasNonDefaultThinking = s.thinkingLevel && s.thinkingLevel !== DEFAULT_THINKING_LEVEL
-        if (hasNonDefaultMode || hasNonDefaultThinking) {
-          optionsMap.set(s.id, {
-            permissionMode: s.permissionMode ?? 'ask',
-            thinkingLevel: s.thinkingLevel ?? DEFAULT_THINKING_LEVEL,
+      for (const session of sessions) {
+        const hasNonDefaultMode = session.permissionMode && session.permissionMode !== 'ask'
+        const hasNonDefaultThinking = session.thinkingLevel && session.thinkingLevel !== DEFAULT_THINKING_LEVEL
+        if (hasNonDefaultMode || hasNonDefaultThinking || session.permissionModeVersion != null) {
+          optionsMap.set(session.id, {
+            permissionMode: session.permissionMode ?? 'ask',
+            thinkingLevel: session.thinkingLevel ?? DEFAULT_THINKING_LEVEL,
+            permissionModeVersion: session.permissionModeVersion,
           })
         }
       }
-      setSessionOptions(optionsMap)
+      return optionsMap
+    }
 
+    try {
+      const runtime = await window.electronAPI.getRuntimeEnvironment()
+      const canPage = runtime === 'web' && window.electronAPI.isChannelAvailable(RPC_CHANNELS.sessions.GET_PAGE)
+
+      if (canPage) {
+        let initialSettled = false
+        let resolveInitial!: () => void
+        let rejectInitial!: (error: unknown) => void
+        const initialReady = new Promise<void>((resolve, reject) => {
+          resolveInitial = resolve
+          rejectInitial = reject
+        })
+
+        void hydrateBoundedSessions({
+          connectedAt: (window as any).__craftPwaWebSocketConnectedAt,
+          requestedSessionId: initialSessionId ?? undefined,
+          getPage: request => window.electronAPI.getSessionPage(request),
+          onInitial: sessions => {
+            initializeSessions(sessions)
+            setSessionOptions(optionsFromSummaries(sessions))
+            setSessionsLoaded(true)
+            if (initialSessionId && sessions.some(session => session.id === initialSessionId)) {
+              navigate(routes.view.allSessions(initialSessionId))
+            }
+            initialSettled = true
+            resolveInitial()
+          },
+          onProgress: sessions => {
+            const loadedSessionIds = store.get(loadedSessionsAtom)
+            store.set(refreshSessionsMetadataAtom, { sessions, loadedSessionIds, removeMissing: false })
+            for (const session of sessions) syncSessionOptionsFromSession(session)
+          },
+          onComplete: (sessions, metrics) => {
+            const loadedSessionIds = store.get(loadedSessionsAtom)
+            store.set(refreshSessionsMetadataAtom, { sessions, loadedSessionIds, removeMissing: true })
+            for (const session of sessions) syncSessionOptionsFromSession(session)
+            rendererLog.info('[PWAHydration] complete', metrics)
+            window.dispatchEvent(new CustomEvent('craft:pwa-hydration-metrics', { detail: metrics }))
+          },
+          onRetryablePartial: reason => {
+            rendererLog.warn('[PWAHydration] retryable partial enumeration', { reason })
+          },
+        }).catch(error => {
+          rendererLog.error('[PWAHydration] background enumeration failed', { error })
+          if (!initialSettled) rejectInitial(error)
+        })
+
+        // Splash/interactivity waits only for the bounded first page, never for
+        // background enumeration or per-session permission reconciliation.
+        await initialReady
+        return
+      }
+
+      // Backward-compatible path for desktop and servers predating GET_PAGE.
+      const loadedSessions = await window.electronAPI.getSessions()
+      initializeSessions(loadedSessions)
+      setSessionOptions(optionsFromSummaries(loadedSessions))
       await Promise.allSettled(
-        loadedSessions.map((s) => reconcilePermissionModeState(s.id))
+        loadedSessions
+          .filter(session => session.permissionModeVersion == null)
+          .map(session => reconcilePermissionModeState(session.id))
       )
-
       setSessionsLoaded(true)
 
       if (initialSessionId && windowWorkspaceId) {
         const session = loadedSessions.find(s => s.id === initialSessionId)
-        if (session) {
-          navigate(routes.view.allSessions(session.id))
-        }
+        if (session) navigate(routes.view.allSessions(session.id))
       }
     } catch (err) {
       console.error('[App] Failed to load sessions:', err)
@@ -567,7 +625,7 @@ export default function App() {
       setSessionLoadError(formatSessionLoadFailure(err))
       setSessionsLoaded(true)
     }
-  }, [initializeSessions, initialSessionId, reconcilePermissionModeState, windowWorkspaceId])
+  }, [initializeSessions, initialSessionId, reconcilePermissionModeState, store, syncSessionOptionsFromSession, windowWorkspaceId])
 
   const refreshSessionListMetadataFromServer = useCallback(async (options: SessionListRefreshOptions = {}): Promise<Map<string, SessionMeta> | null> => {
     const {
@@ -580,7 +638,32 @@ export default function App() {
     const transportState = await window.electronAPI.getTransportConnectionState().catch(() => null)
 
     try {
-      const sessions = await window.electronAPI.getSessions()
+      const runtime = await window.electronAPI.getRuntimeEnvironment()
+      const canPage = runtime === 'web' && window.electronAPI.isChannelAvailable(RPC_CHANNELS.sessions.GET_PAGE)
+      let sessions: Session[]
+
+      if (canPage) {
+        let reconciled: Session[] | null = null
+        await hydrateBoundedSessions({
+          connectedAt: (window as any).__craftPwaWebSocketConnectedAt,
+          requestedSessionId: selectedSessionId ?? undefined,
+          getPage: request => window.electronAPI.getSessionPage(request),
+          onInitial: () => {},
+          onProgress: () => {},
+          onComplete: (completeSessions, metrics) => {
+            reconciled = completeSessions
+            rendererLog.info('[PWAHydration] reconnect reconciliation complete', metrics)
+          },
+          onRetryablePartial: partialReason => {
+            rendererLog.warn('[PWAHydration] reconnect reconciliation retryable partial', { partialReason })
+          },
+        })
+        if (!reconciled) throw new Error('Paginated session reconciliation did not complete')
+        sessions = reconciled
+      } else {
+        sessions = await window.electronAPI.getSessions()
+      }
+
       const returnedIds = new Set(sessions.map(s => s.id))
       const missingIds = Array.from(beforeIds).filter(id => !returnedIds.has(id))
       const addedIds = sessions.map(s => s.id).filter(id => !beforeIds.has(id))
@@ -617,7 +700,11 @@ export default function App() {
       for (const session of sessions) {
         syncSessionOptionsFromSession(session)
       }
-      await Promise.allSettled(sessions.map(s => reconcilePermissionModeState(s.id)))
+      await Promise.allSettled(
+        sessions
+          .filter(session => session.permissionModeVersion == null)
+          .map(session => reconcilePermissionModeState(session.id))
+      )
 
       return nextMetaMap
     } catch (err) {
@@ -941,19 +1028,25 @@ export default function App() {
 
       // Session lifecycle events are handled explicitly (not by the agent event processor).
       if (event.type === 'session_created') {
-        window.electronAPI.getSessionMessages(sessionId)
-          .then((createdSession: Session | null) => {
-            if (createdSession) {
-              const existingMeta = store.get(sessionMetaMapAtom).has(sessionId)
-              if (existingMeta) {
-                replaceLoadedSession(createdSession)
-              } else {
-                addSession(createdSession)
-              }
-              syncSessionOptionsFromSession(createdSession)
-              return
-            }
-            return window.electronAPI.getSessions().then(initializeSessions)
+        if (event.summary) {
+          // A pushed summary is metadata-only: upsert it without marking the
+          // transcript loaded. Opening it remains the sole history fetch.
+          const loadedSessionIds = store.get(loadedSessionsAtom)
+          store.set(refreshSessionsMetadataAtom, {
+            sessions: [event.summary],
+            loadedSessionIds,
+            removeMissing: false,
+          })
+          syncSessionOptionsFromSession(event.summary)
+          return
+        }
+
+        // Backward compatibility with older servers whose lifecycle event only
+        // carried an id. Their unpaginated refresh is metadata-only as well.
+        window.electronAPI.getSessions()
+          .then(sessions => {
+            const loadedSessionIds = store.get(loadedSessionsAtom)
+            store.set(refreshSessionsMetadataAtom, { sessions, loadedSessionIds, removeMissing: false })
           })
           .catch((error: unknown) => console.error('Failed to handle session_created event:', error))
         return
@@ -1101,7 +1194,9 @@ export default function App() {
       console.warn('[App] Stale reconnect — refreshing session metadata and active/processing sessions')
 
       const refreshedMetaMap = await refreshSessionListMetadataFromServer({
-        removeMissing: false,
+        // Stable-cursor enumeration is authoritative only after a complete
+        // unchanged snapshot, so exact removal is safe here.
+        removeMissing: true,
         reason: 'stale-reconnect',
         selectedSessionId: sessionSelection.selected,
       })
