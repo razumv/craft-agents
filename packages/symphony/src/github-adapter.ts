@@ -16,6 +16,8 @@ import {
   type WorkflowConfig,
 } from "./domain";
 import { parseIssueContract } from "./contract";
+import { applyDeadlineSuccessor, type DeadlineSuccessorApplyReport } from "./deadline-apply";
+import type { DeadlineSuccessorProposal } from "./deadline-triage";
 import {
   appliedGroomingBody,
   groomingAttributionComment,
@@ -184,6 +186,10 @@ export class GitHubIssuesProjectsAdapter implements TrackerAdapter {
       throw new Error("every lifecycle state requires an exact Project status option ID");
     }
     this.#managedLabels = new Set(labels);
+  }
+
+  async applyDeadlineSuccessor(proposal: DeadlineSuccessorProposal | null): Promise<DeadlineSuccessorApplyReport> {
+    return applyDeadlineSuccessor(proposal, this.config, this.transport);
   }
 
   async fetchIssuesByStates(states: readonly LifecycleState[]): Promise<TrackerIssueSnapshot[]> {
