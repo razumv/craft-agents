@@ -1642,6 +1642,23 @@ describe("v4.2 GitHub Issues and Projects adapter", () => {
     expect(done.evidence.mergeCommitSha).toBe("c".repeat(40));
     expect(await adapter.activeClaims()).toEqual([]);
     expect(transport.comments.get("FENCE")!.at(-1)!.body).toContain("\"operation\":\"release\"");
+
+    expect(await adapter.terminalWorktreeEvidence(claim)).toEqual({
+      accepted: true,
+      repository: "acme/repo",
+      projectId: workflow.config.project.id,
+      issueIdentifier: "acme/repo#1",
+      requiredBranch: "v4/acme-repo-1",
+      baseBranch: "main",
+      settledAtMs: 1_300,
+      branchSha: "d".repeat(40),
+      mergeCommitSha: "c".repeat(40),
+    });
+    transport.comments.set("FOREIGN_FENCE", []);
+    const foreignLane = new GitHubIssuesProjectsAdapter(
+      config("FOREIGN_FENCE", ["FENCE", "FOREIGN_FENCE"]), transport, new MemoryWorkspaceTruth(),
+    );
+    expect(await foreignLane.terminalWorktreeEvidence(claim)).toEqual({ accepted: false, reason: "foreign-or-ambiguous-lane" });
   });
 
   test("evidence advancement is idempotent and terminal once the ledger settles", async () => {

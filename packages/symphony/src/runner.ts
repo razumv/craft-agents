@@ -36,7 +36,7 @@ import { compareForDispatch, DeterministicScheduler, type Clock, type CrashPoint
 import type { FailedLifecycleDecision, TrackerBacklogIssue } from "./tracker";
 import { projectStatus } from "./status";
 import { loadWorkflow } from "./workflow";
-import { GitWorktreeAdapter } from "./workspace-adapter";
+import { GitWorktreeAdapter, type TerminalWorktreeGcReport } from "./workspace-adapter";
 import { FilesystemWorkspaceTruthReader } from "./workspace-truth";
 
 export interface LiveRunnerConfig {
@@ -146,6 +146,8 @@ export interface LiveRunnerStatus {
   backlog?: TrackerBacklogIssue[];
   /** Discovery mode only: why unmanaged backlog can or cannot yield work. */
   grooming?: GroomingReport;
+  /** Last lane-local terminal worktree retention/classification receipt. */
+  terminalWorktreeGc?: TerminalWorktreeGcReport;
 }
 
 export const WARM_RESTART_PAYLOAD_SCHEMA = "craft-agent/symphony-warm-runner@1" as const;
@@ -190,6 +192,7 @@ export class LiveV4Runner {
   #examinedGroomingCandidates = 0;
   /** False only between restoring a local checkpoint and successful live reconciliation. */
   #warmReconciled = true;
+  #terminalWorktreeGc: TerminalWorktreeGcReport | null = null;
 
   constructor(
     readonly config: LiveRunnerConfig,
@@ -327,7 +330,47 @@ export class LiveV4Runner {
     // issue must consume the lane before autonomous grooming is considered.
     await this.scheduler.tick(crashAfter);
     await this.#groomIdleLaneAfterDispatch();
+    await this.#collectTerminalWorktrees();
     return this.#readStatusInScope();
+  }
+
+  async #collectTerminalWorktrees(): Promise<void> {
+    if (!this.workspaces || this.config.mode !== "discovery") return;
+    const previousReceipt = this.#terminalWorktreeGc?.lastReceipt ?? null;
+    // One fresh observation for batch classification. Only the single selected
+    // candidate pays for additional exact pre/post-removal observations.
+    this.readScope?.clear();
+    const report = await this.workspaces.collectTerminalWorktrees({
+      laneIdle: async () => (await this.tracker.activeClaims()).length === 0,
+      verify: async (binding, phase) => {
+        if (phase !== "classify") this.readScope?.clear();
+        const provider = await this.tracker.terminalWorktreeEvidence(binding);
+        if (!provider.accepted) return provider;
+        let execution: CraftExecutionSession | null;
+        try {
+          execution = await this.craft.get(binding.sessionId);
+        } catch (error) {
+          return { accepted: false as const, reason: `craft-session-readback-failed: ${error instanceof Error ? error.message : String(error)}` };
+        }
+        if (!execution) return { accepted: false as const, reason: "craft-session-readback-absent" };
+        if (execution.sessionId !== binding.sessionId || execution.issueId !== binding.issueId
+          || execution.attempt !== binding.attempt || execution.worktreePath !== binding.workspacePath) {
+          return { accepted: false as const, reason: "craft-session-binding-mismatch" };
+        }
+        if (execution.isProcessing || execution.status !== "settled") {
+          return { accepted: false as const, reason: execution.isProcessing ? "craft-session-processing" : `craft-session-${execution.status}` };
+        }
+        return { accepted: true as const, evidence: provider };
+      },
+    });
+    // `lastReceipt` intentionally means the latest successful removal, not
+    // "a removal in this scan"; keep it visible across later no-op cycles.
+    this.#terminalWorktreeGc = report.lastReceipt || !previousReceipt
+      ? report
+      : { ...report, lastReceipt: previousReceipt };
+    if (this.#terminalWorktreeGc.laneError) {
+      this.onDiagnostic(`terminal worktree GC lane-local error: ${this.#terminalWorktreeGc.laneError}`);
+    }
   }
 
   async #pollOwnerDesk(): Promise<void> {
@@ -534,7 +577,12 @@ export class LiveV4Runner {
     if (this.config.mode === "discovery") return this.readDiscoveryStatus();
     const snapshot = await this.tracker.get(this.#pinnedIssueId());
     const execution = snapshot.claim ? await this.craft.get(snapshot.claim.sessionId) : null;
-    return { snapshot, status: projectStatus(snapshot), execution };
+    return {
+      snapshot,
+      status: projectStatus(snapshot),
+      execution,
+      ...(this.#terminalWorktreeGc ? { terminalWorktreeGc: this.#terminalWorktreeGc } : {}),
+    };
   }
 
   /**
@@ -562,6 +610,7 @@ export class LiveV4Runner {
       statuses,
       backlog,
       grooming: this.#groomingReport(backlog),
+      ...(this.#terminalWorktreeGc ? { terminalWorktreeGc: this.#terminalWorktreeGc } : {}),
     };
   }
 

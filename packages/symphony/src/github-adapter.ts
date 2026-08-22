@@ -145,6 +145,8 @@ interface SharedFenceEvent {
 interface SharedFenceState {
   lease: SharedFenceEvent | null;
   acceptedCommentIds: Set<number>;
+  /** Immutable accepted history, retained so a released terminal claim can still prove its lane. */
+  acceptedEvents: Array<{ commentId: number; event: SharedFenceEvent }>;
 }
 
 interface Hydrated {
@@ -1036,6 +1038,82 @@ export class GitHubIssuesProjectsAdapter implements TrackerAdapter {
     const [snapshot] = await this.fetchIssuesByIds([issueId]);
     if (!snapshot) throw new Error(`unknown GitHub issue ${issueId}`);
     return snapshot;
+  }
+
+  /**
+   * Fresh provider/ledger proof for one historical worktree binding. This is
+   * deliberately stricter than ordinary status projection: GC may act only
+   * when the exact accepted claim event, terminal done receipt, configured
+   * repository/Project, and one historical lane-fence ledger all agree.
+   */
+  async terminalWorktreeEvidence(claim: Claim): Promise<
+    | { accepted: false; reason: string }
+    | {
+        accepted: true;
+        repository: string;
+        projectId: string;
+        issueIdentifier: string;
+        requiredBranch: string;
+        baseBranch: string;
+        settledAtMs: number;
+        branchSha: string;
+        mergeCommitSha: string;
+      }
+  > {
+    let detail: Hydrated;
+    try {
+      detail = await this.detailed(claim.issueId);
+    } catch (error) {
+      return { accepted: false, reason: `provider-readback-failed: ${errorMessage(error)}` };
+    }
+    const { snapshot } = detail;
+    if (snapshot.issue.identifier !== claim.issueIdentifier) return { accepted: false, reason: "issue-identity-mismatch" };
+    if (snapshot.contract.repository !== this.config.repository || snapshot.contract.projectId !== this.config.workflow.project.id) {
+      return { accepted: false, reason: "repository-or-project-mismatch" };
+    }
+    if (snapshot.issue.state !== "done" || snapshot.claim !== null) {
+      return { accepted: false, reason: `lifecycle-${snapshot.issue.state}` };
+    }
+    const comments = await collectPages((cursor) => this.transport.listComments(claim.issueId, cursor));
+    const accepted = parseLedgerComments(comments, claim.issueId, this.config.eventAuthorLogin)
+      .filter(({ comment }) => detail.acceptedCommentIds.has(comment.databaseId));
+    const claims = accepted.filter(({ event }) => event.operation === "claim" && event.claim && claimBindingsEqual(event.claim, claim));
+    if (claims.length !== 1) return { accepted: false, reason: "claim-ledger-binding-absent-or-ambiguous" };
+    const terminal = accepted.filter(({ event }) => event.operation === "transition" && event.to === "done").at(-1)?.event;
+    // The terminal receipt's fence binds this exact historical claim to done;
+    // an older attempt cannot inherit a later attempt's delivery.
+    if (!terminal || terminal.claim !== null || terminal.fence !== claim.fence) {
+      return { accepted: false, reason: "settled-done-receipt-absent" };
+    }
+    const branchSha = terminal.evidence.branchSha;
+    const mergeCommitSha = terminal.evidence.mergeCommitSha;
+    if (!branchSha || !mergeCommitSha || !terminal.evidence.mergedAt || !terminal.evidence.prUrl) {
+      return { accepted: false, reason: "provider-delivery-evidence-incomplete" };
+    }
+
+    const owners: string[] = [];
+    for (const fenceIssueId of this.config.configuredClaimFenceIssueIds ?? [this.config.claimFenceIssueId]) {
+      const state = await this.sharedFenceState(fenceIssueId);
+      const exact = state.acceptedEvents.filter(({ event }) => event.operation === "acquire"
+        && event.issueId === claim.issueId && event.fence === claim.fence
+        && event.atMs === claim.claimedAtMs && event.expiresAtMs === claim.expiresAtMs);
+      if (exact.length > 1) return { accepted: false, reason: "lane-fence-receipt-ambiguous" };
+      if (exact.length === 1) owners.push(fenceIssueId);
+    }
+    if (owners.length !== 1 || owners[0] !== this.config.claimFenceIssueId) {
+      return { accepted: false, reason: owners.length === 0 ? "lane-fence-receipt-absent" : "foreign-or-ambiguous-lane" };
+    }
+    return {
+      accepted: true,
+      repository: snapshot.contract.repository,
+      projectId: snapshot.contract.projectId,
+      issueIdentifier: snapshot.issue.identifier,
+      requiredBranch: snapshot.contract.requiredBranch,
+      baseBranch: snapshot.contract.baseBranch,
+      settledAtMs: terminal.atMs,
+      branchSha,
+      mergeCommitSha,
+    };
   }
 
   async tryClaim(
@@ -2142,6 +2220,7 @@ function serializeFenceEvent(event: SharedFenceEvent): string {
 function reduceSharedFence(comments: GitHubComment[], author?: string): SharedFenceState {
   let lease: SharedFenceEvent | null = null;
   const acceptedCommentIds = new Set<number>();
+  const acceptedEvents: Array<{ commentId: number; event: SharedFenceEvent }> = [];
   const sorted = [...comments].sort((a, b) => a.databaseId - b.databaseId);
   const seen = new Set<number>();
   for (const comment of sorted) {
@@ -2164,12 +2243,14 @@ function reduceSharedFence(comments: GitHubComment[], author?: string): SharedFe
       if (lease && event.atMs < lease.expiresAtMs) continue;
       lease = event;
       acceptedCommentIds.add(comment.databaseId);
+      acceptedEvents.push({ commentId: comment.databaseId, event });
     } else if (lease?.issueId === event.issueId && lease.fence === event.fence) {
       acceptedCommentIds.add(comment.databaseId);
+      acceptedEvents.push({ commentId: comment.databaseId, event });
       lease = event.operation === "release" ? null : event;
     }
   }
-  return { lease, acceptedCommentIds };
+  return { lease, acceptedCommentIds, acceptedEvents };
 }
 
 function validateFenceShape(value: unknown): SharedFenceEvent {

@@ -150,6 +150,11 @@ export async function loadSymphonyServerConfig(path: string): Promise<SymphonySe
   return parseSymphonyServerConfig(JSON.parse(await readFile(path, 'utf8')))
 }
 
+function terminalWorktreeGc(snapshot: unknown): unknown | null {
+  if (!snapshot || typeof snapshot !== 'object' || Array.isArray(snapshot)) return null
+  return (snapshot as { terminalWorktreeGc?: unknown }).terminalWorktreeGc ?? null
+}
+
 export class NativeSymphonyService implements SymphonyServiceControl {
   /**
    * Delay before retrying projects that failed to reconstruct. Long enough not
@@ -207,6 +212,7 @@ export class NativeSymphonyService implements SymphonyServiceControl {
           reconciling: true,
           cacheError: null,
           snapshot: null,
+          terminalWorktreeGc: null,
           ownerSessionId: null,
           craftProjectId: null,
           mode: 'issue',
@@ -261,6 +267,7 @@ export class NativeSymphonyService implements SymphonyServiceControl {
         runtime.status = {
           ...runtime.status,
           snapshot: cached.cache.board,
+          terminalWorktreeGc: terminalWorktreeGc(cached.cache.board),
           freshness: 'stale',
           reconciling: true,
           cacheError: null,
@@ -370,6 +377,7 @@ export class NativeSymphonyService implements SymphonyServiceControl {
           reconciling: false,
           cacheError: observed.cacheError,
           snapshot: observed.snapshot,
+          terminalWorktreeGc: terminalWorktreeGc(observed.snapshot),
         }
         reconstructed += 1
       } catch (error) {
@@ -467,6 +475,7 @@ export class NativeSymphonyService implements SymphonyServiceControl {
           reconciling: false,
           cacheError: reconstructedRuntime.cacheError,
           snapshot: reconstructedRuntime.snapshot,
+          terminalWorktreeGc: terminalWorktreeGc(reconstructedRuntime.snapshot),
           ownerSessionId: runnerConfig.craft?.ownerSessionId ?? null,
           craftProjectId: runnerConfig.craft?.projectId ?? null,
           mode: runnerConfig.mode === 'discovery' ? 'discovery' : 'issue',
@@ -701,7 +710,7 @@ export class NativeSymphonyService implements SymphonyServiceControl {
           lastError: null,
           freshness: 'live',
           reconciling: false,
-          ...(updatesSnapshot ? { snapshot: result } : {}),
+          ...(updatesSnapshot ? { snapshot: result, terminalWorktreeGc: terminalWorktreeGc(result) } : {}),
         }
         if (updatesSnapshot) void this.#pushDecisionsNeeded(projectId, result)
         this.#notify(projectId, operation)
