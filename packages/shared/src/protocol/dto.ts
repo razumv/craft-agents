@@ -56,6 +56,8 @@ export interface Session {
   isFlagged?: boolean
   /** Permission mode for this session ('safe', 'ask', 'allow-all') */
   permissionMode?: PermissionMode
+  /** Monotonic version of the authoritative permission mode carried with summaries. */
+  permissionModeVersion?: number
   sessionStatus?: SessionStatus
   /** Labels (additive tags, many-per-session — bare IDs or "id::value" entries) */
   labels?: string[]
@@ -357,6 +359,43 @@ export interface TaskResultsDto {
   nodes: TaskResultNodeDto[]
 }
 
+export interface SessionPageRequest {
+  /** Opaque stable cursor from the preceding page. Omit for the initial page. */
+  cursor?: string
+  /** Newest summaries per page. Clamped by the server to at most 100. */
+  limit?: number
+  /** Session that a hard-reload URL intends to open, pinned into the first page when authorized. */
+  requestedSessionId?: string
+}
+
+export type SessionPagePartialReason =
+  | 'malformed-cursor'
+  | 'stale-cursor'
+  | 'workspace-changed'
+  | 'interrupted-page'
+
+export interface SessionPageMetrics {
+  serverDurationMs: number
+  responseBytes?: number
+}
+
+export type SessionPageResult =
+  | {
+      state: 'partial' | 'complete'
+      sessions: Session[]
+      total: number
+      snapshotVersion: string
+      cursor?: string
+      metrics: SessionPageMetrics
+    }
+  | {
+      state: 'retryable-partial'
+      reason: SessionPagePartialReason
+      sessions: Session[]
+      total: number
+      metrics: SessionPageMetrics
+    }
+
 export interface PermissionModeState {
   permissionMode: PermissionMode
   previousPermissionMode?: PermissionMode
@@ -410,7 +449,7 @@ export type SessionEvent =
   | { type: 'session_status_changed'; sessionId: string; sessionStatus: SessionStatus }
   | { type: 'session_metadata_changed'; sessionId: string; changes: Partial<Pick<Session, 'taskNodeCount' | 'kanbanColumn' | 'taskDraft' | 'taskSlug' | 'projectId'>> }
   | { type: 'session_deleted'; sessionId: string }
-  | { type: 'session_created'; sessionId: string }
+  | { type: 'session_created'; sessionId: string; summary?: Session }
   | { type: 'session_shared'; sessionId: string; sharedUrl: string }
   | { type: 'session_unshared'; sessionId: string }
   | { type: 'auth_request'; sessionId: string; message: Message; request: SharedAuthRequest }

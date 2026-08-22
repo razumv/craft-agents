@@ -1,6 +1,6 @@
 import { readFile, writeFile, stat } from 'fs/promises'
 import { join } from 'path'
-import { RPC_CHANNELS, type FileAttachment, type SendMessageOptions, type SessionEvent } from '@craft-agent/shared/protocol'
+import { RPC_CHANNELS, type FileAttachment, type SendMessageOptions, type SessionEvent, type SessionPageRequest } from '@craft-agent/shared/protocol'
 import type { StoredAttachment } from '@craft-agent/core/types'
 import { getWorkspaceByNameOrId } from '@craft-agent/shared/config'
 import { perf } from '@craft-agent/shared/utils'
@@ -10,6 +10,7 @@ const VALID_THINKING_LEVELS_LIST = THINKING_LEVEL_IDS.map(id => `'${id}'`).join(
 import { pushTyped, type RpcServer } from '@craft-agent/server-core/transport'
 import type { HandlerDeps } from '../handler-deps'
 import { setTransferableHandler } from './transfer'
+import { buildSessionPage } from '../../sessions/session-pagination'
 
 interface ClientSessionWatchState {
   watcher: import('fs').FSWatcher
@@ -103,6 +104,7 @@ async function scanSessionDirectory(dirPath: string): Promise<import('@craft-age
 
 export const HANDLED_CHANNELS = [
   RPC_CHANNELS.sessions.GET,
+  RPC_CHANNELS.sessions.GET_PAGE,
   RPC_CHANNELS.sessions.GET_UNREAD_SUMMARY,
   RPC_CHANNELS.sessions.MARK_ALL_READ,
   RPC_CHANNELS.sessions.CREATE,
@@ -160,6 +162,37 @@ export function registerSessionsHandlers(server: RpcServer, deps: HandlerDeps): 
     })
 
     return sessions
+  })
+
+  // Bounded PWA hydration path. The legacy GET channel above intentionally
+  // remains unchanged for older desktop/web clients during the transition.
+  server.handle(RPC_CHANNELS.sessions.GET_PAGE, async (ctx, request?: SessionPageRequest) => {
+    try {
+      await sessionManager.waitForInit()
+    } catch (error) {
+      log.error('GET_SESSION_PAGE continuing after initialization failure:', error)
+    }
+
+    const windowWorkspaceId = ctx.webContentsId != null
+      ? deps.windowManager?.getWorkspaceForWindow(ctx.webContentsId)
+      : undefined
+    const workspaceId = ctx.workspaceId ?? windowWorkspaceId
+    // A workspace-less remote request is authorized for no session membership;
+    // never fall back to the manager's all-workspaces list on this endpoint.
+    const sessions = workspaceId ? sessionManager.getSessions(workspaceId) : []
+    const result = buildSessionPage(sessions, workspaceId ?? '(none)', request)
+
+    log.info('[sessions:getPage] result', {
+      workspaceId,
+      state: result.state,
+      returnedCount: result.sessions.length,
+      total: result.total,
+      cursor: 'cursor' in result ? Boolean(result.cursor) : false,
+      reason: result.state === 'retryable-partial' ? result.reason : undefined,
+      metrics: result.metrics,
+    })
+
+    return result
   })
 
   // Get unread summary across all workspaces
