@@ -154,6 +154,70 @@ describe("v4 live runner mutation scope", () => {
     expect(() => scoped.updateProjectText("OTHER", "ITEM_52", "GATE", "x")).toThrow("escaped");
   });
 
+  test("binds warm evidence to exact repository, Project, workflow and lifecycle mapping and blocks every write while stale", async () => {
+    let schedulerTicks = 0;
+    let restores = 0;
+    const provider = {
+      schema: "craft-agent/symphony-github-observation@1" as const,
+      repository: "acme/repo",
+      projectId: "PROJECT",
+      watermark: "2026-08-22T08:00:00Z",
+      records: [],
+      backlog: [],
+    };
+    const tracker = {
+      exportWarmObservation: () => structuredClone(provider),
+      restoreWarmObservation: () => { restores += 1; },
+    } as unknown as GitHubIssuesProjectsAdapter;
+    const config = {
+      mode: "discovery",
+      github: {
+        repository: "acme/repo",
+        projectId: "PROJECT",
+        statusFieldId: "STATUS",
+        gateFieldId: "GATE",
+        requiredLabels: ["v4"],
+        states: { ready: { label: "agent-ready", projectStatusOptionId: "todo" } },
+      },
+      craft: { cli: { cliPath: "/bin/craft", serverUrl: "https://craft.test", serverToken: "must-not-persist", rpcDeadlineMs: 1, expected: {} } },
+    } as unknown as LiveRunnerConfig;
+    const workflow = { version: "4.1", project: { repository: "acme/repo" }, scheduler: { wipLimit: 1 } } as unknown as WorkflowConfig;
+    const runner = new LiveV4Runner(
+      config,
+      workflow,
+      tracker,
+      {} as CraftMobileControlPlaneAdapter,
+      {} as CraftCliRpcTransport,
+      { tick: async () => { schedulerTicks += 1; } } as unknown as DeterministicScheduler,
+    );
+    const payload = runner.exportWarmRestart();
+
+    for (const mismatch of [
+      { ...payload.binding, repository: "other/repo" },
+      { ...payload.binding, projectId: "OTHER" },
+      { ...payload.binding, configHash: "0".repeat(64) },
+      { ...payload.binding, workflowHash: "0".repeat(64) },
+      { ...payload.binding, lifecycleHash: "0".repeat(64) },
+    ]) {
+      expect(() => runner.restoreWarmRestart({ ...payload, binding: mismatch })).toThrow("binding mismatch");
+    }
+    expect(() => runner.restoreWarmRestart({ ...payload, providerWatermark: "2026-08-22T09:00:00Z" })).toThrow("watermark mismatch");
+    expect(JSON.stringify(payload)).not.toContain("must-not-persist");
+    expect(restores).toBe(0);
+
+    runner.restoreWarmRestart(payload);
+    expect(restores).toBe(1);
+    await expect(runner.tick()).rejects.toThrow("stale and reconciling");
+    await expect(runner.createContractIssue({} as never)).rejects.toThrow("stale and reconciling");
+    await expect(runner.prepareCiRepair("I_1", null)).rejects.toThrow("stale and reconciling");
+    await expect(runner.applyGrooming({} as never)).rejects.toThrow("stale and reconciling");
+    await expect(runner.applyDeadlineSuccessor(null)).rejects.toThrow("stale and reconciling");
+    await expect(runner.project()).rejects.toThrow("stale and reconciling");
+    await expect(runner.transitionToPrOpen()).rejects.toThrow("stale and reconciling");
+    await expect(runner.archiveExecution()).rejects.toThrow("stale and reconciling");
+    expect(schedulerTicks).toBe(0);
+  });
+
   test("refuses PR transition without exact true-settled Craft readback", async () => {
     for (const status of ["running", "ended-without-response", "turn-deadline", "context-deadline"] as const) {
       const { runner, transitionCount } = transitionFixture(status);

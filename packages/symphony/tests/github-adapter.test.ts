@@ -38,7 +38,9 @@ beforeAll(async () => {
 
 class MemoryWorkspaceTruth implements WorkspaceTruthReader {
   readonly values = new Map<string, WorkspaceTruth>();
+  inspectCalls = 0;
   async inspect(claim: Claim): Promise<WorkspaceTruth> {
+    this.inspectCalls += 1;
     return structuredClone(this.values.get(claim.fence) ?? { kind: "absent" });
   }
 }
@@ -502,6 +504,94 @@ describe("v4.2 GitHub Issues and Projects adapter", () => {
 
     expect(await adapter.fetchIssuesByStates(["ready"])).toHaveLength(2);
     expect(transport.issueBounds).toEqual([providerWatermark]);
+  });
+
+  test("a warm checkpoint resumes since-watermark discovery and exact-refreshes cached targets without persisting bodies", async () => {
+    const { transport, adapter } = setup();
+    transport.honorUpdatedSince = true;
+    const managed = transport.addIssue(1);
+    const backlog = transport.addIssue(2);
+    managed.labelNames = ["v4", "state:ready"];
+    backlog.labelNames = ["bug"];
+    transport.labels.set(backlog.id, ["bug"]);
+
+    const beforeManaged = await adapter.fetchIssuesByStates(["ready"]);
+    const beforeBacklog = await adapter.fetchBacklog();
+    const checkpoint = adapter.exportWarmObservation();
+
+    expect(checkpoint.watermark).toBe(backlog.updatedAt);
+    expect(checkpoint.records.every((record) => !Object.hasOwn(record, "body"))).toBeTrue();
+    expect(checkpoint.backlog.every((issue) => !Object.hasOwn(issue, "description"))).toBeTrue();
+    expect(JSON.stringify(checkpoint)).not.toContain("Exercise the GitHub adapter deterministically");
+
+    const restarted = new GitHubIssuesProjectsAdapter(config(), transport, new MemoryWorkspaceTruth());
+    restarted.restoreWarmObservation(checkpoint);
+    transport.calls.clear();
+    transport.issueBounds.length = 0;
+
+    const afterManaged = await restarted.fetchIssuesByStates(["ready"]);
+    const afterBacklog = await restarted.fetchBacklog();
+
+    expect(afterManaged).toEqual(beforeManaged);
+    expect(afterBacklog).toEqual(beforeBacklog);
+    expect(transport.issueBounds.length).toBeGreaterThan(0);
+    expect(transport.issueBounds.every((bound) => bound === checkpoint.watermark)).toBeTrue();
+    expect(transport.issueBounds).not.toContain(null);
+    // One batched node refresh replaces a repository-wide cold listing and
+    // restores every redacted body before the adapter can return live state.
+    expect(transport.calls.get("issue-nodes")).toBeGreaterThan(0);
+
+    expect(() => restarted.restoreWarmObservation({ ...checkpoint, repository: "other/repo" })).toThrow("repository mismatch");
+    expect(() => restarted.restoreWarmObservation({ ...checkpoint, records: [{ ...checkpoint.records[0], body: "raw" }] })).toThrow("issue body");
+    expect(() => restarted.restoreWarmObservation({
+      ...checkpoint,
+      backlog: [{ ...checkpoint.backlog[0], blockedBy: [{ id: "bad", state: "OPEN" }] }],
+    })).toThrow("malformed");
+  });
+
+  test("provider changes reconcile exactly from a restored watermark", async () => {
+    const { transport, adapter } = setup();
+    transport.honorUpdatedSince = true;
+    const issue = transport.addIssue(1);
+    issue.labelNames = ["v4", "state:ready"];
+    await adapter.fetchIssuesByStates(["ready"]);
+    const checkpoint = adapter.exportWarmObservation();
+
+    issue.title = "Changed provider title";
+    issue.updatedAt = "2026-08-22T08:00:00Z";
+    const restarted = new GitHubIssuesProjectsAdapter(config(), transport, new MemoryWorkspaceTruth());
+    restarted.restoreWarmObservation(checkpoint);
+
+    const [changed] = await restarted.fetchIssuesByStates(["ready"]);
+    expect(changed?.issue.title).toBe("Changed provider title");
+    expect(transport.issueBounds.at(-1)).toBe(checkpoint.watermark);
+  });
+
+  test("warm promotion re-reads active provider and worktree truth without writing lifecycle state", async () => {
+    const { transport, adapter } = setup();
+    transport.honorUpdatedSince = true;
+    transport.addIssue(1);
+    const ready = await adapter.get("I_1");
+    const claim = await proposedClaim(adapter, "I_1");
+    await adapter.tryClaim("I_1", ready.version, claim, 1_000);
+    await adapter.markRunning(claim.fence, 1_100);
+    const checkpoint = adapter.exportWarmObservation();
+
+    const truth = new MemoryWorkspaceTruth();
+    truth.values.set(claim.fence, { kind: "bound", binding: claim });
+    const restarted = new GitHubIssuesProjectsAdapter(config(), transport, truth);
+    restarted.restoreWarmObservation(checkpoint);
+    transport.calls.clear();
+    const [live] = await restarted.fetchIssuesByStates(["running"]);
+    await restarted.verifyWarmMutationTruth();
+
+    expect(live?.claim?.fence).toBe(claim.fence);
+    expect(transport.calls.get("issue-nodes")).toBeGreaterThan(0);
+    expect(truth.inspectCalls).toBe(1);
+    expect(live?.version).toBe((await adapter.get("I_1")).version);
+
+    truth.values.set(claim.fence, { kind: "ambiguous", reason: "dirty/unpushed" });
+    await expect(restarted.verifyWarmMutationTruth()).rejects.toThrow("ambiguous");
   });
 
   test("an active claim is node-refreshed when PR checks change without touching the issue", async () => {

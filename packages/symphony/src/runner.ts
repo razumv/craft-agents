@@ -148,6 +148,24 @@ export interface LiveRunnerStatus {
   grooming?: GroomingReport;
 }
 
+export const WARM_RESTART_PAYLOAD_SCHEMA = "craft-agent/symphony-warm-runner@1" as const;
+
+export interface WarmRestartBinding {
+  repository: string;
+  projectId: string;
+  /** Complete non-secret LiveRunnerConfig binding (credentials are excluded). */
+  configHash: string;
+  workflowHash: string;
+  lifecycleHash: string;
+}
+
+export interface WarmRestartPayload {
+  schema: typeof WARM_RESTART_PAYLOAD_SCHEMA;
+  binding: WarmRestartBinding;
+  providerWatermark: string | null;
+  provider: ReturnType<GitHubIssuesProjectsAdapter["exportWarmObservation"]>;
+}
+
 export const SHADOW_RECEIPT_SCHEMA = "craft-agent/symphony-shadow@1" as const;
 
 export interface LiveShadowReceipt {
@@ -170,6 +188,8 @@ export class LiveV4Runner {
   /** Refusals are revision-scoped: the same issue is reconsidered only after GitHub reports it changed. */
   readonly #groomingRefusals = new Map<string, GroomingRefusalRecord & { revision: string }>();
   #examinedGroomingCandidates = 0;
+  /** False only between restoring a local checkpoint and successful live reconciliation. */
+  #warmReconciled = true;
 
   constructor(
     readonly config: LiveRunnerConfig,
@@ -196,6 +216,61 @@ export class LiveV4Runner {
    */
   #beginOperation(): void {
     this.readScope?.clear();
+  }
+
+  warmRestartBinding(): WarmRestartBinding {
+    const { serverToken: _credential, ...cli } = this.config.craft.cli;
+    const nonSecretConfig = { ...this.config, craft: { ...this.config.craft, cli } };
+    return {
+      repository: this.config.github.repository,
+      projectId: this.config.github.projectId,
+      configHash: createHash("sha256").update(canonicalJson(nonSecretConfig)).digest("hex"),
+      workflowHash: createHash("sha256").update(canonicalJson(this.workflow)).digest("hex"),
+      lifecycleHash: createHash("sha256").update(canonicalJson({
+        statusFieldId: this.config.github.statusFieldId,
+        gateFieldId: this.config.github.gateFieldId,
+        requiredLabels: this.config.github.requiredLabels,
+        states: this.config.github.states,
+      })).digest("hex"),
+    };
+  }
+
+  exportWarmRestart(): WarmRestartPayload {
+    const provider = this.tracker.exportWarmObservation();
+    return {
+      schema: WARM_RESTART_PAYLOAD_SCHEMA,
+      binding: this.warmRestartBinding(),
+      providerWatermark: provider.watermark,
+      provider,
+    };
+  }
+
+  restoreWarmRestart(value: unknown): void {
+    if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("warm runner payload must be an object");
+    const payload = value as Partial<WarmRestartPayload>;
+    if (payload.schema !== WARM_RESTART_PAYLOAD_SCHEMA) throw new Error("warm runner payload schema mismatch");
+    if (canonicalJson(payload.binding) !== canonicalJson(this.warmRestartBinding())) throw new Error("warm runner binding mismatch");
+    if (!payload.provider || payload.providerWatermark !== payload.provider.watermark) {
+      throw new Error("warm runner provider watermark mismatch");
+    }
+    this.tracker.restoreWarmObservation(payload.provider);
+    this.#warmReconciled = false;
+  }
+
+  /** The sole path that promotes restored evidence from stale to live. */
+  async reconcileWarmRestart(): Promise<LiveRunnerStatus> {
+    if (this.#warmReconciled) return this.readStatus();
+    // readStatus exact-refreshes provider nodes and the active Craft execution.
+    // Worktree truth is a separate local authority and is re-read without any
+    // lifecycle projection before the stale-write fence can open.
+    const status = await this.readStatus();
+    await this.tracker.verifyWarmMutationTruth();
+    this.#warmReconciled = true;
+    return status;
+  }
+
+  #assertWarmReconciled(operation: string): void {
+    if (!this.#warmReconciled) throw new Error(`${operation} refused while warm restart evidence is stale and reconciling`);
   }
 
   async preflight(): Promise<{
@@ -240,6 +315,7 @@ export class LiveV4Runner {
   }
 
   async tick(crashAfter?: CrashPoint): Promise<LiveRunnerStatus> {
+    this.#assertWarmReconciled("tick");
     this.#beginOperation();
     // Owner input is part of this cycle's frozen context. Poll before dispatch
     // so a directive addressed to a ready issue reaches the session created by
@@ -510,13 +586,16 @@ export class LiveV4Runner {
    * an explicit owner action, independent from scheduler mutation gating.
    */
   async createContractIssue(input: ContractIssueInput): Promise<{ id: string; number: number; url: string }> {
-    const intake = this.intake;
-    if (!intake) throw new Error("this runner has no GitHub intake transport configured");
     // A single-issue runner is pinned to one authorized issue and would never
-    // discover the new one — creating it here would orphan the work.
+    // discover the new one — creating it here would orphan the work. Keep this
+    // structural refusal ahead of the instance-private warm fence so narrow
+    // capability probes can verify it without constructing a live runner.
     if (this.config.mode !== "discovery") {
       throw new Error("issue intake requires a discovery-mode project (a pinned single-issue runner would never dispatch it)");
     }
+    this.#assertWarmReconciled("issue intake");
+    const intake = this.intake;
+    if (!intake) throw new Error("this runner has no GitHub intake transport configured");
     // Intake writes bypass the memoised transport, so nothing read before this
     // point may be reused afterwards.
     this.#beginOperation();
@@ -552,6 +631,7 @@ export class LiveV4Runner {
    * restarts therefore cannot reset the two-attempt cap.
    */
   async prepareCiRepair(issueId: string, proposal: CiRepairProposal | null): Promise<CiRepairDecision> {
+    this.#assertWarmReconciled("CI repair");
     this.#beginOperation();
     const snapshot = await this.tracker.get(issueId);
     const failure = await this.tracker.ciFailure(issueId);
@@ -585,6 +665,7 @@ export class LiveV4Runner {
 
   /** Apply only the exact proposal returned by grooming; refusals remain read-only. */
   async applyGrooming(proposal: GroomingProposal): Promise<GroomingApplyReport> {
+    this.#assertWarmReconciled("grooming write");
     this.#beginOperation();
     return this.tracker.applyGrooming(proposal);
   }
@@ -607,6 +688,7 @@ export class LiveV4Runner {
 
   /** Explicit applying half; never runs autonomously and requires discovery scope. */
   async applyDeadlineSuccessor(proposal: DeadlineSuccessorProposal | null): Promise<DeadlineSuccessorApplyReport> {
+    this.#assertWarmReconciled("deadline successor write");
     this.#beginOperation();
     if (this.config.mode !== "discovery") {
       return { outcome: "failed", writes: 0, completedSteps: [], issue: null, failedStep: "preflight", error: "deadline-successor apply requires discovery mode" };
@@ -656,6 +738,7 @@ export class LiveV4Runner {
   }
 
   async project(): Promise<{ notes: string; status: LiveRunnerStatus }> {
+    this.#assertWarmReconciled("Project Desk write");
     const status = await this.readStatus();
     if (!status.status) throw new Error("no discovered issue to project to the desk");
     const notes = await this.craft.projectToDesk({
@@ -667,6 +750,7 @@ export class LiveV4Runner {
   }
 
   async transitionToPrOpen(): Promise<LiveRunnerStatus> {
+    this.#assertWarmReconciled("lifecycle write");
     const before = await this.tracker.get(this.#pinnedIssueId());
     if (!before.claim) throw new Error("Issue has no active claim for PR transition");
     if (before.issue.state !== "running" && before.issue.state !== "pr-open") {
@@ -686,6 +770,7 @@ export class LiveV4Runner {
   }
 
   async archiveExecution(): Promise<{ rpcSessionId: string; commandResult: unknown; readback: Record<string, unknown> }> {
+    this.#assertWarmReconciled("Craft archive write");
     const status = await this.readStatus();
     if (!status.execution || status.execution.status !== "settled") {
       throw new Error("execution session must have true settled readback before archive");

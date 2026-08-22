@@ -161,13 +161,31 @@ interface CoreHydrated extends Hydrated {
   nativeBlockers: GitHubIssueLink[];
 }
 
+export const GITHUB_WARM_OBSERVATION_SCHEMA = "craft-agent/symphony-github-observation@1" as const;
+
+/**
+ * Minimal provider checkpoint for #69's incremental scan. Issue bodies and
+ * comments are deliberately absent: the first warm reconciliation refreshes
+ * every cached node before this state can authorize any operation.
+ */
+export interface GitHubWarmObservation {
+  schema: typeof GITHUB_WARM_OBSERVATION_SCHEMA;
+  repository: string;
+  projectId: string;
+  watermark: string | null;
+  records: Array<Omit<GitHubIssueRecord, "body">>;
+  backlog: Array<Omit<TrackerBacklogIssue, "description">>;
+}
+
 export class GitHubIssuesProjectsAdapter implements TrackerAdapter {
   readonly #managedLabels: Set<string>;
-  /** In-memory only: a restart deliberately pays for a complete recovery read. */
+  /** Provider watermark retained in memory and, after a verified read, in the warm checkpoint. */
   #watermark: string | null = null;
   #records = new Map<string, GitHubIssueRecord>();
   #hydrated = new Map<string, CoreHydrated>();
   #backlog = new Map<string, TrackerBacklogIssue>();
+  /** Node IDs restored without bodies; all are exact-refreshed before warm reconciliation succeeds. */
+  #warmRefreshIds: Set<string> | null = null;
   /** Serializes the shared in-memory observation used by parallel status reads. */
   #stateTail: Promise<void> = Promise.resolve();
 
@@ -198,6 +216,50 @@ export class GitHubIssuesProjectsAdapter implements TrackerAdapter {
       throw new Error("every lifecycle state requires an exact Project status option ID");
     }
     this.#managedLabels = new Set(labels);
+  }
+
+  /** Export no raw issue bodies/comments: only the inventory needed to resume #69. */
+  exportWarmObservation(): GitHubWarmObservation {
+    return {
+      schema: GITHUB_WARM_OBSERVATION_SCHEMA,
+      repository: this.config.repository,
+      projectId: this.config.projectId,
+      watermark: this.#watermark,
+      records: [...this.#records.values()].map(({ body: _body, ...record }) => structuredClone(record)),
+      backlog: [...this.#backlog.values()].map(({ description: _description, ...issue }) => structuredClone(issue)),
+    };
+  }
+
+  /**
+   * Restore inventory only. The adapter remains unable to expose hydrated
+   * lifecycle evidence until the next read exact-refreshes every cached node.
+   */
+  restoreWarmObservation(value: unknown): void {
+    const observation = parseGitHubWarmObservation(value);
+    if (observation.repository !== this.config.repository) throw new Error("warm observation repository mismatch");
+    if (observation.projectId !== this.config.projectId) throw new Error("warm observation Project mismatch");
+    this.#watermark = observation.watermark;
+    this.#records = new Map(observation.records.map((record) => [record.id, { ...structuredClone(record), body: "" }]));
+    this.#hydrated = new Map();
+    this.#backlog = new Map(observation.backlog.map((issue) => [issue.id, { ...structuredClone(issue), description: "" }]));
+    this.#warmRefreshIds = new Set(observation.records.map((record) => record.id));
+  }
+
+  /**
+   * Read-only final warm fence: provider nodes were exact-refreshed by the status
+   * read; now inspect local worktree bindings without projecting any lifecycle
+   * transition. Ordinary scheduler reconciliation remains the sole writer.
+   */
+  async verifyWarmMutationTruth(): Promise<void> {
+    for (const core of this.#hydrated.values()) {
+      const claim = core.snapshot.claim;
+      if (!claim) continue;
+      const truth = await this.workspaceTruth.inspect(claim);
+      if (truth.kind === "ambiguous") throw new Error(`warm worktree truth is ambiguous for ${core.snapshot.issue.identifier}: ${truth.reason}`);
+      if (truth.kind === "bound" && !claimBindingsEqual(claim, truth.binding)) {
+        throw new Error(`warm worktree binding mismatch for ${core.snapshot.issue.identifier}`);
+      }
+    }
   }
 
   async applyDeadlineSuccessor(proposal: DeadlineSuccessorProposal | null): Promise<DeadlineSuccessorApplyReport> {
@@ -545,8 +607,19 @@ export class GitHubIssuesProjectsAdapter implements TrackerAdapter {
         }
         candidateIds.add(record.id);
         const cached = backlog.get(record.id);
-        if (!scan.changedIds.has(record.id) && cached?.updatedAt === record.updatedAt) continue;
-        const blockedBy = await collectPages((cursor) => this.transport.listBlockedBy(record.id, cursor));
+        if (!scan.changedIds.has(record.id) && cached?.updatedAt === record.updatedAt && cached.description !== "") continue;
+        // A warm checkpoint intentionally redacts the issue body. Its exact node
+        // refresh above restores the body; existing blocker/parent facts remain
+        // reusable when the provider revision is unchanged.
+        const blockedBy = cached?.description === "" && !scan.changedIds.has(record.id)
+          ? cached.blockedBy.map((blocker) => ({
+              id: blocker.id,
+              number: Number(blocker.identifier.split("#").at(-1)),
+              title: blocker.title,
+              state: blocker.state,
+              url: blocker.url,
+            })).filter((blocker) => Number.isInteger(blocker.number))
+          : await collectPages((cursor) => this.transport.listBlockedBy(record.id, cursor));
         const relation = (issue: GitHubIssueLink) => ({
           id: issue.id,
           identifier: `${this.config.repository}#${issue.number}`,
@@ -1391,14 +1464,17 @@ export class GitHubIssuesProjectsAdapter implements TrackerAdapter {
   }> {
     const since = this.#watermark;
     const changed = await collectPages((cursor) => this.transport.listIssues(this.config.repository, cursor, since));
-    const records = since === null ? new Map<string, GitHubIssueRecord>() : new Map(this.#records);
+    const records = since === null && this.#warmRefreshIds === null
+      ? new Map<string, GitHubIssueRecord>()
+      : new Map(this.#records);
     for (const record of changed) records.set(record.id, mergeListingRecord(records.get(record.id), record));
 
     // GitHub does not touch an issue when a closing PR merges or a check turns
     // green. Node-refresh every known durable claim on every scan so that its
     // PR/check evidence is hydrated even when it falls behind the watermark.
-    const forcedIds = new Set<string>(requested);
-    if (since !== null) {
+    const warmRefreshIds = this.#warmRefreshIds;
+    const forcedIds = new Set<string>([...requested, ...(warmRefreshIds ?? [])]);
+    if (since !== null || warmRefreshIds !== null) {
       for (const [id, core] of this.#hydrated) {
         if (core.snapshot.claim) forcedIds.add(id);
       }
@@ -1414,6 +1490,10 @@ export class GitHubIssuesProjectsAdapter implements TrackerAdapter {
           records.set(id, mergeListingRecord(records.get(id), record));
         }
       }
+      // Clearing is safe after every exact node read succeeded. A later failure
+      // still leaves the on-disk checkpoint untouched, and a fresh runner can
+      // retry from it or fall back to a cold reconstruction.
+      if (warmRefreshIds !== null) this.#warmRefreshIds = null;
     }
 
     // The bound is exclusively provider evidence. No local clock participates,
@@ -1605,6 +1685,93 @@ export class GitHubIssuesProjectsAdapter implements TrackerAdapter {
     snapshot.evidence = { ...snapshot.evidence, ...providerEvidence };
     return { snapshot, providerEvidence, record, item, labels, acceptedCommentIds, projectionDrift, contract, nativeBlockers };
   }
+}
+
+function validCachedNativeLink(value: unknown): value is GitHubIssueLink {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const link = value as Record<string, unknown>;
+  return typeof link.id === "string" && Boolean(link.id)
+    && Number.isInteger(link.number) && (link.number as number) > 0
+    && typeof link.title === "string"
+    && (link.state === "OPEN" || link.state === "CLOSED")
+    && typeof link.url === "string";
+}
+
+function validCachedBacklogLink(value: unknown): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const link = value as Record<string, unknown>;
+  return typeof link.id === "string" && Boolean(link.id)
+    && typeof link.identifier === "string" && Boolean(link.identifier)
+    && (link.state === "OPEN" || link.state === "CLOSED")
+    && typeof link.title === "string"
+    && typeof link.url === "string";
+}
+
+function parseGitHubWarmObservation(value: unknown): GitHubWarmObservation {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("warm observation must be an object");
+  const raw = value as Record<string, unknown>;
+  if (raw.schema !== GITHUB_WARM_OBSERVATION_SCHEMA) throw new Error("warm observation schema mismatch");
+  if (typeof raw.repository !== "string" || !raw.repository.trim()) throw new Error("warm observation repository is invalid");
+  if (typeof raw.projectId !== "string" || !raw.projectId.trim()) throw new Error("warm observation Project is invalid");
+  if (raw.watermark !== null && (typeof raw.watermark !== "string" || !Number.isFinite(Date.parse(raw.watermark)))) {
+    throw new Error("warm observation provider watermark is invalid");
+  }
+  if (!Array.isArray(raw.records) || !Array.isArray(raw.backlog)) throw new Error("warm observation inventory is invalid");
+
+  const recordIds = new Set<string>();
+  const records = raw.records.map((value, index) => {
+    if (!value || typeof value !== "object" || Array.isArray(value) || Object.hasOwn(value, "body")) {
+      throw new Error(`warm observation record ${index} is malformed or contains an issue body`);
+    }
+    const record = structuredClone(value) as Omit<GitHubIssueRecord, "body">;
+    validateIssueRecord({ ...record, body: "" });
+    if (
+      typeof record.url !== "string"
+      || (record.state !== "OPEN" && record.state !== "CLOSED")
+      || (record.assigneeId !== null && typeof record.assigneeId !== "string")
+      || (record.labelNames !== undefined && record.labelNames !== null
+        && (!Array.isArray(record.labelNames) || record.labelNames.some((label) => typeof label !== "string")))
+      || (record.priority !== undefined && record.priority !== null && !Number.isInteger(record.priority))
+      || (record.parent !== undefined && record.parent !== null && !validCachedNativeLink(record.parent))
+    ) throw new Error(`warm observation record ${index} has malformed nested provider fields`);
+    if (recordIds.has(record.id)) throw new Error(`warm observation contains duplicate record ${record.id}`);
+    recordIds.add(record.id);
+    return record;
+  });
+
+  const backlogIds = new Set<string>();
+  const backlog = raw.backlog.map((value, index) => {
+    if (!value || typeof value !== "object" || Array.isArray(value) || Object.hasOwn(value, "description")) {
+      throw new Error(`warm observation backlog ${index} is malformed or contains issue content`);
+    }
+    const issue = structuredClone(value) as Omit<TrackerBacklogIssue, "description">;
+    if (
+      typeof issue.id !== "string" || !issue.id
+      || typeof issue.identifier !== "string" || !issue.identifier
+      || !Number.isInteger(issue.number) || issue.number < 1
+      || typeof issue.title !== "string" || !issue.title
+      || (issue.url !== null && typeof issue.url !== "string")
+      || !Array.isArray(issue.labels) || issue.labels.some((label) => typeof label !== "string")
+      || (issue.priority !== null && !Number.isInteger(issue.priority))
+      || (issue.createdAt !== null && (typeof issue.createdAt !== "string" || !Number.isFinite(Date.parse(issue.createdAt))))
+      || (issue.updatedAt !== null && (typeof issue.updatedAt !== "string" || !Number.isFinite(Date.parse(issue.updatedAt))))
+      || !Array.isArray(issue.blockedBy) || issue.blockedBy.some((link) => !validCachedBacklogLink(link))
+      || (issue.parent !== null && !validCachedBacklogLink(issue.parent))
+    ) throw new Error(`warm observation backlog ${index} is malformed`);
+    if (!recordIds.has(issue.id)) throw new Error(`warm observation backlog ${issue.id} has no provider record`);
+    if (backlogIds.has(issue.id)) throw new Error(`warm observation contains duplicate backlog ${issue.id}`);
+    backlogIds.add(issue.id);
+    return issue;
+  });
+
+  return {
+    schema: GITHUB_WARM_OBSERVATION_SCHEMA,
+    repository: raw.repository,
+    projectId: raw.projectId,
+    watermark: raw.watermark,
+    records,
+    backlog,
+  };
 }
 
 function providerWatermark(current: string | null, records: readonly GitHubIssueRecord[]): string | null {
