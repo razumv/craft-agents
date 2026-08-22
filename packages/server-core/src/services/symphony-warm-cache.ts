@@ -121,6 +121,7 @@ export function cacheSafeBoardSnapshot(value: unknown): unknown {
       }).filter(Boolean)
     : undefined
   return {
+    ...(typeof status.claimFenceIssueId === 'string' ? { claimFenceIssueId: status.claimFenceIssueId } : {}),
     snapshot: issue && typeof issue.id === 'string' ? { issue: { id: issue.id } } : null,
     status: status.status === undefined ? null : structuredClone(status.status),
     ...(Array.isArray(status.statuses) ? { statuses: structuredClone(status.statuses) } : {}),
