@@ -29,6 +29,7 @@ scheduler:
   claim_ttl_ms: 60000
   stale_run_ms: 120000
   max_attempts: 3
+  executable_acceptance_limit: 2
   max_revivals: 2
   pr_open_stuck_cycles: 3
   retry_base_ms: 1000

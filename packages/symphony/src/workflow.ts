@@ -114,6 +114,9 @@ export function parseWorkflow(content: string, workflowPath = resolve("WORKFLOW.
   const retryBaseMs = integer(scheduler.retry_base_ms, "scheduler.retry_base_ms");
   const retryMaxMs = integer(scheduler.retry_max_ms, "scheduler.retry_max_ms");
   const maxRevivals = integer(scheduler.max_revivals, "scheduler.max_revivals");
+  const executableAcceptanceLimit = scheduler.executable_acceptance_limit === undefined
+    ? 1
+    : integer(scheduler.executable_acceptance_limit, "scheduler.executable_acceptance_limit");
   const prOpenStuckCycles = scheduler.pr_open_stuck_cycles === undefined
     ? 3
     : integer(scheduler.pr_open_stuck_cycles, "scheduler.pr_open_stuck_cycles");
@@ -139,6 +142,7 @@ export function parseWorkflow(content: string, workflowPath = resolve("WORKFLOW.
       claimTtlMs: integer(scheduler.claim_ttl_ms, "scheduler.claim_ttl_ms"),
       staleRunMs: integer(scheduler.stale_run_ms, "scheduler.stale_run_ms"),
       maxAttempts: integer(scheduler.max_attempts, "scheduler.max_attempts"),
+      executableAcceptanceLimit,
       maxRevivals,
       prOpenStuckCycles,
       retryBaseMs,

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import type { OwnerDirective } from "./ledger";
+import type { PreclaimScopeApplyResult, PreclaimScopeProposal } from "./preclaim-scope";
 import type {
   Claim,
   FailureClass,
@@ -103,6 +104,10 @@ export interface TrackerAdapter {
   fetchIssuesByIds(ids: readonly string[]): Promise<TrackerIssueSnapshot[]>;
   activeClaims(): Awaitable<TrackerIssueSnapshot[]>;
   get(issueId: string): Awaitable<TrackerIssueSnapshot>;
+  /** Resume at most one durable pre-claim reservation left between provider writes. */
+  reconcilePreclaimScopes?(nowMs: number): Awaitable<PreclaimScopeApplyResult | null>;
+  /** Supersede/reserve the still-unclaimed source, then create or reuse its bounded successor. */
+  applyPreclaimScope?(proposal: Readonly<PreclaimScopeProposal>, nowMs: number): Awaitable<PreclaimScopeApplyResult>;
   tryClaim(
     issueId: string,
     expectedVersion: number,

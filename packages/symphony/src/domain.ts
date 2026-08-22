@@ -96,6 +96,8 @@ export interface WorkflowConfig {
     claimTtlMs: number;
     staleRunMs: number;
     maxAttempts: number;
+    /** Maximum acceptance criteria an authored contract may carry into a claim. */
+    executableAcceptanceLimit: number;
     /** Maximum fresh attempt budgets an owner may grant after terminal failure. */
     maxRevivals: number;
     /** Consecutive observations of one self-unchanging PR verdict before the lane parks. */

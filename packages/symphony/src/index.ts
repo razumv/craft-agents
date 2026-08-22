@@ -14,6 +14,7 @@ export * from "./grooming";
 export * from "./identity";
 export * from "./ledger";
 export * from "./policy";
+export * from "./preclaim-scope";
 export * from "./read-scope-transport";
 export * from "./runner";
 export * from "./scheduler";

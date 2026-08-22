@@ -11,6 +11,7 @@ import {
   ManualClock,
   lifecycleStates,
   loadWorkflow,
+  proposePreclaimScope,
   type Claim,
   type GitHubAdapterConfig,
   type GitHubBranchEvidence,
@@ -63,6 +64,7 @@ class MemoryGitHubTransport implements GitHubTransport {
   pageSize = 100;
   honorUpdatedSince = false;
   failNextListIssues = false;
+  failNextCreateIssue = false;
   #commentId = 1000;
 
   addIssue(number: number, state: LifecycleState = "ready", dependencies: string[] = [], risk: "low" | "medium" | "high" = "low"): GitHubIssueRecord {
@@ -156,6 +158,33 @@ class MemoryGitHubTransport implements GitHubTransport {
     this.comments.get(issueId)!.push(comment);
     await Promise.resolve();
     return structuredClone(comment);
+  }
+  async createIssue(_repository: string, title: string, body: string, _labels: readonly string[]): Promise<{ id: string; number: number; url: string }> {
+    this.hit("create-issue");
+    if (this.failNextCreateIssue) {
+      this.failNextCreateIssue = false;
+      throw new Error("simulated issue creation interruption");
+    }
+    const number = Math.max(0, ...this.issues.map((issue) => issue.number)) + 1;
+    const id = `I_${number}`;
+    const url = `https://github.test/acme/repo/issues/${number}`;
+    this.issues.push({ id, number, title, body, url, state: "OPEN", createdAt: "2026-08-18T19:10:00Z", updatedAt: "2026-08-18T19:10:00Z", assigneeId: null });
+    this.labels.set(id, []);
+    this.blockers.set(id, []);
+    this.items.set(id, []);
+    this.comments.set(id, []);
+    this.prs.set(id, []);
+    return { id, number, url };
+  }
+  async addIssueToProject(projectId: string, contentId: string): Promise<string> {
+    this.hit("add-project-item");
+    const itemId = `ITEM_${contentId}`;
+    this.items.set(contentId, [{ id: itemId, projectId }]);
+    this.fields.set(itemId, [
+      { kind: "single-select", fieldId: "STATUS", fieldName: "Status", optionId: null, value: null },
+      { kind: "text", fieldId: "GATE", fieldName: "Gate", value: null },
+    ]);
+    return itemId;
   }
   updateIssueBody(_repository: string, issueNumber: number, body: string): Promise<boolean> {
     this.hit("update-body");
@@ -308,6 +337,76 @@ function attachPr(
 }
 
 describe("v4.2 GitHub Issues and Projects adapter", () => {
+  test("creates one bounded successor and supersedes the open authored source before any claim", async () => {
+    const { transport, truth, adapter } = setup();
+    const sourceRecord = transport.addIssue(1);
+    sourceRecord.body = sourceRecord.body.replace(
+      "acceptance:\n  - exact durable transition",
+      "acceptance:\n  - exact durable transition\n  - preserve authored ordering\n  - report remaining scope verbatim",
+    );
+    const sourceBody = sourceRecord.body;
+    const source = await adapter.get(sourceRecord.id);
+    const proposal = proposePreclaimScope(source, config().workflow)!;
+
+    const first = await adapter.applyPreclaimScope(proposal, 2_000);
+    expect(first).toMatchObject({
+      outcome: "applied",
+      source: { issue: { id: sourceRecord.id, state: "cancelled", closed: false }, claim: null },
+      successor: { issue: { state: "ready", closed: false }, contract: { acceptance: ["exact durable transition", "preserve authored ordering"] } },
+    });
+    expect(first.outcome === "refused" ? null : first.source.events.map((event) => event.kind)).not.toContain("claim");
+    expect(first.outcome === "refused" ? null : first.source.events).toContainEqual(expect.objectContaining({
+      kind: "supersession",
+      successor: proposal.contract.id,
+    }));
+    expect(sourceRecord.state).toBe("OPEN");
+    expect(sourceRecord.body).toBe(sourceBody);
+    expect(transport.calls.get("create-issue")).toBe(1);
+
+    const restarted = new GitHubIssuesProjectsAdapter(config(), transport, truth);
+    expect(await restarted.reconcilePreclaimScopes(3_000)).toBeNull();
+    expect(transport.calls.get("create-issue")).toBe(1);
+    expect(transport.issues.filter((issue) => issue.body.includes(proposal.contract.id))).toHaveLength(1);
+    expect(proposal.contractMarkdown).toContain(JSON.stringify("report remaining scope verbatim"));
+  });
+
+  test("source CAS elects one concurrent creator and an interrupted reservation resumes after restart", async () => {
+    const concurrent = setup();
+    const sourceRecord = concurrent.transport.addIssue(1);
+    sourceRecord.body = sourceRecord.body.replace(
+      "acceptance:\n  - exact durable transition",
+      "acceptance:\n  - exact durable transition\n  - preserve authored ordering\n  - report remaining scope verbatim",
+    );
+    const proposal = proposePreclaimScope(await concurrent.adapter.get(sourceRecord.id), config().workflow)!;
+    const [left, right] = await Promise.all([
+      concurrent.adapter.applyPreclaimScope(proposal, 2_000),
+      concurrent.adapter.applyPreclaimScope(proposal, 2_000),
+    ]);
+    expect([left.outcome, right.outcome].sort()).toEqual(["applied", "refused"]);
+    expect(concurrent.transport.calls.get("create-issue")).toBe(1);
+
+    const interrupted = setup();
+    const interruptedSource = interrupted.transport.addIssue(1);
+    interruptedSource.body = interruptedSource.body.replace(
+      "acceptance:\n  - exact durable transition",
+      "acceptance:\n  - exact durable transition\n  - preserve authored ordering\n  - report remaining scope verbatim",
+    );
+    const interruptedProposal = proposePreclaimScope(await interrupted.adapter.get(interruptedSource.id), config().workflow)!;
+    interrupted.transport.failNextCreateIssue = true;
+    await expect(interrupted.adapter.applyPreclaimScope(interruptedProposal, 2_000)).rejects.toThrow("simulated issue creation interruption");
+    const reserved = await interrupted.adapter.get(interruptedSource.id);
+    expect(reserved).toMatchObject({ issue: { state: "cancelled", closed: false }, claim: null });
+    expect(reserved.events).toContainEqual(expect.objectContaining({
+      kind: "supersession",
+      successor: interruptedProposal.contract.id,
+    }));
+
+    const restarted = new GitHubIssuesProjectsAdapter(config(), interrupted.transport, interrupted.truth);
+    expect(await restarted.reconcilePreclaimScopes(3_000)).toMatchObject({ outcome: "applied" });
+    expect(interrupted.transport.issues.filter((issue) => issue.body.includes(interruptedProposal.contract.id))).toHaveLength(1);
+    expect(await restarted.reconcilePreclaimScopes(4_000)).toBeNull();
+  });
+
   test("projects one immutable directive receipt visibly on its issue and deduplicates after restart", async () => {
     const { transport, truth, adapter } = setup();
     transport.addIssue(1);
