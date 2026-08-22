@@ -309,6 +309,120 @@ describe("v4 live runner mutation scope", () => {
     expect(receipts).toEqual([`${snapshot.issue.id}:Keep the change bounded.`]);
   });
 
+  test("deduplicates an exact owner revival through one ledger operation and exact reconstructed readback", async () => {
+    const base = transitionFixture("settled").runner;
+    const status = await base.readStatus();
+    const snapshot = structuredClone(status.snapshot!);
+    snapshot.issue.state = "failed";
+    snapshot.claim = null;
+    snapshot.version = 7;
+    snapshot.events = [{ sequence: 7, atMs: 1_900, state: "failed", kind: "failure", message: "attempt failed: provider unavailable" }];
+    const directive = {
+      id: "directive-revive-52", issueId: snapshot.issue.id,
+      receivedAtMs: 2_000, acknowledgedAtMs: 2_000,
+      verbatim: `REVIVE ${snapshot.issue.identifier}: provider quota reset OPS-42`,
+      sourceSessionId: "owner-desk", sourceMessageId: "revive-message-52", sourceTimestampMs: 1_900,
+      acknowledgementId: "ack-revive-52",
+    };
+    let receiptWrites = 0;
+    let revivals = 0;
+    let directTransitions = 0;
+    const tracker = {
+      get: async () => structuredClone(snapshot),
+      recordOwnerDirective: async () => { receiptWrites += 1; return { recorded: receiptWrites === 1 }; },
+      reviveFailed: async (_issueId: string, justification: string) => {
+        revivals += 1;
+        snapshot.issue.state = "ready";
+        snapshot.version += 1;
+        snapshot.events.push({ sequence: 8, atMs: 2_100, state: "ready", kind: "revival", message: "revived", justification });
+        return { accepted: true as const, snapshot: structuredClone(snapshot), reason: `revived because ${justification}` };
+      },
+      transition: async () => { directTransitions += 1; return structuredClone(snapshot); },
+    } as unknown as GitHubIssuesProjectsAdapter;
+    const craft = {
+      pollOwnerDesk: async () => ({
+        directives: [{
+          directive, gateDecision: null, newlyIngested: revivals === 0,
+          failedDecision: { kind: "revive" as const, issueId: snapshot.issue.id, justification: "provider quota reset OPS-42", evidenceId: directive.id },
+        }],
+        refusals: [], providerReadCalls: 4 as const, providerWriteCalls: 0 as const,
+      }),
+      get: async () => structuredClone(status.execution),
+    } as unknown as CraftMobileControlPlaneAdapter;
+    const diagnostics: string[] = [];
+    const runner = new LiveV4Runner(
+      { issueId: snapshot.issue.id } as LiveRunnerConfig,
+      { scheduler: { maxRevivals: 2 } } as WorkflowConfig,
+      tracker, craft, {} as CraftCliRpcTransport, { tick: async () => {} } as unknown as DeterministicScheduler,
+      undefined, undefined, undefined, (message) => diagnostics.push(message),
+    );
+
+    await runner.tick();
+    await runner.tick();
+
+    expect(revivals).toBe(1);
+    expect(receiptWrites).toBe(1);
+    expect(directTransitions).toBe(0);
+    expect(String(snapshot.issue.state)).toBe("ready");
+    expect(diagnostics).toContainEqual(expect.stringContaining("failed decision revive"));
+    expect(diagnostics).toContainEqual(expect.stringContaining("source lifecycle is ready, not failed"));
+  });
+
+  test("applies one exact #94 receipt even when the Project Desk is unreadable", async () => {
+    const base = transitionFixture("settled").runner;
+    const status = await base.readStatus();
+    const snapshot = structuredClone(status.snapshot!);
+    snapshot.issue.state = "failed";
+    snapshot.claim = null;
+    snapshot.version = 4;
+    snapshot.events = [{ sequence: 4, atMs: 2_000, state: "failed", kind: "failure", message: "attempt failed: deadline" }];
+    let supersessions = 0;
+    let directTransitions = 0;
+    const successor = structuredClone(snapshot);
+    successor.issue.id = "SUCCESSOR_99";
+    successor.issue.identifier = "razumv/craft-protocol#99";
+    successor.issue.state = "ready";
+    successor.issue.closed = false;
+    const tracker = {
+      get: async (issueId: string) => structuredClone(issueId === successor.issue.id ? successor : snapshot),
+      pollFailedDecisionReceipts: async () => ({
+        decisions: [{
+          kind: "supersede" as const,
+          issueId: snapshot.issue.id,
+          successorIssueId: successor.issue.id,
+          successor: successor.issue.identifier,
+          evidenceId: "deadline-successor-receipt:99:1",
+        }],
+        refusals: [],
+      }),
+      supersedeFailed: async (_issueId: string, successor: string) => {
+        supersessions += 1;
+        snapshot.issue.state = "cancelled";
+        snapshot.version += 1;
+        snapshot.events.push({ sequence: 5, atMs: 2_100, state: "cancelled", kind: "supersession", message: "superseded", successor });
+        return { accepted: true as const, snapshot: structuredClone(snapshot), reason: `cancelled because work continued at ${successor}` };
+      },
+      transition: async () => { directTransitions += 1; return structuredClone(snapshot); },
+    } as unknown as GitHubIssuesProjectsAdapter;
+    const diagnostics: string[] = [];
+    const runner = new LiveV4Runner(
+      { issueId: snapshot.issue.id } as LiveRunnerConfig,
+      { scheduler: { maxRevivals: 2 } } as WorkflowConfig,
+      tracker,
+      { pollOwnerDesk: async () => { throw new Error("desk unconfigured"); }, get: async () => structuredClone(status.execution) } as unknown as CraftMobileControlPlaneAdapter,
+      {} as CraftCliRpcTransport, { tick: async () => {} } as unknown as DeterministicScheduler,
+      undefined, undefined, undefined, (message) => diagnostics.push(message),
+    );
+
+    await runner.tick();
+
+    expect(supersessions).toBe(1);
+    expect(directTransitions).toBe(0);
+    expect(String(snapshot.issue.state)).toBe("cancelled");
+    expect(diagnostics).toContain("Project Desk read failed; cycle continues: desk unconfigured");
+    expect(diagnostics).toContainEqual(expect.stringContaining("failed decision supersede"));
+  });
+
   test("applies an exact current gate approval only after its issue receipt", async () => {
     const base = transitionFixture("settled").runner;
     const status = await base.readStatus();

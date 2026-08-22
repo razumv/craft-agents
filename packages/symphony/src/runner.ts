@@ -33,7 +33,7 @@ import {
 } from "./grooming";
 import { ReadScopeGitHubTransport } from "./read-scope-transport";
 import { compareForDispatch, DeterministicScheduler, type Clock, type CrashPoint, type ShadowProposal } from "./scheduler";
-import type { TrackerBacklogIssue } from "./tracker";
+import type { FailedLifecycleDecision, TrackerBacklogIssue } from "./tracker";
 import { projectStatus } from "./status";
 import { loadWorkflow } from "./workflow";
 import { GitWorktreeAdapter } from "./workspace-adapter";
@@ -246,6 +246,7 @@ export class LiveV4Runner {
     // this tick. Failure is diagnostic-only: an unreadable desk cannot stop the
     // lane, and the fleet service can continue operating its other runners.
     await this.#pollOwnerDesk();
+    await this.#pollFailedDecisionReceipts();
     // Dispatch always gets first refusal after owner input: an existing ready
     // issue must consume the lane before autonomous grooming is considered.
     await this.scheduler.tick(crashAfter);
@@ -258,22 +259,41 @@ export class LiveV4Runner {
       const snapshots = this.config.mode === "discovery"
         ? await this.tracker.fetchIssuesByStates(lifecycleStates)
         : [await this.tracker.get(this.#pinnedIssueId())];
-      const poll = await this.craft.pollOwnerDesk(snapshots.map((snapshot) => ({
-        issueId: snapshot.issue.id,
-        issueIdentifier: snapshot.issue.identifier,
-        ...(snapshot.issue.state === "owner-gate" && snapshot.evidence.ownerGateId
-          ? { gateId: snapshot.evidence.ownerGateId }
-          : {}),
-      })));
+      const poll = await this.craft.pollOwnerDesk(snapshots.map((snapshot) => {
+        const revivals = snapshot.events.filter((event) => event.kind === "revival");
+        return {
+          issueId: snapshot.issue.id,
+          issueIdentifier: snapshot.issue.identifier,
+          state: snapshot.issue.state,
+          closed: snapshot.issue.closed,
+          providerMerged: Boolean(snapshot.evidence.mergedAt && snapshot.evidence.mergeCommitSha),
+          usedRevivalFacts: revivals.flatMap((event) => event.justification ? [event.justification] : []),
+          revivalLimitReached: revivals.length >= (this.workflow.scheduler?.maxRevivals ?? Number.MAX_SAFE_INTEGER),
+          ...(snapshot.issue.state === "owner-gate" && snapshot.evidence.ownerGateId
+            ? { gateId: snapshot.evidence.ownerGateId }
+            : {}),
+        };
+      }));
       for (const refusal of poll.refusals) this.onDiagnostic(`owner directive refused: ${refusal}`);
       for (const item of poll.directives) {
-        let current = item.gateDecision ? await this.tracker.get(item.directive.issueId) : null;
+        let current = item.gateDecision || item.failedDecision ? await this.tracker.get(item.directive.issueId) : null;
         if (item.gateDecision && (current?.issue.state !== "owner-gate" || current.evidence.ownerGateId !== item.gateDecision.gateId)) {
           const actual = current?.evidence.ownerGateId ?? "none";
           throw new Error(`owner decision gate ${item.gateDecision.gateId} does not match the currently open gate (${actual})`);
         }
+        if (item.failedDecision) {
+          const precondition = await this.#failedDecisionPrecondition(current!, item.failedDecision);
+          if (precondition) {
+            this.onDiagnostic(`failed decision ${item.failedDecision.kind} ${current!.issue.identifier} refused: ${precondition}`);
+            continue;
+          }
+        }
         if (!this.tracker.recordOwnerDirective) throw new Error("tracker cannot persist owner directive receipts");
         await this.tracker.recordOwnerDirective(item.directive);
+        if (item.failedDecision) {
+          await this.#applyFailedDecision(item.failedDecision, `Project Desk directive ${item.directive.id}`);
+          continue;
+        }
         if (!item.gateDecision || !current) continue;
         // The receipt write is external. Re-read before acting so a gate changed
         // concurrently cannot inherit a decision for the prior gate.
@@ -297,6 +317,67 @@ export class LiveV4Runner {
     } catch (error) {
       this.onDiagnostic(`Project Desk read failed; cycle continues: ${error instanceof Error ? error.message : String(error)}`);
     }
+  }
+
+  async #pollFailedDecisionReceipts(): Promise<void> {
+    if (!this.tracker.pollFailedDecisionReceipts) return;
+    try {
+      const poll = await this.tracker.pollFailedDecisionReceipts();
+      for (const refusal of poll.refusals) this.onDiagnostic(`failed decision receipt refused: ${refusal}`);
+      for (const decision of poll.decisions) await this.#applyFailedDecision(decision, decision.evidenceId);
+    } catch (error) {
+      this.onDiagnostic(`failed decision receipt read failed; cycle continues: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  async #failedDecisionPrecondition(snapshot: TrackerIssueSnapshot, decision: FailedLifecycleDecision): Promise<string | null> {
+    if (snapshot.issue.id !== decision.issueId) return "decision source does not match exact issue readback";
+    if (snapshot.evidence.mergedAt && snapshot.evidence.mergeCommitSha) return "provider merge evidence already records delivery";
+    if (snapshot.issue.state !== "failed") return `source lifecycle is ${snapshot.issue.state}, not failed`;
+    if (snapshot.issue.closed) return "source issue is closed";
+    if (decision.kind === "revive") {
+      const revivals = snapshot.events.filter((event) => event.kind === "revival");
+      if (revivals.some((event) => event.justification === decision.justification)) return `change already used: ${decision.justification}`;
+      const limit = this.workflow.scheduler?.maxRevivals ?? Number.MAX_SAFE_INTEGER;
+      if (revivals.length >= limit) return `configured revival limit of ${limit} is reached`;
+    } else {
+      let successor: TrackerIssueSnapshot;
+      try {
+        successor = await this.tracker.get(decision.successorIssueId);
+      } catch (error) {
+        return `successor ${decision.successor} exact readback failed: ${error instanceof Error ? error.message : String(error)}`;
+      }
+      if (successor.issue.id !== decision.successorIssueId || successor.issue.identifier !== decision.successor) {
+        return `successor ${decision.successor} does not match exact configured repository and Project readback`;
+      }
+      if (successor.issue.closed) return `successor ${decision.successor} is closed`;
+    }
+    return null;
+  }
+
+  async #applyFailedDecision(decision: FailedLifecycleDecision, source: string): Promise<void> {
+    const before = await this.tracker.get(decision.issueId);
+    const precondition = await this.#failedDecisionPrecondition(before, decision);
+    if (precondition) {
+      this.onDiagnostic(`failed decision ${decision.kind} ${before.issue.identifier} refused from ${source}: ${precondition}`);
+      return;
+    }
+    const result = decision.kind === "revive"
+      ? await this.tracker.reviveFailed(decision.issueId, decision.justification, Date.now())
+      : await this.tracker.supersedeFailed(decision.issueId, decision.successor, Date.now());
+    if (!result.accepted) {
+      this.onDiagnostic(`failed decision ${decision.kind} ${before.issue.identifier} refused from ${source}: ${result.reason}`);
+      return;
+    }
+    const readback = await this.tracker.get(decision.issueId);
+    const expectedState = decision.kind === "revive" ? "ready" : "cancelled";
+    const exactEvent = readback.events.some((event) => decision.kind === "revive"
+      ? event.kind === "revival" && event.justification === decision.justification && event.state === expectedState
+      : event.kind === "supersession" && event.successor === decision.successor && event.state === expectedState);
+    if (readback.issue.state !== expectedState || !exactEvent || readback.version !== result.snapshot.version) {
+      throw new Error(`${decision.kind} ${before.issue.identifier} durable decision readback did not reconstruct exact ${expectedState} lifecycle state`);
+    }
+    this.onDiagnostic(`failed decision ${decision.kind} ${before.issue.identifier} accepted from ${source}: ${result.reason}`);
   }
 
   /**

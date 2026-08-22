@@ -22,6 +22,15 @@ export type LifecycleDecisionResult =
   | { accepted: true; snapshot: TrackerIssueSnapshot; reason: string }
   | { accepted: false; snapshot: TrackerIssueSnapshot; reason: string };
 
+export type FailedLifecycleDecision =
+  | { kind: "revive"; issueId: string; justification: string; evidenceId: string }
+  | { kind: "supersede"; issueId: string; successorIssueId: string; successor: string; evidenceId: string };
+
+export interface FailedDecisionReceiptPoll {
+  decisions: FailedLifecycleDecision[];
+  refusals: string[];
+}
+
 export interface PreservationRecord {
   issueId: string;
   attempt: number;
@@ -87,6 +96,8 @@ export interface TrackerAdapter {
   pullRequestVerdict?(issueId: string): Promise<PullRequestVerdict>;
   /** Durable, idempotent issue-visible receipt for one immutable Project Desk directive. */
   recordOwnerDirective?(directive: Readonly<OwnerDirective>): Promise<{ recorded: boolean }>;
+  /** Exact #94 successor-creation receipts that can supersede their failed sources. */
+  pollFailedDecisionReceipts?(): Promise<FailedDecisionReceiptPoll>;
   /** Durable receipt written only after the preservation ref is provider-visible. */
   recordPreservation?(record: Readonly<PreservationRecord>): Promise<{ recorded: boolean }>;
   fetchIssuesByIds(ids: readonly string[]): Promise<TrackerIssueSnapshot[]>;
