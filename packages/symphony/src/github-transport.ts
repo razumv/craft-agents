@@ -135,6 +135,10 @@ export interface GitHubTransport {
   getBranch(repository: string, branchName: string): Promise<GitHubBranchEvidence | null>;
   getBaseSha(repository: string, branchName: string): Promise<string>;
   appendComment(issueId: string, body: string): Promise<GitHubComment>;
+  /** Create an unlabeled issue for resumable intake flows. Optional for read-only/test transports. */
+  createIssue?(repository: string, title: string, body: string, labels: readonly string[]): Promise<{ id: string; number: number; url: string }>;
+  /** Add an observed issue to one configured Project. Optional for read-only/test transports. */
+  addIssueToProject?(projectId: string, contentId: string): Promise<string>;
   /** Compare-and-set body update. False means the provider rejected a concurrent issue mutation. */
   updateIssueBody(repository: string, issueNumber: number, body: string, expectedUpdatedAt: string): Promise<boolean>;
   replaceLabels(repository: string, issueNumber: number, labels: readonly string[]): Promise<void>;

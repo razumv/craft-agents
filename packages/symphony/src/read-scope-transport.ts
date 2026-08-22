@@ -162,6 +162,18 @@ export class ReadScopeGitHubTransport implements GitHubTransport {
     return this.inner.appendComment(issueId, body);
   }
 
+  async createIssue(repository: string, title: string, body: string, labels: readonly string[]): Promise<{ id: string; number: number; url: string }> {
+    if (!this.inner.createIssue) throw new Error("GitHub transport cannot create issues");
+    this.#invalidateListing();
+    return this.inner.createIssue(repository, title, body, labels);
+  }
+
+  async addIssueToProject(projectId: string, contentId: string): Promise<string> {
+    if (!this.inner.addIssueToProject) throw new Error("GitHub transport cannot add Project items");
+    this.#invalidate(`listProjectItems\n${contentId}`);
+    return this.inner.addIssueToProject(projectId, contentId);
+  }
+
   async updateIssueBody(repository: string, issueNumber: number, body: string, expectedUpdatedAt: string): Promise<boolean> {
     // Body rides on both listing forms and must be read back from the provider.
     this.#invalidateListing();

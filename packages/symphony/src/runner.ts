@@ -8,6 +8,7 @@ import { decideCiRepair, recordCiRepairAttempt, type CiRepairDecision, type CiRe
 import { CraftMobileControlPlaneAdapter } from "./craft-adapter";
 import { CraftCliRpcTransport, type CraftCliTransportConfig } from "./craft-transport";
 import { lifecycleStates, type LifecycleState, type ProjectStatus, type TrackerIssueSnapshot, type WorkflowConfig } from "./domain";
+import type { DeadlineSuccessorApplyReport } from "./deadline-apply";
 import { proposeDeadlineSuccessor, type DeadlineSuccessorProposal } from "./deadline-triage";
 import { GitHubIssuesProjectsAdapter, type GitHubStateProjection } from "./github-adapter";
 import {
@@ -523,6 +524,15 @@ export class LiveV4Runner {
     return null;
   }
 
+  /** Explicit applying half; never runs autonomously and requires discovery scope. */
+  async applyDeadlineSuccessor(proposal: DeadlineSuccessorProposal | null): Promise<DeadlineSuccessorApplyReport> {
+    this.#beginOperation();
+    if (this.config.mode !== "discovery") {
+      return { outcome: "failed", writes: 0, completedSteps: [], issue: null, failedStep: "preflight", error: "deadline-successor apply requires discovery mode" };
+    }
+    return this.tracker.applyDeadlineSuccessor(proposal);
+  }
+
   async projectDesk(): Promise<ProjectDeskReadback> {
     this.#beginOperation();
     const status = await this.#readStatusInScope();
@@ -951,6 +961,23 @@ export class DiscoveryGitHubTransport implements GitHubTransport {
       throw new Error("GitHub comment mutation escaped discovered issue/fence scope");
     }
     return this.delegate.appendComment(issueId, body);
+  }
+  async createIssue(repository: string, title: string, body: string, labels: readonly string[]): Promise<{ id: string; number: number; url: string }> {
+    if (repository !== this.scope.repository || !this.delegate.createIssue) {
+      throw new Error("GitHub issue creation escaped configured repository scope or is unavailable");
+    }
+    const created = await this.delegate.createIssue(repository, title, body, labels);
+    this.#issueIds.add(created.id);
+    this.#issueNumbers.add(created.number);
+    return created;
+  }
+  async addIssueToProject(projectId: string, contentId: string): Promise<string> {
+    if (projectId !== this.scope.projectId || !this.#issueIds.has(contentId) || !this.delegate.addIssueToProject) {
+      throw new Error("GitHub Project item creation escaped discovered issue/project scope or is unavailable");
+    }
+    const itemId = await this.delegate.addIssueToProject(projectId, contentId);
+    this.#projectItemIds.add(itemId);
+    return itemId;
   }
   async updateIssueBody(repository: string, issueNumber: number, body: string, expectedUpdatedAt: string): Promise<boolean> {
     if (repository !== this.scope.repository || !this.#issueNumbers.has(issueNumber)) {
