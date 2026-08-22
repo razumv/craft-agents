@@ -114,6 +114,9 @@ export function parseWorkflow(content: string, workflowPath = resolve("WORKFLOW.
   const retryBaseMs = integer(scheduler.retry_base_ms, "scheduler.retry_base_ms");
   const retryMaxMs = integer(scheduler.retry_max_ms, "scheduler.retry_max_ms");
   const maxRevivals = integer(scheduler.max_revivals, "scheduler.max_revivals");
+  const prOpenStuckCycles = scheduler.pr_open_stuck_cycles === undefined
+    ? 3
+    : integer(scheduler.pr_open_stuck_cycles, "scheduler.pr_open_stuck_cycles");
   if (maxRevivals < 0) throw new Error("scheduler.max_revivals must be non-negative");
   if (retryMaxMs < retryBaseMs) throw new Error("scheduler.retry_max_ms must be >= retry_base_ms");
 
@@ -137,6 +140,7 @@ export function parseWorkflow(content: string, workflowPath = resolve("WORKFLOW.
       staleRunMs: integer(scheduler.stale_run_ms, "scheduler.stale_run_ms"),
       maxAttempts: integer(scheduler.max_attempts, "scheduler.max_attempts"),
       maxRevivals,
+      prOpenStuckCycles,
       retryBaseMs,
       retryMaxMs,
     },

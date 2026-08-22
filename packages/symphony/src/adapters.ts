@@ -96,10 +96,11 @@ export class FakeGitHubAdapter {
     return clone(entry);
   }
 
-  heartbeat(fence: string, nowMs: number, ttlMs: number): void {
+  heartbeat(fence: string, nowMs: number, ttlMs: number, evidence: MaterialEvidence = {}): void {
     const entry = this.byFence(fence);
     entry.claim!.heartbeatAtMs = nowMs;
     entry.claim!.expiresAtMs = nowMs + ttlMs;
+    entry.evidence = { ...entry.evidence, ...clone(evidence) };
     entry.version += 1;
   }
 

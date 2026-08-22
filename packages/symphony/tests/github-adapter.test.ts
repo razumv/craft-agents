@@ -572,6 +572,76 @@ describe("v4.2 GitHub Issues and Projects adapter", () => {
     expect(await adapter.ciFailure("I_1")).toBeNull();
   });
 
+  test("classifies queued, running, requested-review, and behind PRs as waiting", async () => {
+    const cases = [
+      {
+        expected: "checks are QUEUED",
+        patch: { checkRollupState: "PENDING", checkRunStatuses: ["QUEUED"] },
+      },
+      {
+        expected: "checks are RUNNING",
+        patch: { checkRollupState: "PENDING", checkRunStatuses: ["IN_PROGRESS"] },
+      },
+      {
+        expected: "review is REQUESTED",
+        patch: { reviewDecision: "REVIEW_REQUIRED" },
+      },
+      {
+        expected: "base branch is BEHIND",
+        patch: { mergeStateStatus: "BEHIND" },
+      },
+    ] satisfies { expected: string; patch: Partial<GitHubPullRequestEvidence> }[];
+
+    for (const { expected, patch } of cases) {
+      const { transport, adapter } = setup();
+      transport.addIssue(1, "pr-open").labelNames = ["v4", "state:pr-open"];
+      attachPr(transport, "I_1", false, { state: "SUCCESS", count: 1 });
+      Object.assign(transport.prs.get("I_1")![0]!, patch);
+      expect(await adapter.pullRequestVerdict("I_1")).toMatchObject({
+        disposition: "waiting",
+        verdict: expected,
+      });
+    }
+  });
+
+  test("reports exact stuck verdicts with the condition required to resume", async () => {
+    const unknown = setup();
+    unknown.transport.addIssue(1, "pr-open").labelNames = ["v4", "state:pr-open"];
+    attachPr(unknown.transport, "I_1", false, { state: "SUCCESS", count: 1 }, "UNKNOWN");
+    expect(await unknown.adapter.pullRequestVerdict("I_1")).toMatchObject({
+      disposition: "stuck",
+      verdict: "mergeability is UNKNOWN",
+      resumeCondition: "GitHub must report a definitive mergeability verdict",
+    });
+
+    const conflicting = setup();
+    conflicting.transport.addIssue(1, "pr-open").labelNames = ["v4", "state:pr-open"];
+    attachPr(conflicting.transport, "I_1", false, { state: "SUCCESS", count: 1 }, "CONFLICTING");
+    expect(await conflicting.adapter.pullRequestVerdict("I_1")).toMatchObject({
+      disposition: "stuck",
+      verdict: "mergeability is CONFLICTING",
+      resumeCondition: "the branch must be updated to resolve conflicts with main",
+    });
+
+    const unchecked = setup();
+    unchecked.transport.addIssue(1, "pr-open").labelNames = ["v4", "state:pr-open"];
+    attachPr(unchecked.transport, "I_1", false, { state: null, count: 0 });
+    // GitHub also reports BLOCKED when required checks never appeared. The exact
+    // missing-check fact must outrank that generic merge-state summary.
+    Object.assign(unchecked.transport.prs.get("I_1")![0]!, { mergeStateStatus: "BLOCKED" });
+    expect(await unchecked.adapter.pullRequestVerdict("I_1")).toMatchObject({
+      disposition: "stuck",
+      verdict: "no checks ran on the head commit",
+      resumeCondition: "at least one required check must run on the head commit and pass",
+    });
+    // The same head still cannot merge: parking classification never loosens the guard.
+    expect(await unchecked.adapter.mergeClosingPullRequest("I_1")).toEqual({
+      merged: false,
+      reason: "no checks ran on the head commit",
+    });
+    expect(unchecked.transport.merged).toBeEmpty();
+  });
+
   test("auto-merge lands a mergeable pull request whose checks actually passed", async () => {
     const { transport, adapter } = setup();
     transport.addIssue(1, "pr-open").labelNames = ["v4", "state:pr-open"];

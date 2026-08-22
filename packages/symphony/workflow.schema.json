@@ -42,6 +42,7 @@
         "stale_run_ms": { "type": "integer", "minimum": 1 },
         "max_attempts": { "type": "integer", "minimum": 1 },
         "max_revivals": { "type": "integer", "minimum": 0 },
+        "pr_open_stuck_cycles": { "type": "integer", "minimum": 1, "default": 3 },
         "retry_base_ms": { "type": "integer", "minimum": 1 },
         "retry_max_ms": { "type": "integer", "minimum": 1 }
       },

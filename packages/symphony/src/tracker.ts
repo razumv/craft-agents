@@ -22,6 +22,15 @@ export type LifecycleDecisionResult =
   | { accepted: true; snapshot: TrackerIssueSnapshot; reason: string }
   | { accepted: false; snapshot: TrackerIssueSnapshot; reason: string };
 
+/** Provider-grounded PR state, separated by whether another actor/event can advance it. */
+export interface PullRequestVerdict {
+  disposition: "ready" | "waiting" | "stuck";
+  /** Exact verdict text retained verbatim when a stuck lane is parked. */
+  verdict: string;
+  /** Concrete condition that would make another attempt at reconciliation useful. */
+  resumeCondition: string;
+}
+
 /** Provider-independent durable tracker boundary used by the deterministic scheduler. */
 /**
  * An open issue in the configured repository that the lane does NOT manage: no
@@ -66,6 +75,8 @@ export interface TrackerAdapter {
    * raised on the provider's own evidence without anything being landed.
    */
   mergeReadiness?(issueId: string): Promise<{ ready: boolean; reason: string; headSha: string }>;
+  /** Classify the current closing-PR verdict for bounded pr-open reconciliation. */
+  pullRequestVerdict?(issueId: string): Promise<PullRequestVerdict>;
   /** Durable, idempotent issue-visible receipt for one immutable Project Desk directive. */
   recordOwnerDirective?(directive: Readonly<OwnerDirective>): Promise<{ recorded: boolean }>;
   fetchIssuesByIds(ids: readonly string[]): Promise<TrackerIssueSnapshot[]>;
@@ -78,7 +89,7 @@ export interface TrackerAdapter {
     nowMs: number,
   ): Awaitable<TrackerIssueSnapshot | null>;
   markRunning(fence: string, nowMs: number): Awaitable<TrackerIssueSnapshot>;
-  heartbeat(fence: string, nowMs: number, ttlMs: number): Awaitable<void>;
+  heartbeat(fence: string, nowMs: number, ttlMs: number, evidence?: MaterialEvidence): Awaitable<void>;
   failClaim(
     fence: string,
     failureClass: FailureClass,

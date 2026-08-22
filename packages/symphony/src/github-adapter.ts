@@ -42,6 +42,7 @@ import {
 import { OwnerDirectiveLedger, type OwnerDirective } from "./ledger";
 import type {
   LifecycleDecisionResult,
+  PullRequestVerdict,
   StartupReconciliation,
   TrackerAdapter,
   TrackerBacklogIssue,
@@ -421,7 +422,22 @@ export class GitHubIssuesProjectsAdapter implements TrackerAdapter {
       : { ready: false, reason: verdict.reason, headSha: "" };
   }
 
-  private async landableClosingPullRequest(issueId: string): Promise<{ ready: boolean; reason: string; pr: GitHubPullRequestEvidence | null }> {
+  async pullRequestVerdict(issueId: string): Promise<PullRequestVerdict> {
+    const verdict = await this.landableClosingPullRequest(issueId);
+    return {
+      disposition: verdict.disposition,
+      verdict: verdict.reason,
+      resumeCondition: verdict.resumeCondition,
+    };
+  }
+
+  private async landableClosingPullRequest(issueId: string): Promise<{
+    ready: boolean;
+    disposition: PullRequestVerdict["disposition"];
+    reason: string;
+    resumeCondition: string;
+    pr: GitHubPullRequestEvidence | null;
+  }> {
     const detailed = await this.detailed(issueId);
     const contract = detailed.snapshot.contract;
     const prs = await collectPages((cursor) => this.transport.listClosingPullRequests(issueId, cursor));
@@ -429,17 +445,75 @@ export class GitHubIssuesProjectsAdapter implements TrackerAdapter {
       pr.headRefName === contract.requiredBranch
       && pr.baseRefName === contract.baseBranch
     ));
-    if (candidates.length !== 1) return { ready: false, reason: `expected exactly one closing PR, found ${candidates.length}`, pr: null };
+    if (candidates.length !== 1) return {
+      ready: false,
+      disposition: "stuck",
+      reason: `expected exactly one closing PR, found ${candidates.length}`,
+      resumeCondition: `exactly one open pull request from ${contract.requiredBranch} to ${contract.baseBranch} must close this issue`,
+      pr: null,
+    };
     const pr = candidates[0]!;
-    if (pr.state === "MERGED") return { ready: false, reason: "already merged", pr };
-    if (pr.state !== "OPEN") return { ready: false, reason: `pull request is ${pr.state}`, pr };
-    if (pr.mergeable !== "MERGEABLE") return { ready: false, reason: `mergeability is ${pr.mergeable}`, pr };
+    if (pr.state === "MERGED") return {
+      ready: false, disposition: "waiting", reason: "already merged",
+      resumeCondition: "provider merge evidence must reconcile into the issue ledger", pr,
+    };
+    if (pr.state !== "OPEN") return {
+      ready: false, disposition: "stuck", reason: `pull request is ${pr.state}`,
+      resumeCondition: "the pull request must be reopened", pr,
+    };
+    if (pr.isDraft) return {
+      ready: false, disposition: "stuck", reason: "pull request is DRAFT",
+      resumeCondition: "the pull request must be marked ready for review", pr,
+    };
+    if (pr.mergeable === "UNKNOWN") return {
+      ready: false, disposition: "stuck", reason: "mergeability is UNKNOWN",
+      resumeCondition: "GitHub must report a definitive mergeability verdict", pr,
+    };
+    if (pr.mergeable === "CONFLICTING") return {
+      ready: false, disposition: "stuck", reason: "mergeability is CONFLICTING",
+      resumeCondition: `the branch must be updated to resolve conflicts with ${contract.baseBranch}`, pr,
+    };
+    if (pr.mergeStateStatus === "BEHIND") return {
+      ready: false, disposition: "waiting", reason: "base branch is BEHIND",
+      resumeCondition: `the branch must catch up with ${contract.baseBranch}`, pr,
+    };
+    if ((pr.checkRunStatuses ?? []).some((status) => status === "IN_PROGRESS")) return {
+      ready: false, disposition: "waiting", reason: "checks are RUNNING",
+      resumeCondition: "the running checks must finish", pr,
+    };
+    if ((pr.checkRunStatuses ?? []).some((status) => ["QUEUED", "WAITING", "REQUESTED", "PENDING", "EXPECTED"].includes(status))) return {
+      ready: false, disposition: "waiting", reason: "checks are QUEUED",
+      resumeCondition: "the queued checks must start and finish", pr,
+    };
+    if (pr.checkRollupState === "PENDING" || pr.checkRollupState === "EXPECTED") return {
+      ready: false, disposition: "waiting", reason: `checks are ${pr.checkRollupState}`,
+      resumeCondition: "the pending checks must finish", pr,
+    };
+    if (pr.reviewDecision === "REVIEW_REQUIRED") return {
+      ready: false, disposition: "waiting", reason: "review is REQUESTED",
+      resumeCondition: "the requested review must approve the head commit", pr,
+    };
     // Today's lesson, encoded: a repository whose workflow does not trigger on
     // this base branch reports NO checks, and reading that as green merges an
-    // unverified change. Absence of checks is never success.
-    if (pr.checkCount < 1) return { ready: false, reason: "no checks ran on the head commit", pr };
-    if (pr.checkRollupState !== "SUCCESS") return { ready: false, reason: `checks are ${pr.checkRollupState ?? "absent"}`, pr };
-    return { ready: true, reason: "mergeable with passing checks", pr };
+    // unverified change. Absence of checks is never success. Check evidence is
+    // more specific than GitHub's generic BLOCKED merge state, so diagnose it
+    // first and tell the next reader exactly what the head commit lacks.
+    if (pr.checkCount < 1) return {
+      ready: false, disposition: "stuck", reason: "no checks ran on the head commit",
+      resumeCondition: "at least one required check must run on the head commit and pass", pr,
+    };
+    if (pr.checkRollupState !== "SUCCESS") return {
+      ready: false, disposition: "stuck", reason: `checks are ${pr.checkRollupState ?? "absent"}`,
+      resumeCondition: "all required checks must run on the head commit and pass", pr,
+    };
+    if (pr.mergeStateStatus === "BLOCKED") return {
+      ready: false, disposition: "stuck", reason: "merge state is BLOCKED",
+      resumeCondition: "the unmet branch-protection requirement must be satisfied", pr,
+    };
+    return {
+      ready: true, disposition: "ready", reason: "mergeable with passing checks",
+      resumeCondition: "the merge policy may now decide whether to land the pull request", pr,
+    };
   }
 
   async mergeClosingPullRequest(issueId: string): Promise<{ merged: boolean; reason: string }> {
@@ -552,14 +626,14 @@ export class GitHubIssuesProjectsAdapter implements TrackerAdapter {
     return this.requiredCommit(current, event);
   }
 
-  async heartbeat(fence: string, nowMs: number, ttlMs: number): Promise<void> {
+  async heartbeat(fence: string, nowMs: number, ttlMs: number, evidence: MaterialEvidence = {}): Promise<void> {
     const current = await this.byFence(fence);
     const claim = current.snapshot.claim;
     if (!claim) throw new Error("claim fence is stale or unknown");
     const event = nextEvent(current.snapshot, "heartbeat", current.snapshot.issue.state, nowMs, fence, {
       claim: { ...claim, heartbeatAtMs: nowMs, expiresAtMs: nowMs + ttlMs },
       retry: current.snapshot.retry,
-      evidence: current.snapshot.evidence,
+      evidence: { ...current.snapshot.evidence, ...structuredClone(evidence) },
       message: `attempt ${claim.attempt} heartbeat`,
     });
     const updated = await this.requiredCommit(current, event);

@@ -68,6 +68,14 @@ export interface GitHubPullRequestEvidence {
   mergeCommitSha: string | null;
   /** GitHub's own mergeability verdict; UNKNOWN while it is still computing. */
   mergeable: "MERGEABLE" | "CONFLICTING" | "UNKNOWN";
+  /** Provider merge-state detail such as BEHIND or BLOCKED. */
+  mergeStateStatus?: string;
+  /** Provider review rollup; REVIEW_REQUIRED is an external wait, not a stuck verdict. */
+  reviewDecision?: string | null;
+  /** Draft PRs require an explicit author action before they can land. */
+  isDraft?: boolean;
+  /** Individual check context states, used to distinguish queued from running checks. */
+  checkRunStatuses?: readonly string[];
   /**
    * Rollup verdict over the head commit's checks, or null when the commit has
    * none. Null is NOT success: a repository whose workflow does not trigger on
@@ -159,6 +167,14 @@ function rollupState(raw: Record<string, unknown>): string | null {
 function rollupCount(raw: Record<string, unknown>): number {
   const contexts = headRollup(raw)?.contexts as { totalCount?: unknown } | undefined;
   return typeof contexts?.totalCount === "number" ? contexts.totalCount : 0;
+}
+
+function checkRunStatuses(raw: Record<string, unknown>): string[] {
+  const contexts = headRollup(raw)?.contexts as { nodes?: Record<string, unknown>[] } | undefined;
+  return (contexts?.nodes ?? []).flatMap((context) => {
+    const value = typeof context.status === "string" ? context.status : context.state;
+    return typeof value === "string" ? [value.toUpperCase()] : [];
+  });
 }
 
 export function failedStepLog(output: string, stepName: string): string {
@@ -292,7 +308,7 @@ export class GhCliTransport implements GitHubTransport {
   }
 
   async listClosingPullRequests(issueId: string, cursor: string | null): Promise<Page<GitHubPullRequestEvidence>> {
-    const data = await this.graphql<{ node: { closedByPullRequestsReferences: GraphPage<Record<string, unknown>> } | null }>(`query PullRequests($id:ID!,$cursor:String){node(id:$id){... on Issue{closedByPullRequestsReferences(first:100,after:$cursor,includeClosedPrs:true){nodes{id url state headRefName headRefOid baseRefName baseRefOid mergedAt mergeCommit{oid} mergeable commits(last:1){nodes{commit{statusCheckRollup{state contexts(first:1){totalCount}}}}}}pageInfo{hasNextPage endCursor}}}}}`, { id: issueId, cursor });
+    const data = await this.graphql<{ node: { closedByPullRequestsReferences: GraphPage<Record<string, unknown>> } | null }>(`query PullRequests($id:ID!,$cursor:String){node(id:$id){... on Issue{closedByPullRequestsReferences(first:100,after:$cursor,includeClosedPrs:true){nodes{id url state headRefName headRefOid baseRefName baseRefOid mergedAt mergeCommit{oid} mergeable mergeStateStatus reviewDecision isDraft commits(last:1){nodes{commit{statusCheckRollup{state contexts(first:100){totalCount nodes{... on CheckRun{status}... on StatusContext{state}}}}}}}}pageInfo{hasNextPage endCursor}}}}}`, { id: issueId, cursor });
     if (!data.node) throw new Error(`GitHub issue node ${issueId} is missing`);
     const result = page(data.node.closedByPullRequestsReferences);
     return {
@@ -303,6 +319,10 @@ export class GhCliTransport implements GitHubTransport {
         mergedAt: typeof raw.mergedAt === "string" ? raw.mergedAt : null,
         mergeCommitSha: raw.mergeCommit && typeof raw.mergeCommit === "object" && "oid" in raw.mergeCommit ? String(raw.mergeCommit.oid) : null,
         mergeable: raw.mergeable === "MERGEABLE" || raw.mergeable === "CONFLICTING" ? raw.mergeable : "UNKNOWN",
+        mergeStateStatus: typeof raw.mergeStateStatus === "string" ? raw.mergeStateStatus : "UNKNOWN",
+        reviewDecision: typeof raw.reviewDecision === "string" ? raw.reviewDecision : null,
+        isDraft: raw.isDraft === true,
+        checkRunStatuses: checkRunStatuses(raw),
         checkRollupState: rollupState(raw),
         checkCount: rollupCount(raw),
       })),
