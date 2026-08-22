@@ -187,6 +187,15 @@ export interface MaterialEvidence {
   prOpenVerdict?: string;
   /** Consecutive cycles carrying that exact self-unchanging verdict; zero for wait states. */
   prOpenVerdictCycles?: number;
+  /** Stable cause/activity/commit identity for the latest run that lost its final response. */
+  silentRunFingerprint?: string;
+  /** Consecutive terminal runs with that exact fingerprint. */
+  silentRunOccurrences?: number;
+  silentRunCause?: string;
+  silentRunLastObserved?: string;
+  /** Exact branch commit observed after terminal preservation (base SHA when the attempt produced no work). */
+  silentRunCommit?: string;
+  silentRunPreservedBranch?: string;
 }
 
 export type LifecycleEventKind =

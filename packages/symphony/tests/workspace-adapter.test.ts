@@ -206,6 +206,28 @@ describe("v4 live git worktree adapter", () => {
     expect(await adapter.probeBranch(retry, "v4/razumv-craft-protocol-52")).toMatchObject({ claimable: true });
   });
 
+  test("terminal observation preserves and names current work without releasing its branch or worktree", async () => {
+    const receipts: PreservedInfo[] = [];
+    const first = await fixture({ onPreserved: (info) => receipts.push(info) });
+    const created = await first.adapter.ensure(first.identity, first.context);
+    await writeFile(resolve(created.workspacePath, "terminal-output.txt"), "242 lines worth of work\n", "utf8");
+
+    const evidence = await first.adapter.preserveInterrupted(first.identity, first.context);
+
+    expect(evidence.preservedBranch).toMatch(/^v4-preserved\/v4-razumv-craft-protocol-52-a1-[0-9a-f]{7}$/);
+    expect(evidence.commit).not.toBe(first.claim.baseSha);
+    expect(receipts).toEqual([{
+      ...evidence,
+      preservedBranch: evidence.preservedBranch!,
+      issueId: first.issue.id,
+      attempt: 1,
+    }]);
+    expect((await git(first.root, ["worktree", "list", "--porcelain"]))).toContain(`worktree ${await realpath(created.workspacePath)}`);
+    expect((await git(created.workspacePath, ["symbolic-ref", "--short", "HEAD"])).trim()).toBe(first.context.contract.requiredBranch);
+    expect(await git(created.workspacePath, ["show", "HEAD:terminal-output.txt"])).toBe("242 lines worth of work\n");
+    expect((await git(first.remote, ["rev-parse", `refs/heads/${evidence.preservedBranch}`])).trim()).toBe(evidence.commit);
+  });
+
   test("a retry preserves the previous attempt's uncommitted work before taking the branch", async () => {
     const preserved: { preservedBranch: string; commit: string; attempt: number }[] = [];
     const first = await fixture({ onPreserved: (info) => preserved.push(info) });

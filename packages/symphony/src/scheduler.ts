@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-import type { CraftStartContext } from "./craft-adapter";
+import type { CraftStartContext, SilentRunObservation } from "./craft-adapter";
 import type { Claim, MaterialEvidence, ProjectStatus, RiskTier, RunIdentity, TrackerIssueSnapshot, WorkflowConfig } from "./domain";
 import { IdentityFactory } from "./identity";
 import { ModelPolicy, RiskPolicy } from "./policy";
@@ -29,6 +29,7 @@ export class SimulatedCrash extends Error {
 
 export interface SchedulerCraftSession {
   status: string;
+  silentRunObservation?: SilentRunObservation;
 }
 
 /** Provider-independent Craft seam; the simulator and RPC adapter both implement it. */
@@ -40,6 +41,12 @@ export interface SchedulerCraftAdapter {
 
 export interface SchedulerWorkspaceAdapter {
   ensure(identity: RunIdentity, context?: CraftStartContext): Promise<unknown>;
+  /** Commit/push/receipt interrupted work without releasing its branch or worktree. */
+  preserveInterrupted?(identity: RunIdentity, context?: CraftStartContext): Promise<{
+    branch: string;
+    commit: string;
+    preservedBranch: string | null;
+  }>;
   /**
    * Read-only: could a claim for this branch actually take it? Optional, so a
    * simulator or test double needs nothing new.
@@ -436,17 +443,17 @@ export class DeterministicScheduler {
           }
         }
         if (stale || deadlineFailure) {
-          await this.adapters.github.failClaim(
-            claim.fence,
-            "runtime",
-            !session
-              ? "stale Craft run is missing"
-              : session.status === "ended-without-response"
-                ? "Craft turn ended without a final response"
-                : `Craft run stopped at ${session.status}`,
-            now,
-            this.config.scheduler,
-          );
+          if (session?.silentRunObservation && ["failed", "ended-without-response"].includes(session.status)) {
+            await this.failSilentRun(snapshot, session.silentRunObservation, now);
+          } else {
+            await this.adapters.github.failClaim(
+              claim.fence,
+              "runtime",
+              !session ? "stale Craft run is missing" : `Craft run stopped at ${session.status}`,
+              now,
+              this.config.scheduler,
+            );
+          }
         }
         continue;
       }
@@ -462,6 +469,71 @@ export class DeterministicScheduler {
         );
       }
     }
+  }
+
+  private async failSilentRun(
+    snapshot: TrackerIssueSnapshot,
+    observation: SilentRunObservation,
+    now: number,
+  ): Promise<void> {
+    const claim = snapshot.claim!;
+    const identity: RunIdentity = {
+      issueId: claim.issueId,
+      issueIdentifier: claim.issueIdentifier,
+      attempt: claim.attempt,
+      sessionId: claim.sessionId,
+      workspaceId: claim.workspaceId,
+      workspaceKey: claim.workspaceKey,
+      workspacePath: claim.workspacePath,
+    };
+    let work: { branch: string; commit: string; preservedBranch: string | null };
+    try {
+      if (!this.adapters.workspaces.preserveInterrupted) {
+        throw new Error("workspace adapter cannot preserve and name the terminal branch commit");
+      }
+      work = await this.adapters.workspaces.preserveInterrupted(identity, {
+        claim,
+        issue: snapshot.issue,
+        contract: snapshot.contract,
+      });
+    } catch (error) {
+      await this.adapters.github.transition(snapshot.issue.id, "preservation-unknown", now, {
+        fence: claim.fence,
+        message: `silent-run diagnosis observed ${observation.cause}, but branch preservation failed: ${error instanceof Error ? error.message : String(error)}`,
+      });
+      return;
+    }
+
+    const stableActivity = observation.lastObserved.replace(/ message [^:]+:/, " message:");
+    const fingerprint = `${observation.cause}\n${stableActivity}\n${work.commit}`;
+    const priorOccurrences = snapshot.evidence.silentRunFingerprint === fingerprint
+      ? snapshot.evidence.silentRunOccurrences ?? 0
+      : 0;
+    const occurrences = priorOccurrences + 1;
+    const evidence: MaterialEvidence = {
+      silentRunFingerprint: fingerprint,
+      silentRunOccurrences: occurrences,
+      silentRunCause: observation.cause,
+      silentRunLastObserved: observation.lastObserved,
+      silentRunCommit: work.commit,
+      ...(work.preservedBranch ? { silentRunPreservedBranch: work.preservedBranch } : {}),
+    };
+    await this.adapters.github.heartbeat(claim.fence, now, this.config.scheduler.claimTtlMs, evidence);
+
+    const preservation = work.preservedBranch
+      ? `branch commit ${work.commit} preserved as ${work.preservedBranch}`
+      : `branch commit ${work.commit} equals the attempt base; no additional branch work was present`;
+    const unchanged = occurrences >= 3
+      ? `; unchanged terminal evidence observed ${occurrences} times, so another attempt is suppressed`
+      : "";
+    const reason = `silent run cause ${observation.cause}; last observed: ${observation.lastObserved}; ${preservation}${unchanged}`;
+    await this.adapters.github.failClaim(
+      claim.fence,
+      "runtime",
+      reason,
+      now,
+      occurrences >= 3 ? { ...this.config.scheduler, maxAttempts: claim.attempt } : this.config.scheduler,
+    );
   }
 
   /**

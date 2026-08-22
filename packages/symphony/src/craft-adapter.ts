@@ -72,6 +72,14 @@ export interface CraftProjectRecord {
   [key: string]: unknown;
 }
 
+export type SilentRunCause = "provider-or-connection-failure" | "no-output" | "ending-lost" | "unknown";
+
+export interface SilentRunObservation {
+  cause: SilentRunCause;
+  /** Exact bounded description of the last persisted activity after the frozen prompt. */
+  lastObserved: string;
+}
+
 export interface CraftExecutionSession {
   /** Stable v4 identity carried by the canonical run label. */
   sessionId: string;
@@ -84,6 +92,8 @@ export interface CraftExecutionSession {
   promptMessageId: string | null;
   finalResponse: string | null;
   contextTokens: number;
+  /** Present when persisted session truth explains why no authoritative final response exists. */
+  silentRunObservation?: SilentRunObservation;
   /** Authoritative persisted archive truth, independent of a user-controlled workflow badge. */
   isArchived?: boolean;
   isProcessing?: boolean;
@@ -811,6 +821,9 @@ export class CraftMobileControlPlaneAdapter implements CraftControlAdapter {
     else if (prompt && ((finalAt !== null && finalAt > turnDueAt) || nowMs >= turnDueAt)) status = "turn-deadline";
     else if (!session.isProcessing && prompt) status = "ended-without-response";
     else status = "running";
+    const silentRunObservation = !final && !session.isProcessing && prompt
+      ? observeSilentRun(afterPrompt, errors, session)
+      : undefined;
     return {
       sessionId,
       rpcSessionId: session.id,
@@ -821,6 +834,7 @@ export class CraftMobileControlPlaneAdapter implements CraftControlAdapter {
       promptMessageId: prompt?.id ?? null,
       finalResponse: final?.content?.trim() ?? null,
       contextTokens: usedContext,
+      ...(silentRunObservation ? { silentRunObservation } : {}),
       isArchived: session.isArchived === true || session.archived === true || session.kanbanColumn === "archived",
       isProcessing: session.isProcessing,
       workflowStatus: session.sessionStatus ?? session.kanbanColumn ?? null,
@@ -895,6 +909,35 @@ export function classifyProjectDeskMessage(
 function parseAttempt(name: string | undefined): number {
   const match = name?.match(/ attempt (\d+)$/);
   return match ? Number(match[1]) : 1;
+}
+
+function observeSilentRun(
+  afterPrompt: readonly CraftMessage[],
+  errors: readonly CraftMessage[],
+  session: CraftRpcSession,
+): SilentRunObservation {
+  // Hidden tool/progress events are still persisted runtime evidence. Hiding is
+  // a presentation choice, not permission to rewrite a worked attempt as empty.
+  const last = afterPrompt.at(-1);
+  const lastObserved = last
+    ? `${last.role} message ${last.id}: ${boundedObservation(last.content)}`
+    : `frozen prompt accepted; session stopped with workflow status ${session.sessionStatus ?? session.kanbanColumn ?? "unset"} and produced no persisted output`;
+  // Work before a later transport error is materially different from a
+  // transport failure that produced nothing: preserve/report it as an ending
+  // lost after work, while the exact last error remains visible above.
+  if (afterPrompt.some((message) => message.role === "assistant" || message.role === "tool" || message.role === "tool_result")) {
+    return { cause: "ending-lost", lastObserved };
+  }
+  if (errors.some((message) => /provider|connection|transport|network|socket|econn|fetch failed|turn ended/i.test(message.content ?? ""))) {
+    return { cause: "provider-or-connection-failure", lastObserved };
+  }
+  if (afterPrompt.length === 0) return { cause: "no-output", lastObserved };
+  return { cause: "unknown", lastObserved };
+}
+
+function boundedObservation(content: string | undefined): string {
+  const normalized = content?.replace(/\s+/g, " ").trim() || "(no text)";
+  return normalized.length <= 160 ? normalized : `${normalized.slice(0, 157)}...`;
 }
 
 function promptMarker(sessionId: string): string {
