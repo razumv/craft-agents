@@ -604,6 +604,19 @@ export class GitHubIssuesProjectsAdapter implements TrackerAdapter {
     return [...hydrated.values()].map((entry) => entry.snapshot).filter((entry) => wanted.has(entry.issue.state));
   }
 
+  async statusObservation(states: readonly LifecycleState[]) {
+    const wanted = new Set(states);
+    // Load the repository once, then derive both projections from that exact
+    // observation. Ownership reads are the same configured-fence reads that
+    // activeClaims already requires; status adds no second issue walk.
+    const hydrated = await this.loadAll(true);
+    const all = [...hydrated.values()].map((entry) => entry.snapshot);
+    return {
+      snapshots: all.filter((entry) => wanted.has(entry.issue.state)),
+      activeClaims: await this.#ownedActiveClaims(all),
+    };
+  }
+
   /**
    * Build the Desk command inventory from provider truth, not from the board's
    * active/read projection. Failed rows are terminal and may be absent there;
@@ -1019,10 +1032,13 @@ export class GitHubIssuesProjectsAdapter implements TrackerAdapter {
   }
 
   async activeClaims(): Promise<TrackerIssueSnapshot[]> {
+    const all = [...(await this.loadAll(true)).values()].map((entry) => entry.snapshot);
+    return this.#ownedActiveClaims(all);
+  }
+
+  async #ownedActiveClaims(snapshots: readonly TrackerIssueSnapshot[]): Promise<TrackerIssueSnapshot[]> {
     const wanted = new Set(this.config.workflow.tracker.activeStates);
-    const active = [...(await this.loadAll(true)).values()]
-      .map((entry) => entry.snapshot)
-      .filter((entry) => wanted.has(entry.issue.state));
+    const active = snapshots.filter((entry) => wanted.has(entry.issue.state));
     const ownership = await this.configuredFenceOwnership();
     const owned: TrackerIssueSnapshot[] = [];
     for (const entry of active) {

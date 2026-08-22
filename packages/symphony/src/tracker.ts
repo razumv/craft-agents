@@ -79,8 +79,21 @@ export interface TrackerBacklogIssue {
   parent: { id: string; identifier: string; state: "OPEN" | "CLOSED"; title: string; url: string } | null;
 }
 
+export interface TrackerStatusObservation {
+  /** Every managed issue in the requested states, for the repository board. */
+  snapshots: TrackerIssueSnapshot[];
+  /** Claims held by this adapter's own configured lane fence only. */
+  activeClaims: TrackerIssueSnapshot[];
+}
+
 export interface TrackerAdapter {
   fetchIssuesByStates(states: readonly LifecycleState[]): Promise<TrackerIssueSnapshot[]>;
+  /**
+   * Build a lane status from one loaded observation. Implementations must not
+   * re-read the provider merely to pair the repository board with this lane's
+   * already-classified claim ownership.
+   */
+  statusObservation?(states: readonly LifecycleState[]): Awaitable<TrackerStatusObservation>;
   /**
    * Exact command target inventory. Unlike ordinary board/backlog projections,
    * this must force-refresh every provider-open issue carrying the managed

@@ -1792,6 +1792,33 @@ describe("lane-scoped WIP and reconciliation", () => {
     expect((await laneB.activeClaims()).map((entry) => entry.issue.id)).toEqual(["I_2"]);
   });
 
+  test("status reuses the lane ownership observation with no provider-read increase", async () => {
+    const prepared = async () => {
+      const fixture = lanes();
+      fixture.transport.addIssue(1);
+      fixture.transport.addIssue(2);
+      const ready = await fixture.laneA.get("I_1");
+      const claim = await proposedClaim(fixture.laneA, "I_1");
+      await fixture.laneA.tryClaim("I_1", ready.version, claim, 1_000);
+      fixture.transport.calls.clear();
+      return { ...fixture, claim };
+    };
+    const before = await prepared();
+    expect((await before.laneA.activeClaims()).map((entry) => entry.issue.id)).toEqual(["I_1"]);
+    const beforeReads = new Map(before.transport.calls);
+    const beforeReadCount = [...beforeReads.values()].reduce((sum, count) => sum + count, 0);
+
+    const after = await prepared();
+    const observation = await after.laneA.statusObservation(lifecycleStates);
+    const afterReads = new Map(after.transport.calls);
+
+    const afterReadCount = [...afterReads.values()].reduce((sum, count) => sum + count, 0);
+    expect(observation.activeClaims.map((entry) => entry.issue.id)).toEqual(["I_1"]);
+    expect(observation.snapshots.map((entry) => entry.issue.id).sort()).toEqual(["I_1", "I_2"]);
+    expect({ beforeReadCount, afterReadCount }).toEqual({ beforeReadCount: 20, afterReadCount: 20 });
+    expect(afterReads).toEqual(beforeReads);
+  });
+
   test("startup and ordinary reconciliation leave a foreign claim completely untouched", async () => {
     const { transport, laneA, laneB } = lanes();
     transport.addIssue(1);
