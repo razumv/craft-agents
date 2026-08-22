@@ -489,6 +489,43 @@ describe("v4.2 GitHub Issues and Projects adapter", () => {
     expect((transport.calls.get("field-values") ?? 0) >= 4).toBeTrue();
   });
 
+  test("one ordinary cycle readies a blocked successor only after every named blocker is done", async () => {
+    const { transport, adapter } = setup();
+    transport.addIssue(1, "blocked", ["WORK-2"]);
+    transport.addIssue(2, "done");
+    transport.addIssue(3, "blocked", ["WORK-4"]);
+    transport.addIssue(4, "ready");
+    const scheduler = new DeterministicScheduler(
+      config().workflow,
+      {
+        github: adapter,
+        craft: {
+          ensure: async () => { throw new Error("no issue should be claimed in this test"); },
+          get: async () => null,
+        },
+        workspaces: {
+          ensure: async () => { throw new Error("no workspace should be created in this test"); },
+          probeBranch: async () => ({ claimable: false, reason: "keep candidates unclaimed for assertion" }),
+        },
+      },
+      new ManualClock(1_000),
+    );
+
+    await scheduler.tick();
+
+    const released = await adapter.get("I_1");
+    expect(released.issue.state).toBe("ready");
+    expect(released.events.at(-1)).toMatchObject({
+      kind: "transition",
+      state: "ready",
+      message: "all blockers completed; ready after waiting on acme/repo#2",
+    });
+    const unfinished = await adapter.get("I_3");
+    expect(unfinished.issue.state).toBe("blocked");
+    expect(unfinished.issue.blockedBy).toEqual([{ id: "I_4", identifier: "acme/repo#4", state: "ready" }]);
+    expect(transport.comments.get("I_3")).toEqual([]);
+  });
+
   test("the first scan after start walks every issue with no update bound", async () => {
     const { transport, adapter } = setup();
     transport.honorUpdatedSince = true;

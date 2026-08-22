@@ -1439,6 +1439,24 @@ export class GitHubIssuesProjectsAdapter implements TrackerAdapter {
     // attempt stays in the ledger history, where a failure belongs.
     for (const entry of [...(await this.loadAll(false)).values()].sort((a, b) => a.snapshot.issue.id.localeCompare(b.snapshot.issue.id))) {
       const snapshot = entry.snapshot;
+      // `blocked` is sometimes only a projection of a dependency edge. Once
+      // every named blocker is durably done, leaving the issue parked requires
+      // a person to notice a condition the provider already proved. Reconcile
+      // that edge before candidate discovery so a successor chain advances in
+      // the same ordinary cycle. An empty blocker set is intentionally excluded:
+      // PR verdicts and owner gates also use `blocked`, and they have their own
+      // explicit resume conditions.
+      const blockers = snapshot.issue.blockedBy;
+      if (snapshot.issue.state === "blocked"
+        && blockers.length > 0
+        && blockers.every((blocker) => blocker.state?.trim().toLowerCase() === "done")) {
+        const blockerNames = blockers.map((blocker) => blocker.identifier ?? blocker.id ?? "unknown blocker");
+        await this.transition(snapshot.issue.id, "ready", nowMs, {
+          message: `all blockers completed; ready after waiting on ${blockerNames.join(", ")}`,
+        });
+        results.push({ issueId: snapshot.issue.id, action: "advanced", reason: `all blockers completed: ${blockerNames.join(", ")}` });
+        continue;
+      }
       if (landedWithoutSaying(snapshot)) {
         if (snapshot.claim) continue;
         results.push(...await this.advanceClaimByEvidence(snapshot, nowMs));
