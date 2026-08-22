@@ -7,16 +7,35 @@ import type { CraftStartContext } from "./craft-adapter";
 import type { Claim, RunIdentity } from "./domain";
 import { claimBindingFile, claimBindingsEqual } from "./workspace-truth";
 
+export interface PreservedWork {
+  issueId: string;
+  attempt: number;
+  branch: string;
+  preservedBranch: string;
+  commit: string;
+}
+
+export interface PreservationAuditRecord {
+  branch: string;
+  commit: string;
+  remoteCommit: string | null;
+  durable: boolean;
+}
+
 export interface GitWorktreeAdapterConfig {
   repositoryRoot: string;
   workspaceRoot: string;
   gitExecutable: string;
+  /** Repository named by the tracker. Its matching git remote receives rescue refs. */
+  trackerRepository?: string;
+  /** Test/embedded override; production derives the remote from trackerRepository. */
+  trackerRemote?: string;
   /**
-   * Called when a dead attempt's uncommitted work was rescued onto a branch
-   * before its worktree was released. Optional: preservation happens either way,
-   * but nobody can act on work they were never told about.
+   * Durable ledger write performed only after the remote has the exact commit.
+   * A rejected write leaves both the local preservation ref and original
+   * worktree intact, so replay can safely finish the receipt.
    */
-  onPreserved?: (info: { issueId: string; attempt: number; branch: string; preservedBranch: string; commit: string }) => void;
+  onPreserved?: (info: PreservedWork) => void | Promise<void>;
 }
 
 export interface GitWorktree {
@@ -87,18 +106,25 @@ export class GitWorktreeAdapter {
     const branch = validateBranch(requiredBranch);
     const prefix = `v4-preserved/${stripRefPrefix(branch)}`;
     const exactPreservedRef = new RegExp(`^${escapeRegExp(prefix)}-a[1-9]\\d*-[0-9a-f]{7}$`, "i");
-    const output = await this.git([
+    const remote = await this.trackerRemote();
+    const output = await this.git(["ls-remote", "--heads", remote, `refs/heads/${prefix}-a*`]);
+    return parseRemoteRefs(output).filter((record) => exactPreservedRef.test(record.branch));
+  }
+
+  /** One-off, read-only inventory of local rescue refs that are absent or different remotely. */
+  async auditPreservedBranches(): Promise<PreservationAuditRecord[]> {
+    const local = parseLocalRefs(await this.git([
       "for-each-ref",
       "--format=%(refname:short)%09%(objectname)",
       "refs/heads/v4-preserved",
-    ]);
-    return output.split(/\r?\n/).filter(Boolean).flatMap((line) => {
-      const [preservedBranch, commit, ...extra] = line.split("\t");
-      if (!preservedBranch || !commit || extra.length || !/^[0-9a-f]{40,64}$/i.test(commit)) {
-        throw new Error("git returned an invalid preserved branch record");
-      }
-      return exactPreservedRef.test(preservedBranch) ? [{ branch: preservedBranch, commit }] : [];
-    }).sort((left, right) => left.branch.localeCompare(right.branch) || left.commit.localeCompare(right.commit));
+    ]));
+    const remote = new Map(parseRemoteRefs(await this.git([
+      "ls-remote", "--heads", await this.trackerRemote(), "refs/heads/v4-preserved/*",
+    ])).map((record) => [record.branch, record.commit]));
+    return local.map(({ branch, commit }) => {
+      const remoteCommit = remote.get(branch) ?? null;
+      return { branch, commit, remoteCommit, durable: remoteCommit === commit };
+    });
   }
 
   async ensure(identity: RunIdentity, context?: CraftStartContext): Promise<GitWorktree> {
@@ -277,13 +303,53 @@ export class GitWorktreeAdapter {
         throw new Error(`refusing to release ${branch}: preservation branch ${preserved} was not created`);
       }
     }
-    this.config.onPreserved?.({
+    const remote = await this.trackerRemote();
+    const pushed = await this.git([
+      "push", "--porcelain", remote, `refs/heads/${preserved}:refs/heads/${preserved}`,
+    ], true);
+    if (pushed.exitCode !== 0) {
+      throw new Error(
+        `preservation push failed for ${preserved}: ${pushed.stderr.trim() || pushed.stdout.trim() || "no diagnostic"}; `
+        + `local branch ${preserved} remains at ${head} and the interrupted worktree was not released`,
+      );
+    }
+    const remoteRef = parseRemoteRefs(await this.git([
+      "ls-remote", "--heads", remote, `refs/heads/${preserved}`,
+    ])).find((record) => record.branch === preserved);
+    if (remoteRef?.commit !== head) {
+      throw new Error(
+        `preservation push for ${preserved} did not read back ${head} from ${remote}; `
+        + `local branch ${preserved} and the interrupted worktree remain`,
+      );
+    }
+
+    await this.config.onPreserved?.({
       issueId: binding.issueId,
       attempt: binding.attempt,
       branch,
       preservedBranch: preserved,
       commit: head,
     });
+  }
+
+  private async trackerRemote(): Promise<string> {
+    if (this.config.trackerRemote?.trim()) return this.config.trackerRemote.trim();
+    const repository = this.config.trackerRepository?.trim();
+    if (!repository || !/^[^/\s]+\/[^/\s]+$/.test(repository)) {
+      throw new Error("tracker repository is required to identify the preservation push remote");
+    }
+    const remotes = (await this.git(["remote"])).split(/\r?\n/).map((remote) => remote.trim()).filter(Boolean);
+    const matching: string[] = [];
+    for (const remote of remotes) {
+      const urls = (await this.git(["remote", "get-url", "--push", "--all", remote], true));
+      if (urls.exitCode === 0 && urls.stdout.split(/\r?\n/).some((url) => repositoryFromRemoteUrl(url) === repository)) {
+        matching.push(remote);
+      }
+    }
+    if (matching.length !== 1) {
+      throw new Error(`expected exactly one git push remote for tracker repository ${repository}, found ${matching.length}`);
+    }
+    return matching[0]!;
   }
 
   /**
@@ -414,6 +480,34 @@ function stripRefPrefix(branch: string): string {
 
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function parseLocalRefs(output: string): { branch: string; commit: string }[] {
+  return output.split(/\r?\n/).filter(Boolean).map((line) => {
+    const [branch, commit, ...extra] = line.split("\t");
+    if (!branch || !commit || extra.length || !/^[0-9a-f]{40,64}$/i.test(commit)) {
+      throw new Error("git returned an invalid local preserved branch record");
+    }
+    return { branch, commit };
+  }).sort((left, right) => left.branch.localeCompare(right.branch) || left.commit.localeCompare(right.commit));
+}
+
+function parseRemoteRefs(output: string): { branch: string; commit: string }[] {
+  return output.split(/\r?\n/).filter(Boolean).map((line) => {
+    const [commit, ref, ...extra] = line.split("\t");
+    if (!commit || !ref?.startsWith("refs/heads/") || extra.length || !/^[0-9a-f]{40,64}$/i.test(commit)) {
+      throw new Error("git returned an invalid remote preserved branch record");
+    }
+    return { branch: ref.slice("refs/heads/".length), commit };
+  }).sort((left, right) => left.branch.localeCompare(right.branch) || left.commit.localeCompare(right.commit));
+}
+
+function repositoryFromRemoteUrl(value: string): string | null {
+  const url = value.trim().replace(/\/+$/, "").replace(/\.git$/, "");
+  // Accept ordinary URL and SCP-like git syntax on any host. Tracker identity is
+  // owner/name; pinning the host to github.com would break GitHub Enterprise.
+  const match = url.match(/^(?:[a-z][a-z0-9+.-]*:\/\/(?:[^@/\s]+@)?[^/\s]+\/|[^@/\s]+@[^:/\s]+:)([^/\s]+\/[^/\s]+)$/i);
+  return match?.[1] ?? null;
 }
 
 function inside(root: string, candidate: string): boolean {

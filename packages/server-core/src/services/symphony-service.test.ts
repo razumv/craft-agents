@@ -381,7 +381,7 @@ describe('NativeSymphonyService autonomous loop', () => {
     await service.stop()
   })
 
-  it("one project's tick error does not stop the next project's dispatch in the same cycle", async () => {
+  it("a preservation push diagnostic does not stop the next project's dispatch in the same cycle", async () => {
     const alphaPath = await runnerConfigPath()
     const betaPath = await runnerConfigPath()
     const calls: string[] = []
@@ -393,7 +393,10 @@ describe('NativeSymphonyService autonomous loop', () => {
       async shadow() { return shadowReceipt },
       async tick() {
         calls.push(`dispatch:${project}`)
-        if (project === 'alpha') throw new Error('grooming exploded')
+        if (project === 'alpha') return {
+          durable: 'alpha-diagnostic',
+          diagnostic: 'preservation push failed for v4-preserved/alpha-a1-1234567: remote rejected; local branch remains and the interrupted worktree was not released',
+        }
         return { durable: 'beta-dispatched' }
       },
     })
@@ -410,6 +413,10 @@ describe('NativeSymphonyService autonomous loop', () => {
 
     expect(calls[0]).toBe('dispatch:alpha')
     expect(calls[1]).toBe('dispatch:beta')
+    expect(service.status().projects.find((project) => project.projectId === 'alpha')).toMatchObject({
+      phase: 'ready', lastError: null,
+      snapshot: { durable: 'alpha-diagnostic', diagnostic: expect.stringContaining('local branch remains') },
+    })
     expect(service.status().projects.find((project) => project.projectId === 'beta')).toMatchObject({
       phase: 'ready', snapshot: { durable: 'beta-dispatched' },
     })

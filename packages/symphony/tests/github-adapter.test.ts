@@ -334,6 +334,26 @@ describe("v4.2 GitHub Issues and Projects adapter", () => {
     expect(transport.calls.get("append-comment")).toBe(1);
   });
 
+  test("records one immutable preservation receipt and deduplicates the same attempt after restart", async () => {
+    const { transport, truth, adapter } = setup();
+    transport.addIssue(1);
+    const record = {
+      issueId: "I_1",
+      attempt: 1,
+      branch: "v4/acme-repo-1",
+      preservedBranch: "v4-preserved/v4-acme-repo-1-a1-1234567",
+      commit: "1234567890abcdef1234567890abcdef12345678",
+    };
+
+    expect(await adapter.recordPreservation(record)).toEqual({ recorded: true });
+    const restarted = new GitHubIssuesProjectsAdapter(config(), transport, truth);
+    expect(await restarted.recordPreservation(record)).toEqual({ recorded: false });
+    expect(transport.comments.get("I_1")).toHaveLength(1);
+    expect(transport.comments.get("I_1")![0]!.body).toContain(`remote branch \`${record.preservedBranch}\``);
+    expect(transport.comments.get("I_1")![0]!.body).toContain("craft-protocol-v4:preservation-receipt");
+    await expect(restarted.recordPreservation({ ...record, commit: "f".repeat(40) })).rejects.toThrow("immutable");
+  });
+
   test("empty fetches avoid provider requests and pagination normalizes exact fields and dependencies", async () => {
     const { transport, adapter } = setup();
     transport.pageSize = 1;
