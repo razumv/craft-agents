@@ -363,17 +363,59 @@ describe("autonomous idle-lane grooming", () => {
     expect(calls).toEqual(["dispatch"]);
   });
 
-  test("several eligible candidates still apply exactly one proposal per cycle", async () => {
+  test("walks past several ordered refusals to apply exactly one later proposal in the same cycle", async () => {
+    const ungroomable = (number: number) => issue({
+      id: `I_${number}`,
+      identifier: `acme/repo#${number}`,
+      number,
+      priority: number,
+      description: "## Acceptance Criteria\n- Improve it better.\n\n## Non-goals\n- Writes.",
+    });
     const candidates = [
-      issue({ id: "I_3", identifier: "acme/repo#3", number: 3, priority: 3 }),
-      issue({ id: "I_1", identifier: "acme/repo#1", number: 1, priority: 1 }),
-      issue({ id: "I_2", identifier: "acme/repo#2", number: 2, priority: 2 }),
+      issue({ id: "I_4", identifier: "acme/repo#4", number: 4, priority: 4 }),
+      ungroomable(3),
+      ungroomable(1),
+      ungroomable(2),
     ];
     const { runner, calls } = autonomousRunner({ backlog: candidates });
 
-    await runner.tick();
+    const status = await runner.tick();
 
-    expect(calls).toEqual(["dispatch", "apply:acme/repo#1"]);
+    expect(calls).toEqual(["dispatch", "apply:acme/repo#4"]);
+    expect(status.grooming).toMatchObject({
+      candidateLimit: 10,
+      examinedCandidates: 4,
+      refusals: [
+        { issueIdentifier: "acme/repo#1", reason: expect.stringContaining("falsifiable acceptance criterion") },
+        { issueIdentifier: "acme/repo#2", reason: expect.stringContaining("falsifiable acceptance criterion") },
+        { issueIdentifier: "acme/repo#3", reason: expect.stringContaining("falsifiable acceptance criterion") },
+      ],
+    });
+  });
+
+  test("stops at the reported ten-candidate bound without applying an eleventh candidate", async () => {
+    const candidates = Array.from({ length: 11 }, (_, index) => {
+      const number = index + 1;
+      return issue({
+        id: `I_${number}`,
+        identifier: `acme/repo#${number}`,
+        number,
+        priority: null,
+        createdAt: `2026-08-${String(number).padStart(2, "0")}T00:00:00Z`,
+        description: number === 11
+          ? issue().description
+          : "## Acceptance Criteria\n- Improve it better.\n\n## Non-goals\n- Writes.",
+      });
+    });
+    const { runner, calls } = autonomousRunner({ backlog: candidates });
+
+    const first = await runner.tick();
+    const second = await runner.tick();
+
+    expect(first.grooming).toMatchObject({ candidateLimit: 10, examinedCandidates: 10 });
+    expect(first.grooming?.refusals).toHaveLength(10);
+    expect(calls).toEqual(["dispatch", "dispatch", "apply:acme/repo#11"]);
+    expect(second.grooming).toMatchObject({ candidateLimit: 10, examinedCandidates: 1 });
   });
 
   test("an unchanged refusal is recorded once with its issue, relation, and readable reason", async () => {
@@ -392,6 +434,8 @@ describe("autonomous idle-lane grooming", () => {
     expect(first.grooming).toEqual({
       state: "exhausted",
       backlogIssueNumbers: [1],
+      candidateLimit: 10,
+      examinedCandidates: 1,
       refusals: [{
         issueId: "I_1",
         issueNumber: 1,
@@ -400,7 +444,7 @@ describe("autonomous idle-lane grooming", () => {
         reason: "issue acme/repo#1 cannot ground an executable contract: missing at least one falsifiable acceptance criterion with an observable outcome",
       }],
     });
-    expect(second.grooming).toEqual(first.grooming);
+    expect(second.grooming).toEqual({ ...first.grooming!, examinedCandidates: 0 });
   });
 
   test("records every refused issue number and distinguishes exhaustion from an empty backlog", async () => {
@@ -414,14 +458,15 @@ describe("autonomous idle-lane grooming", () => {
     const populated = autonomousRunner({ backlog: [parented, blocked] });
     const empty = autonomousRunner({ backlog: [] });
 
-    const partlyRefused = await populated.runner.tick();
     const exhausted = await populated.runner.tick();
+    const remembered = await populated.runner.tick();
     const backlogEmpty = await empty.runner.tick();
 
-    expect(partlyRefused.grooming).toMatchObject({ state: "groomable", backlogIssueNumbers: [1, 2] });
     expect(exhausted.grooming).toEqual({
       state: "exhausted",
       backlogIssueNumbers: [1, 2],
+      candidateLimit: 10,
+      examinedCandidates: 2,
       refusals: [
         {
           issueId: "I_1", issueNumber: 1, issueIdentifier: "acme/repo#1",
@@ -433,7 +478,14 @@ describe("autonomous idle-lane grooming", () => {
         },
       ],
     });
-    expect(backlogEmpty.grooming).toEqual({ state: "backlog-empty", backlogIssueNumbers: [], refusals: [] });
+    expect(remembered.grooming).toEqual({ ...exhausted.grooming!, examinedCandidates: 0 });
+    expect(backlogEmpty.grooming).toEqual({
+      state: "backlog-empty",
+      backlogIssueNumbers: [],
+      candidateLimit: 10,
+      examinedCandidates: 0,
+      refusals: [],
+    });
   });
 
   test("an edited refusal is retried and removed when the issue becomes groomable", async () => {
@@ -450,7 +502,13 @@ describe("autonomous idle-lane grooming", () => {
 
     expect(refused.grooming?.refusals).toHaveLength(1);
     expect(calls).toEqual(["dispatch", "dispatch", "apply:acme/repo#1"]);
-    expect(retried.grooming).toEqual({ state: "groomable", backlogIssueNumbers: [1], refusals: [] });
+    expect(retried.grooming).toEqual({
+      state: "groomable",
+      backlogIssueNumbers: [1],
+      candidateLimit: 10,
+      examinedCandidates: 1,
+      refusals: [],
+    });
   });
 
   test("a grooming exception is logged but does not fail the scheduler tick", async () => {
@@ -570,24 +628,35 @@ describe("read-only backlog grooming", () => {
     if (result.outcome === "refused") expect(result.refusal.message).toContain("Improve it better.");
   });
 
-  test("a deliberately vague issue names the missing falsifiable acceptance set and invents no contract", () => {
-    const vague = issue({
-      description: [
-        "Please make grooming better.",
-        "",
-        "## Acceptance Criteria",
-        "- Improve it better.",
-        "",
-        "## Non-goals",
-        "- Changing the scheduler.",
-      ].join("\n"),
-    });
-    const result = proposal(vague);
+  test("the walk does not loosen falsifiable-acceptance or non-goals grounding rules", () => {
+    const cases = [
+      {
+        candidate: issue({
+          description: [
+            "Please make grooming better.",
+            "",
+            "## Acceptance Criteria",
+            "- Improve it better.",
+            "",
+            "## Non-goals",
+            "- Changing the scheduler.",
+          ].join("\n"),
+        }),
+        missing: "falsifiable acceptance criterion",
+      },
+      {
+        candidate: issue({ description: "## Acceptance Criteria\n- The runner returns one proposal." }),
+        missing: "Non-goals or Out of scope section",
+      },
+    ];
 
-    expect(result).toMatchObject({ outcome: "refused", refusal: { relation: "grounding" } });
-    if (result.outcome === "refused") {
-      expect(result.refusal.message).toContain("falsifiable acceptance criterion");
-      expect("contract" in result).toBeFalse();
+    for (const { candidate, missing } of cases) {
+      const result = proposal(candidate);
+      expect(result).toMatchObject({ outcome: "refused", refusal: { relation: "grounding" } });
+      if (result.outcome === "refused") {
+        expect(result.refusal.message).toContain(missing);
+        expect("contract" in result).toBeFalse();
+      }
     }
   });
 

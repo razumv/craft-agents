@@ -118,10 +118,16 @@ export interface GroomingRefusalRecord {
   reason: string;
 }
 
+export const GROOMING_CANDIDATE_LIMIT = 10;
+
 export interface GroomingReport {
   /** Empty needs new work; exhausted needs the named backlog issues repaired. */
   state: "backlog-empty" | "groomable" | "exhausted";
   backlogIssueNumbers: number[];
+  /** Hard bound on newly considered candidates in one idle-lane cycle. */
+  candidateLimit: typeof GROOMING_CANDIDATE_LIMIT;
+  /** Candidates actually considered by the most recent idle-lane cycle. */
+  examinedCandidates: number;
   refusals: GroomingRefusalRecord[];
 }
 
@@ -162,6 +168,7 @@ class SystemClock implements Clock {
 export class LiveV4Runner {
   /** Refusals are revision-scoped: the same issue is reconsidered only after GitHub reports it changed. */
   readonly #groomingRefusals = new Map<string, GroomingRefusalRecord & { revision: string }>();
+  #examinedGroomingCandidates = 0;
 
   constructor(
     readonly config: LiveRunnerConfig,
@@ -292,12 +299,14 @@ export class LiveV4Runner {
   }
 
   /**
-   * At most one backlog candidate is considered after dispatch. Every failure
-   * is diagnostic-only: a broken grooming read/write cannot fail this lane's
-   * scheduler tick or prevent the service from dispatching the next project.
+   * Consider at most GROOMING_CANDIDATE_LIMIT new backlog candidates after
+   * dispatch, stopping at the first grounded contract. Candidate decisions are
+   * pure over one backlog observation; at most one proposal is applied. Every
+   * failure remains diagnostic-only so this lane and later projects continue.
    */
   async #groomIdleLaneAfterDispatch(): Promise<void> {
     if (this.config.mode !== "discovery") return;
+    this.#examinedGroomingCandidates = 0;
     try {
       const [active, ready] = await Promise.all([
         this.tracker.activeClaims(),
@@ -307,26 +316,30 @@ export class LiveV4Runner {
 
       const backlog = await this.tracker.fetchBacklog();
       this.#reconcileGroomingRefusals(backlog);
-      const eligible = backlog.filter((candidate) => !this.#groomingRefusals.has(candidate.id));
-      const proposal = proposeBacklogGrooming(this.config.github.repository, eligible, this.workflow);
-      if (proposal.outcome === "refused") {
-        if (proposal.candidate) {
-          this.#groomingRefusals.set(proposal.candidate.id, {
-            issueId: proposal.candidate.id,
-            issueNumber: proposal.candidate.number,
-            issueIdentifier: proposal.candidate.identifier,
-            relation: proposal.refusal.relation,
-            reason: proposal.refusal.message,
-            revision: groomingRevision(proposal.candidate),
-          });
-          this.onDiagnostic(`grooming refused ${proposal.candidate.identifier}: ${proposal.refusal.message}`);
-        }
-        return;
-      }
+      let eligible = backlog.filter((candidate) => !this.#groomingRefusals.has(candidate.id));
+      while (this.#examinedGroomingCandidates < GROOMING_CANDIDATE_LIMIT) {
+        const proposal = proposeBacklogGrooming(this.config.github.repository, eligible, this.workflow);
+        if (!proposal.candidate) return;
+        this.#examinedGroomingCandidates += 1;
 
-      const report = await this.tracker.applyGrooming(proposal);
-      if (report.outcome === "failed") {
-        this.onDiagnostic(`grooming failed ${report.issueIdentifier} at ${report.step}: ${report.error}`);
+        if (proposal.outcome === "proposed") {
+          const report = await this.tracker.applyGrooming(proposal);
+          if (report.outcome === "failed") {
+            this.onDiagnostic(`grooming failed ${report.issueIdentifier} at ${report.step}: ${report.error}`);
+          }
+          return;
+        }
+
+        this.#groomingRefusals.set(proposal.candidate.id, {
+          issueId: proposal.candidate.id,
+          issueNumber: proposal.candidate.number,
+          issueIdentifier: proposal.candidate.identifier,
+          relation: proposal.refusal.relation,
+          reason: proposal.refusal.message,
+          revision: groomingRevision(proposal.candidate),
+        });
+        this.onDiagnostic(`grooming refused ${proposal.candidate.identifier}: ${proposal.refusal.message}`);
+        eligible = eligible.filter((candidate) => candidate.id !== proposal.candidate!.id);
       }
     } catch (error) {
       this.onDiagnostic(`grooming failed before apply: ${error instanceof Error ? error.message : String(error)}`);
@@ -400,7 +413,13 @@ export class LiveV4Runner {
       : refusals.length === backlog.length
         ? "exhausted"
         : "groomable";
-    return { state, backlogIssueNumbers, refusals };
+    return {
+      state,
+      backlogIssueNumbers,
+      candidateLimit: GROOMING_CANDIDATE_LIMIT,
+      examinedCandidates: this.#examinedGroomingCandidates,
+      refusals,
+    };
   }
 
   /**
