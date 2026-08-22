@@ -644,6 +644,7 @@ export function KanbanBoardContainer() {
           onChangeStatus={handleChangeStatus}
           treatment={treatment}
           expandedTaskIds={expandedTaskIds}
+          returnStateKey={`${activeWorkspaceId ?? 'workspace'}:${projectFilter.join(',') || 'all'}:${activeColumns.map(column => column.id).join(',')}`}
           onTaskClick={openSessionScoped}
           onEditTask={handleEditTask}
           onToggleSubtasks={handleToggleSubtasks}

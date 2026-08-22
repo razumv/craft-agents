@@ -17,6 +17,16 @@ import type { SessionStatus } from '@/config/session-status-config'
 import { useKanbanColumnColors, makeColumnColor } from '@/hooks/useKanbanColumnColors'
 import { KanbanColumn } from './KanbanColumn'
 import { TaskTile } from './TaskTile'
+import {
+  PORTRAIT_CAROUSEL_GAP,
+  PORTRAIT_CAROUSEL_PADDING,
+  getCarouselScrollSnapType,
+  getCarouselSnapOffsets,
+  getKanbanBoardLayout,
+  getNearestCarouselIndex,
+  isKanbanDragEnabled,
+  type KanbanBoardLayout,
+} from './kanban-carousel'
 import type {
   KanbanColumnId,
   KanbanColumnMeta,
@@ -64,6 +74,35 @@ interface KanbanBoardProps {
   onRemoveColumn?: (columnId: string) => void
   /** Append a new custom column (single-project edit mode). Renders the "add column" affordance. */
   onAddColumn?: () => void
+  /** Scope for restoring the carousel column and per-column vertical scroll after navigation. */
+  returnStateKey?: string
+}
+
+interface SavedBoardPosition {
+  activeColumnId?: string
+  columnScrollTop: Record<string, number>
+}
+
+const BOARD_POSITION_PREFIX = 'craft-kanban-position-v1:'
+
+function readBoardPosition(key: string): SavedBoardPosition | null {
+  try {
+    const value = window.sessionStorage.getItem(`${BOARD_POSITION_PREFIX}${key}`)
+    if (!value) return null
+    const parsed = JSON.parse(value) as SavedBoardPosition
+    return parsed && typeof parsed.columnScrollTop === 'object' ? parsed : null
+  } catch {
+    return null
+  }
+}
+
+function writeBoardPosition(key: string, value: SavedBoardPosition): void {
+  try {
+    window.sessionStorage.setItem(`${BOARD_POSITION_PREFIX}${key}`, JSON.stringify(value))
+  } catch {
+    // Position memory is a progressive enhancement; a blocked storage backend
+    // must never stop cards from opening or the board from scrolling.
+  }
 }
 
 /**
@@ -97,6 +136,7 @@ export function KanbanBoard({
   onUpdateColumn,
   onRemoveColumn,
   onAddColumn,
+  returnStateKey = 'all-tasks',
 }: KanbanBoardProps) {
   const { t } = useTranslation()
   const firstColumnId = columns[0]?.id
@@ -124,6 +164,139 @@ export function KanbanBoard({
   // elements marked data-no-dnd (chevron toggle, "Add subtask" composer).
   const sensors = useSensors(useSensor(SmartPointerSensor, { activationConstraint: { distance: 5 } }))
 
+  const scrollViewportRef = React.useRef<HTMLDivElement>(null)
+  const scrollFrameRef = React.useRef<number | null>(null)
+  const columnIdsKey = React.useMemo(() => columns.map(column => column.id).join('\u001f'), [columns])
+  const [layout, setLayout] = React.useState<KanbanBoardLayout>(() =>
+    typeof window === 'undefined' ? 'row' : getKanbanBoardLayout(window.innerWidth, window.innerHeight)
+  )
+  const [activeColumnIndex, setActiveColumnIndex] = React.useState(0)
+  const activeColumnIndexRef = React.useRef(0)
+  activeColumnIndexRef.current = activeColumnIndex
+
+  const getSnapOffsets = React.useCallback(() => {
+    const viewport = scrollViewportRef.current
+    if (!viewport) return []
+    const columnOffsets = Array.from(
+      viewport.querySelectorAll<HTMLElement>('[data-kanban-column-id]'),
+      column => column.offsetLeft
+    )
+    const scrollPaddingStart = Number.parseFloat(window.getComputedStyle(viewport).scrollPaddingLeft) || 0
+    return getCarouselSnapOffsets(columnOffsets, scrollPaddingStart)
+  }, [])
+
+  const saveBoardPosition = React.useCallback(
+    (forcedIndex?: number) => {
+      const viewport = scrollViewportRef.current
+      if (!viewport) return
+      const snapOffsets = getSnapOffsets()
+      const measuredIndex = getNearestCarouselIndex(viewport.scrollLeft, snapOffsets)
+      const index = forcedIndex ?? measuredIndex
+      const columnScrollTop: Record<string, number> = {}
+      viewport.querySelectorAll<HTMLElement>('[data-kanban-column-scroll]').forEach(column => {
+        const id = column.dataset.kanbanColumnScroll
+        if (id) columnScrollTop[id] = column.scrollTop
+      })
+      writeBoardPosition(returnStateKey, {
+        activeColumnId: columns[index]?.id,
+        columnScrollTop,
+      })
+    },
+    [columns, getSnapOffsets, returnStateKey]
+  )
+
+  const alignColumn = React.useCallback(
+    (index: number, behavior: ScrollBehavior = 'auto', persist = true) => {
+      const viewport = scrollViewportRef.current
+      const offsets = getSnapOffsets()
+      if (!viewport || offsets.length === 0) return
+      const boundedIndex = Math.max(0, Math.min(index, offsets.length - 1))
+      viewport.scrollTo({ left: offsets[boundedIndex], behavior })
+      activeColumnIndexRef.current = boundedIndex
+      setActiveColumnIndex(boundedIndex)
+      if (persist) saveBoardPosition(boundedIndex)
+    },
+    [getSnapOffsets, saveBoardPosition]
+  )
+
+  const schedulePositionUpdate = React.useCallback(() => {
+    if (scrollFrameRef.current !== null) cancelAnimationFrame(scrollFrameRef.current)
+    scrollFrameRef.current = requestAnimationFrame(() => {
+      scrollFrameRef.current = null
+      const viewport = scrollViewportRef.current
+      if (!viewport) return
+      const index = getNearestCarouselIndex(viewport.scrollLeft, getSnapOffsets())
+      if (index !== activeColumnIndexRef.current) {
+        activeColumnIndexRef.current = index
+        setActiveColumnIndex(index)
+      }
+      saveBoardPosition(index)
+    })
+  }, [getSnapOffsets, saveBoardPosition])
+
+  // Restore both axes after returning from a card. The column id, rather than a
+  // stale pixel offset, survives width/orientation changes and custom columns.
+  React.useLayoutEffect(() => {
+    const saved = readBoardPosition(returnStateKey)
+    const restoredIndex = saved?.activeColumnId
+      ? Math.max(0, columns.findIndex(column => column.id === saved.activeColumnId))
+      : 0
+    activeColumnIndexRef.current = restoredIndex
+    setActiveColumnIndex(restoredIndex)
+    const frame = requestAnimationFrame(() => {
+      alignColumn(restoredIndex, 'auto', false)
+      const viewport = scrollViewportRef.current
+      if (!viewport) return
+      if (saved) {
+        viewport.querySelectorAll<HTMLElement>('[data-kanban-column-scroll]').forEach(column => {
+          const id = column.dataset.kanbanColumnScroll
+          if (id) column.scrollTop = saved.columnScrollTop[id] ?? 0
+        })
+      }
+      saveBoardPosition(restoredIndex)
+    })
+    return () => cancelAnimationFrame(frame)
+  }, [returnStateKey, columnIdsKey, columns, alignColumn, saveBoardPosition])
+
+  // Re-evaluate only on viewport changes. On both orientation transitions, align
+  // the remembered column to its new real DOM snap point so no partial column is
+  // left onscreen; row mode itself remains the existing flex layout.
+  React.useEffect(() => {
+    const handleViewportChange = () => {
+      setLayout(getKanbanBoardLayout(window.innerWidth, window.innerHeight))
+      requestAnimationFrame(() => alignColumn(activeColumnIndexRef.current))
+    }
+    window.addEventListener('resize', handleViewportChange)
+    window.addEventListener('orientationchange', handleViewportChange)
+    return () => {
+      window.removeEventListener('resize', handleViewportChange)
+      window.removeEventListener('orientationchange', handleViewportChange)
+      if (scrollFrameRef.current !== null) cancelAnimationFrame(scrollFrameRef.current)
+    }
+  }, [alignColumn])
+
+  const handleTaskClick = React.useCallback(
+    (taskId: string) => {
+      saveBoardPosition()
+      onTaskClick?.(taskId)
+    },
+    [onTaskClick, saveBoardPosition]
+  )
+  const handleEditTaskClick = React.useCallback(
+    (taskId: string) => {
+      saveBoardPosition()
+      onEditTask?.(taskId)
+    },
+    [onEditTask, saveBoardPosition]
+  )
+  const handleSubtaskClick = React.useCallback(
+    (taskId: string, subtaskId: string) => {
+      saveBoardPosition()
+      onSubtaskClick?.(taskId, subtaskId)
+    },
+    [onSubtaskClick, saveBoardPosition]
+  )
+
   const activeTask = activeId ? tasks.find(t => t.id === activeId) ?? null : null
 
   const handleDragStart = React.useCallback((event: DragStartEvent) => {
@@ -143,16 +316,39 @@ export function KanbanBoard({
     [tasks, onMoveTask]
   )
 
+  const boundedActiveIndex = Math.max(0, Math.min(activeColumnIndex, Math.max(0, columns.length - 1)))
+  const activeColumn = columns[boundedActiveIndex]
+  const activeColumnLabel = activeColumn?.labelKey ? t(activeColumn.labelKey) : (activeColumn?.name ?? '')
+
   return (
     <DndContext
-      sensors={sensors}
+      // A card must not steal a horizontal phone swipe as a drag. Touch DnD is
+      // outside this contract; desktop/landscape keep the existing sensor set.
+      sensors={isKanbanDragEnabled(layout) ? sensors : []}
       collisionDetection={closestCorners}
       onDragStart={handleDragStart}
       onDragEnd={handleDragEnd}
       onDragCancel={() => setActiveId(null)}
     >
-      <div className="h-full overflow-x-auto">
-      <div className="flex h-full min-w-max gap-3 p-3 snap-x snap-mandatory md:snap-none">
+      <div
+        className="flex h-full min-h-0 flex-col"
+        data-kanban-layout={layout}
+        style={
+          {
+            '--kanban-carousel-padding': `${PORTRAIT_CAROUSEL_PADDING}px`,
+            '--kanban-carousel-gap': `${PORTRAIT_CAROUSEL_GAP}px`,
+            '--kanban-carousel-gutter-total': `${PORTRAIT_CAROUSEL_PADDING * 2}px`,
+          } as React.CSSProperties
+        }
+      >
+        <div
+          ref={scrollViewportRef}
+          data-kanban-scroll
+          className="min-h-0 flex-1 overflow-x-auto"
+          style={{ scrollSnapType: getCarouselScrollSnapType(layout) }}
+          onScrollCapture={schedulePositionUpdate}
+        >
+          <div data-kanban-track className="flex h-full min-w-max gap-3 p-3">
         {columns.map((column, index) => (
           <KanbanColumn
             key={column.id}
@@ -166,10 +362,10 @@ export function KanbanBoard({
             onChangeStatus={onChangeStatus}
             treatment={treatment}
             expandedTaskIds={expandedTaskIds}
-            onTaskClick={onTaskClick}
-            onEditTask={onEditTask}
+            onTaskClick={onTaskClick ? handleTaskClick : undefined}
+            onEditTask={onEditTask ? handleEditTaskClick : undefined}
             onToggleSubtasks={onToggleSubtasks}
-            onSubtaskClick={onSubtaskClick}
+            onSubtaskClick={onSubtaskClick ? handleSubtaskClick : undefined}
             onAddSubtask={onAddSubtask}
             onRunSubtasks={onRunSubtasks}
             subtaskModelGroups={subtaskModelGroups}
@@ -195,7 +391,31 @@ export function KanbanBoard({
             <Plus className="h-4 w-4" strokeWidth={2.5} />
           </button>
         )}
-      </div>
+          </div>
+        </div>
+
+        <div
+          className="kanban-carousel-indicator"
+          aria-live="polite"
+          aria-label={`${activeColumnLabel} — ${boundedActiveIndex + 1} / ${columns.length}`}
+        >
+          <span className="max-w-[60%] truncate text-[11px] font-semibold text-foreground/70">
+            {activeColumnLabel}
+          </span>
+          <span className="text-[11px] tabular-nums text-foreground/50">
+            {boundedActiveIndex + 1} / {columns.length}
+          </span>
+          <div className="flex items-center gap-1.5" aria-hidden="true">
+            {columns.map((column, index) => (
+              <span
+                key={column.id}
+                className={`h-1.5 rounded-full transition-[width,background-color] ${
+                  index === boundedActiveIndex ? 'w-4 bg-foreground/65' : 'w-1.5 bg-foreground/20'
+                }`}
+              />
+            ))}
+          </div>
+        </div>
       </div>
 
       {/* position:fixed overlay clone — escapes the column's overflow clipping.

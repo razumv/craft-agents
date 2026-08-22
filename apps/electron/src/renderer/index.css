@@ -1289,6 +1289,56 @@ html.dark[data-scenic] .fullscreen-overlay-background {
 }
 
 /* ============================================================================
+ * KANBAN PORTRAIT CAROUSEL
+ *
+ * Runtime sets portrait-carousel only for an upright phone-sized viewport. The
+ * existing flex row remains untouched for desktop and landscape. The scroll
+ * viewport owns snapping; each existing column is one mandatory snap stop.
+ * ============================================================================ */
+
+[data-kanban-scroll] {
+  container-type: inline-size;
+}
+
+.kanban-carousel-indicator {
+  display: none;
+}
+
+[data-kanban-layout="portrait-carousel"] [data-kanban-scroll] {
+  overscroll-behavior-inline: contain;
+  scroll-padding-inline-start: calc(var(--kanban-carousel-padding) + env(safe-area-inset-left, 0px));
+  scrollbar-width: none;
+}
+
+[data-kanban-layout="portrait-carousel"] [data-kanban-scroll]::-webkit-scrollbar {
+  display: none;
+}
+
+[data-kanban-layout="portrait-carousel"] [data-kanban-track] {
+  gap: var(--kanban-carousel-gap);
+  padding-left: calc(var(--kanban-carousel-padding) + env(safe-area-inset-left, 0px));
+  padding-right: calc(var(--kanban-carousel-padding) + env(safe-area-inset-right, 0px));
+}
+
+[data-kanban-layout="portrait-carousel"] [data-kanban-column-id] {
+  flex: 0 0 calc(100cqw - var(--kanban-carousel-gutter-total) - env(safe-area-inset-left, 0px) - env(safe-area-inset-right, 0px));
+  width: calc(100cqw - var(--kanban-carousel-gutter-total) - env(safe-area-inset-left, 0px) - env(safe-area-inset-right, 0px));
+}
+
+[data-kanban-layout="portrait-carousel"] .kanban-carousel-indicator {
+  display: flex;
+  min-height: 30px;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  border-top: 1px solid color-mix(in srgb, var(--border) 50%, transparent);
+  padding: 6px calc(12px + env(safe-area-inset-right, 0px))
+    calc(6px + env(safe-area-inset-bottom, 0px))
+    calc(12px + env(safe-area-inset-left, 0px));
+  background: var(--background);
+}
+
+/* ============================================================================
  * CONTAINER QUERY RESPONSIVE RULES
  *
  * These rules adapt component layout based on container width, replacing
