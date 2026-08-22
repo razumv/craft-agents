@@ -12,6 +12,8 @@ export interface OwnerDirective {
   sourceMessageId?: string;
   /** Author timestamp; distinct from receivedAtMs when a polling cycle discovers an older message. */
   sourceTimestampMs?: number;
+  /** Immutable source lifecycle revision observed when a failed decision was ingested. */
+  sourceRevision?: number;
   /** Immutable evidence for the compact acknowledgement projection. */
   acknowledgementId?: string;
 }

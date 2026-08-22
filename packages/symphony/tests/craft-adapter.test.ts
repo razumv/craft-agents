@@ -490,6 +490,81 @@ describe("v4.3 Craft mobile control-plane adapter", () => {
     expect(transport.notes).not.toContain("smaller scope");
   });
 
+  test("ingests an exact lifecycle command before later tool/assistant prose and durably acknowledges one outcome across restart", async () => {
+    const { adapter, transport } = adapterFixture();
+    directOwnerMessage(transport, "live-owner-293", "REVIVE razumv/lineage2-client#293: provider quota reset OPS-293", transport.now - 5_000);
+    transport.byId("owner-desk").messages!.push(
+      { id: "tool-after-owner", role: "tool", content: "null", timestamp: transport.now - 4_000 },
+      { id: "assistant-after-owner", role: "assistant", content: "I cannot relay that command.", timestamp: transport.now - 3_000 },
+    );
+    const failed = {
+      issueId: "LINEAGE_293", issueIdentifier: "razumv/lineage2-client#293", state: "failed",
+      closed: false, providerMerged: false, usedRevivalFacts: [], revivalLimitReached: false,
+    };
+
+    const first = await adapter.pollOwnerDesk([failed]);
+    expect(first.directives).toHaveLength(1);
+    expect(first.directives[0]).toMatchObject({
+      newlyIngested: true,
+      directive: { sourceMessageId: "live-owner-293", sourceTimestampMs: transport.now - 5_000 },
+      failedDecision: { kind: "revive", issueId: "LINEAGE_293", justification: "provider quota reset OPS-293" },
+    });
+    expect(first.latestFailedDecisionOutcome).toBeNull();
+    const outcome = await adapter.acknowledgeFailedDecision(first.directives[0]!.directive, {
+      issueIdentifier: failed.issueIdentifier,
+      decisionKind: "revive",
+      status: "accepted",
+      stage: "readback",
+      reason: "exact provider and reconstructed-ledger readback is ready",
+    });
+    expect(transport.notes).toContain(`ACK ${outcome.id} ACCEPTED readback`);
+
+    const restarted = new CraftMobileControlPlaneAdapter(config(transport), transport);
+    const duplicate = await restarted.pollOwnerDesk([{ ...failed, state: "ready" }]);
+    expect(duplicate.directives).toHaveLength(0);
+    expect(duplicate.providerWriteCalls).toBe(0);
+    expect(duplicate.latestFailedDecisionOutcome).toEqual(outcome);
+    await restarted.projectToDesk({ status: deskStatus, activeRun: null, latestAcknowledgement: null });
+    expect(transport.notes).toContain(`ACK ${outcome.id} ACCEPTED readback`);
+    expect(transport.notes.match(/craft-protocol-v4:owner-directive/g)).toHaveLength(1);
+    expect(transport.notes.match(/craft-protocol-v4:failed-decision-outcome/g)).toHaveLength(1);
+    expect(transport.calls.some((call) => call.channel === "sessions:sendMessage")).toBeFalse();
+  });
+
+  test("persists one stage-specific refusal for malformed, wrong-author, missing-target and missing-timestamp lifecycle intent", async () => {
+    const { adapter, transport } = adapterFixture();
+    const desk = transport.byId("owner-desk");
+    desk.messages!.push(
+      { id: "live-owner-29", role: "user", content: "REVIVE razumv/magnetring#29 because fixed", timestamp: transport.now - 9_000 },
+      { id: "live-assistant-66", role: "assistant", content: "SUPERSEDE Dirty-play/general#66: Dirty-play/general#83", timestamp: transport.now - 8_000 },
+      { id: "live-owner-66", role: "user", content: "SUPERSEDE Dirty-play/general#66: other/repo#83", timestamp: transport.now - 7_000 },
+      { id: "live-owner-83", role: "user", content: "REVIVE Dirty-play/general#83: dependency now released" },
+    );
+    const targets = [
+      { issueId: "DIRTY_66", issueIdentifier: "Dirty-play/general#66", state: "failed", closed: false, providerMerged: false },
+      { issueId: "DIRTY_83", issueIdentifier: "Dirty-play/general#83", state: "failed", closed: false, providerMerged: false },
+    ];
+
+    const first = await adapter.pollOwnerDesk(targets);
+    expect(first.directives).toHaveLength(0);
+    expect(first.refusals).toEqual([
+      expect.stringContaining("live-owner-29"),
+      expect.stringContaining("live-assistant-66"),
+      expect.stringContaining("live-owner-66"),
+      expect.stringContaining("live-owner-83"),
+    ]);
+    expect(transport.notes).toContain('"stage":"syntax"');
+    expect(transport.notes).toContain('"stage":"author"');
+    expect(transport.notes).toContain('"stage":"target"');
+    expect(transport.notes).toContain('"stage":"transport"');
+    expect(transport.notes.match(/craft-protocol-v4:failed-decision-outcome/g)).toHaveLength(4);
+
+    const restarted = new CraftMobileControlPlaneAdapter(config(transport), transport);
+    const second = await restarted.pollOwnerDesk(targets);
+    expect(second.providerWriteCalls).toBe(0);
+    expect(transport.notes.match(/craft-protocol-v4:failed-decision-outcome/g)).toHaveLength(4);
+  });
+
   test("refuses any non-configured source and states a stale gate mismatch", async () => {
     const { adapter, transport } = adapterFixture();
     transport.sessions.push({
@@ -515,7 +590,7 @@ describe("v4.3 Craft mobile control-plane adapter", () => {
 
   test("failed decisions require exact same-Project commands and reject stale or reused inputs before ingestion", () => {
     const source = {
-      issueId: "SOURCE", issueIdentifier: "acme/repo#65", state: "failed", closed: false,
+      issueId: "SOURCE", issueIdentifier: "acme/repo#65", version: 7, state: "failed", closed: false,
       providerMerged: false, usedRevivalFacts: ["quota reset OPS-41"], revivalLimitReached: false,
     };
     const successor = { issueId: "SUCCESSOR", issueIdentifier: "acme/repo#66", state: "ready", closed: false };
@@ -524,12 +599,12 @@ describe("v4.3 Craft mobile control-plane adapter", () => {
     expect(classifyProjectDeskMessage("REVIVE acme/repo#65: quota reset OPS-42", targets)).toMatchObject({
       kind: "directive",
       target: source,
-      failedDecision: { kind: "revive", issueId: "SOURCE", justification: "quota reset OPS-42" },
+      failedDecision: { kind: "revive", issueId: "SOURCE", justification: "quota reset OPS-42", sourceVersion: 7 },
     });
     expect(classifyProjectDeskMessage("SUPERSEDE acme/repo#65: acme/repo#66", targets)).toMatchObject({
       kind: "directive",
       target: source,
-      failedDecision: { kind: "supersede", issueId: "SOURCE", successor: "acme/repo#66" },
+      failedDecision: { kind: "supersede", issueId: "SOURCE", successor: "acme/repo#66", sourceVersion: 7 },
     });
     const magicSource = { ...source, issueId: "MAGIC_94", issueIdentifier: "razumv/magicmarkets#94" };
     const completedMagicSuccessor = {

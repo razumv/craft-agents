@@ -3,7 +3,7 @@
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
-import type { CraftExecutionSession, CraftRpcSession, ProjectDeskReadback } from "./craft-adapter";
+import type { CraftExecutionSession, CraftRpcSession, FailedDecisionOutcome, ProjectDeskReadback } from "./craft-adapter";
 import { decideCiRepair, recordCiRepairAttempt, type CiRepairDecision, type CiRepairProposal } from "./ci-repair";
 import { CraftMobileControlPlaneAdapter } from "./craft-adapter";
 import { CraftCliRpcTransport, type CraftCliTransportConfig } from "./craft-transport";
@@ -136,6 +136,8 @@ export interface LiveRunnerStatus {
   snapshot: TrackerIssueSnapshot | null;
   status: ProjectStatus | null;
   execution: CraftExecutionSession | null;
+  /** Latest exact Desk lifecycle command outcome/refusal, durable in Desk notes. */
+  failedDecisionOutcome: FailedDecisionOutcome | null;
   /** Discovery mode only: one status per issue discovered in the repository. */
   statuses?: ProjectStatus[];
   /**
@@ -175,6 +177,7 @@ export interface LiveShadowReceipt {
   schema: typeof SHADOW_RECEIPT_SCHEMA;
   /** Explicit public projection: no issue body, messages, or final response. */
   projectDesk: ProjectDeskReadback | null;
+  failedDecisionOutcome: FailedDecisionOutcome | null;
   proposal: ShadowProposal | null;
   writes: 0;
   /** SHA-256 over every public receipt field except this hash itself. */
@@ -193,6 +196,9 @@ export class LiveV4Runner {
   /** False only between restoring a local checkpoint and successful live reconciliation. */
   #warmReconciled = true;
   #terminalWorktreeGc: TerminalWorktreeGcReport | null = null;
+  #failedDecisionOutcome: FailedDecisionOutcome | null = null;
+  /** Prevent dispatch after a lifecycle API commits but its Desk ACK is interrupted. */
+  #failedDecisionAcknowledgementPending = false;
 
   constructor(
     readonly config: LiveRunnerConfig,
@@ -325,12 +331,14 @@ export class LiveV4Runner {
     // this tick. Failure is diagnostic-only: an unreadable desk cannot stop the
     // lane, and the fleet service can continue operating its other runners.
     await this.#pollOwnerDesk();
-    await this.#pollFailedDecisionReceipts();
-    // Dispatch always gets first refusal after owner input: an existing ready
-    // issue must consume the lane before autonomous grooming is considered.
-    await this.scheduler.tick(crashAfter);
-    await this.#groomIdleLaneAfterDispatch();
-    await this.#collectTerminalWorktrees();
+    if (!this.#failedDecisionAcknowledgementPending) {
+      await this.#pollFailedDecisionReceipts();
+      // Dispatch always gets first refusal after owner input: an existing ready
+      // issue must consume the lane before autonomous grooming is considered.
+      await this.scheduler.tick(crashAfter);
+      await this.#groomIdleLaneAfterDispatch();
+      await this.#collectTerminalWorktrees();
+    }
     return this.#readStatusInScope();
   }
 
@@ -374,15 +382,17 @@ export class LiveV4Runner {
   }
 
   async #pollOwnerDesk(): Promise<void> {
+    this.#failedDecisionAcknowledgementPending = false;
     try {
       const snapshots = this.config.mode === "discovery"
-        ? await this.tracker.fetchIssuesByStates(lifecycleStates)
+        ? await (this.tracker.fetchFailedDecisionTargets?.() ?? this.tracker.fetchIssuesByStates(lifecycleStates))
         : [await this.tracker.get(this.#pinnedIssueId())];
       const poll = await this.craft.pollOwnerDesk(snapshots.map((snapshot) => {
         const revivals = snapshot.events.filter((event) => event.kind === "revival");
         return {
           issueId: snapshot.issue.id,
           issueIdentifier: snapshot.issue.identifier,
+          version: snapshot.version,
           state: snapshot.issue.state,
           closed: snapshot.issue.closed,
           providerMerged: Boolean(snapshot.evidence.mergedAt && snapshot.evidence.mergeCommitSha),
@@ -393,6 +403,7 @@ export class LiveV4Runner {
             : {}),
         };
       }));
+      this.#failedDecisionOutcome = poll.latestFailedDecisionOutcome;
       for (const refusal of poll.refusals) this.onDiagnostic(`owner directive refused: ${refusal}`);
       for (const item of poll.directives) {
         let current = item.gateDecision || item.failedDecision ? await this.tracker.get(item.directive.issueId) : null;
@@ -400,17 +411,46 @@ export class LiveV4Runner {
           const actual = current?.evidence.ownerGateId ?? "none";
           throw new Error(`owner decision gate ${item.gateDecision.gateId} does not match the currently open gate (${actual})`);
         }
+        const failedDecisionAlreadyCommitted = item.failedDecision
+          ? this.#failedDecisionCommitted(current!, item.failedDecision)
+          : false;
         if (item.failedDecision) {
-          const precondition = await this.#failedDecisionPrecondition(current!, item.failedDecision);
+          const precondition = failedDecisionAlreadyCommitted ? null : await this.#failedDecisionPrecondition(current!, item.failedDecision);
           if (precondition) {
-            this.onDiagnostic(`failed decision ${item.failedDecision.kind} ${current!.issue.identifier} refused: ${precondition}`);
+            const message = `failed decision ${item.failedDecision.kind} ${current!.issue.identifier} refused: ${precondition}`;
+            this.onDiagnostic(message);
+            this.#failedDecisionOutcome = await this.craft.acknowledgeFailedDecision(item.directive, {
+              issueIdentifier: current!.issue.identifier,
+              decisionKind: item.failedDecision.kind,
+              status: "refused",
+              stage: "preflight",
+              reason: precondition,
+            });
             continue;
           }
         }
         if (!this.tracker.recordOwnerDirective) throw new Error("tracker cannot persist owner directive receipts");
-        await this.tracker.recordOwnerDirective(item.directive);
+        // A committed decision proves its directive receipt preceded the API;
+        // after restart, do not append/read that provider receipt a second time.
+        if (!failedDecisionAlreadyCommitted || item.newlyIngested) {
+          await this.tracker.recordOwnerDirective(item.directive);
+        }
         if (item.failedDecision) {
-          await this.#applyFailedDecision(item.failedDecision, `Project Desk directive ${item.directive.id}`);
+          const outcome = await this.#applyFailedDecision(item.failedDecision, `Project Desk directive ${item.directive.id}`);
+          try {
+            this.#failedDecisionOutcome = await this.craft.acknowledgeFailedDecision(item.directive, {
+              issueIdentifier: current!.issue.identifier,
+              decisionKind: item.failedDecision.kind,
+              ...outcome,
+            });
+          } catch (error) {
+            // A successful revival can become claimable immediately. Do not let
+            // dispatch advance it until the same Desk durably carries its ACK;
+            // the next tick reconstructs the exact final decision event first.
+            if (outcome.status === "accepted") this.#failedDecisionAcknowledgementPending = true;
+            throw error;
+          }
+          continue;
           continue;
         }
         if (!item.gateDecision || !current) continue;
@@ -451,6 +491,9 @@ export class LiveV4Runner {
 
   async #failedDecisionPrecondition(snapshot: TrackerIssueSnapshot, decision: FailedLifecycleDecision): Promise<string | null> {
     if (snapshot.issue.id !== decision.issueId) return "decision source does not match exact issue readback";
+    if (decision.sourceVersion !== undefined && snapshot.version !== decision.sourceVersion) {
+      return `source ledger revision changed from ${decision.sourceVersion} to ${snapshot.version} after command ingestion`;
+    }
     if (snapshot.evidence.mergedAt && snapshot.evidence.mergeCommitSha) return "provider merge evidence already records delivery";
     if (snapshot.issue.state !== "failed") return `source lifecycle is ${snapshot.issue.state}, not failed`;
     if (snapshot.issue.closed) return "source issue is closed";
@@ -485,29 +528,53 @@ export class LiveV4Runner {
     return null;
   }
 
-  async #applyFailedDecision(decision: FailedLifecycleDecision, source: string): Promise<void> {
+  #failedDecisionCommitted(snapshot: TrackerIssueSnapshot, decision: FailedLifecycleDecision): boolean {
+    const expectedState = decision.kind === "revive" ? "ready" : "cancelled";
+    if (snapshot.issue.state !== expectedState) return false;
+    // A Desk-ingested command captures the failed source revision. Its decision
+    // must be the one and only next ledger commit, not merely an older matching
+    // event followed by unrelated work.
+    if (decision.sourceVersion !== undefined && snapshot.version !== decision.sourceVersion + 1) return false;
+    const event = snapshot.events.at(-1);
+    return Boolean(event && (decision.kind === "revive"
+      ? event.kind === "revival" && event.justification === decision.justification && event.state === expectedState
+      : event.kind === "supersession" && event.successor === decision.successor && event.state === expectedState));
+  }
+
+  async #applyFailedDecision(
+    decision: FailedLifecycleDecision,
+    source: string,
+  ): Promise<{ status: "accepted" | "refused"; stage: string; reason: string }> {
     const before = await this.tracker.get(decision.issueId);
+    // Crash recovery: the API may have committed after the directive receipt but
+    // before Desk acknowledgement. Exact reconstructed ledger evidence is the
+    // only permission to finish the acknowledgement without invoking again.
+    if (this.#failedDecisionCommitted(before, decision)) {
+      const reason = "exact provider and reconstructed-ledger readback proves the decision was already committed";
+      this.onDiagnostic(`failed decision ${decision.kind} ${before.issue.identifier} accepted from ${source}: ${reason}`);
+      return { status: "accepted", stage: "readback", reason };
+    }
     const precondition = await this.#failedDecisionPrecondition(before, decision);
     if (precondition) {
       this.onDiagnostic(`failed decision ${decision.kind} ${before.issue.identifier} refused from ${source}: ${precondition}`);
-      return;
+      return { status: "refused", stage: "preflight", reason: precondition };
     }
     const result = decision.kind === "revive"
       ? await this.tracker.reviveFailed(decision.issueId, decision.justification, Date.now())
       : await this.tracker.supersedeFailed(decision.issueId, decision.successor, Date.now());
     if (!result.accepted) {
       this.onDiagnostic(`failed decision ${decision.kind} ${before.issue.identifier} refused from ${source}: ${result.reason}`);
-      return;
+      return { status: "refused", stage: "api", reason: result.reason };
     }
     const readback = await this.tracker.get(decision.issueId);
     const expectedState = decision.kind === "revive" ? "ready" : "cancelled";
-    const exactEvent = readback.events.some((event) => decision.kind === "revive"
-      ? event.kind === "revival" && event.justification === decision.justification && event.state === expectedState
-      : event.kind === "supersession" && event.successor === decision.successor && event.state === expectedState);
-    if (readback.issue.state !== expectedState || !exactEvent || readback.version !== result.snapshot.version) {
-      throw new Error(`${decision.kind} ${before.issue.identifier} durable decision readback did not reconstruct exact ${expectedState} lifecycle state`);
+    if (!this.#failedDecisionCommitted(readback, decision) || readback.version !== result.snapshot.version) {
+      const reason = `${decision.kind} ${before.issue.identifier} durable decision readback did not reconstruct exact ${expectedState} lifecycle state and committed revision`;
+      this.onDiagnostic(`failed decision ${decision.kind} ${before.issue.identifier} refused from ${source}: ${reason}`);
+      return { status: "refused", stage: "readback", reason };
     }
     this.onDiagnostic(`failed decision ${decision.kind} ${before.issue.identifier} accepted from ${source}: ${result.reason}`);
+    return { status: "accepted", stage: "readback", reason: result.reason };
   }
 
   /**
@@ -581,6 +648,7 @@ export class LiveV4Runner {
       snapshot,
       status: projectStatus(snapshot),
       execution,
+      failedDecisionOutcome: this.#failedDecisionOutcome,
       ...(this.#terminalWorktreeGc ? { terminalWorktreeGc: this.#terminalWorktreeGc } : {}),
     };
   }
@@ -607,6 +675,7 @@ export class LiveV4Runner {
       snapshot: primary,
       status: primary ? projectStatus(primary) : null,
       execution,
+      failedDecisionOutcome: this.#failedDecisionOutcome,
       statuses,
       backlog,
       grooming: this.#groomingReport(backlog),
@@ -790,7 +859,13 @@ export class LiveV4Runner {
         ? this.scheduler.previewNext()
         : this.scheduler.preview(this.#pinnedIssueId()),
     ]);
-    const payload = { schema: SHADOW_RECEIPT_SCHEMA, projectDesk, proposal, writes: 0 as const };
+    const payload = {
+      schema: SHADOW_RECEIPT_SCHEMA,
+      projectDesk,
+      failedDecisionOutcome: status.failedDecisionOutcome,
+      proposal,
+      writes: 0 as const,
+    };
     return {
       ...payload,
       receiptHash: createHash("sha256").update(canonicalJson(payload)).digest("hex"),

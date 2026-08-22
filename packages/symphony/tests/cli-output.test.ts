@@ -37,6 +37,7 @@ describe("runner CLI status output", () => {
       snapshot: null,
       status: first,
       execution: null,
+      failedDecisionOutcome: null,
       statuses: [first, second],
     };
 
@@ -49,7 +50,7 @@ describe("runner CLI status output", () => {
 
   test("compact output prints the pinned issue when discovery statuses are absent", () => {
     const pinned = status("razumv/craft-agents#25", "pr-open", "https://github.com/razumv/craft-agents/pull/42");
-    const value: LiveRunnerStatus = { snapshot: null, status: pinned, execution: null };
+    const value: LiveRunnerStatus = { snapshot: null, status: pinned, execution: null, failedDecisionOutcome: null };
 
     expect(formatStatusOutput(value, true)).toBe(
       "razumv/craft-agents#25\tpr-open\thttps://github.com/razumv/craft-agents/pull/42\n",
@@ -61,6 +62,7 @@ describe("runner CLI status output", () => {
       snapshot: null,
       status: status("razumv/craft-agents#25", "running", null),
       execution: null,
+      failedDecisionOutcome: null,
     };
 
     expect(formatStatusOutput(value)).toBe(`${JSON.stringify(value, null, 2)}\n`);
