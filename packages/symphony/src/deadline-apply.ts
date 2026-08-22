@@ -43,8 +43,19 @@ export type DeadlineSuccessorApplyReport =
 
 const attributionPrefix = "<!-- craft-agent/symphony-deadline-successor@1 ";
 
+export interface DeadlineSuccessorAttributionReceipt {
+  contractId: string;
+  sourceIssueIdentifier: string;
+}
+
 export function deadlineSuccessorAttribution(proposal: DeadlineSuccessorProposal): string {
   return `${attributionPrefix}${proposal.contract.id} -->\nDeadline successor ${proposal.contract.id} was created by Symphony from failed source ${proposal.sourceIssueIdentifier}.`;
+}
+
+/** Parse only the exact immutable receipt emitted by the #94 apply path. */
+export function parseDeadlineSuccessorAttribution(body: string): DeadlineSuccessorAttributionReceipt | null {
+  const match = /^<!-- craft-agent\/symphony-deadline-successor@1 ([A-Za-z0-9._-]+) -->\nDeadline successor \1 was created by Symphony from failed source ([^\s]+#\d+)\.$/.exec(body);
+  return match ? { contractId: match[1]!, sourceIssueIdentifier: match[2]! } : null;
 }
 
 /**

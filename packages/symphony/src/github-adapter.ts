@@ -16,7 +16,11 @@ import {
   type WorkflowConfig,
 } from "./domain";
 import { parseIssueContract } from "./contract";
-import { applyDeadlineSuccessor, type DeadlineSuccessorApplyReport } from "./deadline-apply";
+import {
+  applyDeadlineSuccessor,
+  parseDeadlineSuccessorAttribution,
+  type DeadlineSuccessorApplyReport,
+} from "./deadline-apply";
 import type { DeadlineSuccessorProposal } from "./deadline-triage";
 import {
   appliedGroomingBody,
@@ -43,6 +47,7 @@ import {
 } from "./ci-repair";
 import { OwnerDirectiveLedger, type OwnerDirective } from "./ledger";
 import type {
+  FailedDecisionReceiptPoll,
   LifecycleDecisionResult,
   PullRequestVerdict,
   PreservationRecord,
@@ -190,6 +195,96 @@ export class GitHubIssuesProjectsAdapter implements TrackerAdapter {
 
   async applyDeadlineSuccessor(proposal: DeadlineSuccessorProposal | null): Promise<DeadlineSuccessorApplyReport> {
     return applyDeadlineSuccessor(proposal, this.config, this.transport);
+  }
+
+  /**
+   * Discover only exact #94 attribution receipts on configured-Project issues.
+   * This is read-only: the runner must route an accepted receipt through the
+   * existing supersedeFailed ledger operation.
+   */
+  async pollFailedDecisionReceipts(): Promise<FailedDecisionReceiptPoll> {
+    const entries = [...(await this.loadAll(false)).values()];
+    const byIdentifier = new Map<string, CoreHydrated[]>();
+    for (const entry of entries) {
+      const key = entry.snapshot.issue.identifier;
+      byIdentifier.set(key, [...(byIdentifier.get(key) ?? []), entry]);
+    }
+    const refusals: string[] = [];
+    const candidates = new Map<string, { source: CoreHydrated; successor: CoreHydrated; evidenceId: string }[]>();
+
+    for (const successor of entries.filter((entry) => entry.contract.id.endsWith("-DEADLINE-SUCCESSOR"))) {
+      const comments = await collectPages((cursor) => this.transport.listComments(successor.snapshot.issue.id, cursor));
+      const receiptLike = comments.filter((comment) => comment.body.includes("craft-agent/symphony-deadline-successor@1"));
+      const exact = receiptLike.flatMap((comment) => {
+        if (this.config.eventAuthorLogin && comment.authorLogin !== this.config.eventAuthorLogin) return [];
+        const receipt = parseDeadlineSuccessorAttribution(comment.body);
+        return receipt ? [{ comment, receipt }] : [];
+      });
+      if (receiptLike.length !== exact.length) {
+        refusals.push(`supersede ${successor.snapshot.issue.identifier} failed check: successor-creation receipt is malformed or has the wrong provider author`);
+        continue;
+      }
+      if (exact.length === 0) continue;
+      if (exact.length !== 1) {
+        refusals.push(`supersede ${successor.snapshot.issue.identifier} failed check: successor-creation receipt is ambiguous (${exact.length} exact receipts)`);
+        continue;
+      }
+      const { comment, receipt } = exact[0]!;
+      if (receipt.contractId !== successor.contract.id) {
+        refusals.push(`supersede ${successor.snapshot.issue.identifier} failed check: receipt contract ${receipt.contractId} does not match successor contract ${successor.contract.id}`);
+        continue;
+      }
+      const sources = byIdentifier.get(receipt.sourceIssueIdentifier) ?? [];
+      if (sources.length !== 1) {
+        refusals.push(`supersede ${receipt.sourceIssueIdentifier} failed check: source is missing or ambiguous in this configured repository and Project`);
+        continue;
+      }
+      const source = sources[0]!;
+      if (successor.contract.id !== `${source.contract.id}-DEADLINE-SUCCESSOR`) {
+        refusals.push(`supersede ${receipt.sourceIssueIdentifier} failed check: successor contract is not the exact #94 derivative of the source contract`);
+        continue;
+      }
+      if (successor.snapshot.issue.closed) {
+        refusals.push(`supersede ${receipt.sourceIssueIdentifier} failed check: successor ${successor.snapshot.issue.identifier} is closed`);
+        continue;
+      }
+      const alreadyApplied = source.snapshot.issue.state === "cancelled"
+        && source.snapshot.events.some((event) => event.kind === "supersession" && event.successor === successor.snapshot.issue.identifier);
+      if (alreadyApplied) continue;
+      if (source.snapshot.issue.state !== "failed") {
+        refusals.push(`supersede ${receipt.sourceIssueIdentifier} failed check: source lifecycle is ${source.snapshot.issue.state}, not failed`);
+        continue;
+      }
+      if (source.snapshot.issue.closed) {
+        refusals.push(`supersede ${receipt.sourceIssueIdentifier} failed check: source issue is closed`);
+        continue;
+      }
+      if (source.snapshot.evidence.mergedAt && source.snapshot.evidence.mergeCommitSha) {
+        refusals.push(`supersede ${receipt.sourceIssueIdentifier} failed check: provider merge evidence already records delivery`);
+        continue;
+      }
+      candidates.set(source.snapshot.issue.id, [
+        ...(candidates.get(source.snapshot.issue.id) ?? []),
+        { source, successor, evidenceId: `deadline-successor-receipt:${successor.snapshot.issue.id}:${comment.databaseId}` },
+      ]);
+    }
+
+    const decisions: FailedDecisionReceiptPoll["decisions"] = [];
+    for (const values of candidates.values()) {
+      if (values.length !== 1) {
+        refusals.push(`supersede ${values[0]!.source.snapshot.issue.identifier} failed check: ${values.length} exact successor receipts are ambiguous`);
+        continue;
+      }
+      const value = values[0]!;
+      decisions.push({
+        kind: "supersede",
+        issueId: value.source.snapshot.issue.id,
+        successorIssueId: value.successor.snapshot.issue.id,
+        successor: value.successor.snapshot.issue.identifier,
+        evidenceId: value.evidenceId,
+      });
+    }
+    return { decisions, refusals };
   }
 
   async fetchIssuesByStates(states: readonly LifecycleState[]): Promise<TrackerIssueSnapshot[]> {
@@ -1063,7 +1158,7 @@ export class GitHubIssuesProjectsAdapter implements TrackerAdapter {
     return found;
   }
 
-  private loadAll(strict: boolean, requested = new Set<string>()): Promise<Map<string, Hydrated>> {
+  private loadAll(strict: boolean, requested = new Set<string>()): Promise<Map<string, CoreHydrated>> {
     return this.#withStateLock(async () => {
       const scan = await this.#scanRecords(requested);
       // Work on clones so a failed strict read cannot partially mutate the last
@@ -1109,7 +1204,7 @@ export class GitHubIssuesProjectsAdapter implements TrackerAdapter {
       }
       const byContract = indexUnique(cores, (entry) => entry.contract.id);
       const byIdentifier = indexUnique(cores, (entry) => entry.snapshot.issue.identifier);
-      const output = new Map<string, Hydrated>();
+      const output = new Map<string, CoreHydrated>();
       for (const [id, core] of cores) {
         try {
           const dependencies = core.contract.dependencies.map((dependency) => resolveDependency(dependency, byContract, byIdentifier));

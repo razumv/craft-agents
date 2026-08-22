@@ -7,6 +7,7 @@ import {
   applyDeadlineSuccessor,
   lifecycleStates,
   loadWorkflow,
+  parseDeadlineSuccessorAttribution,
   parseIssueContract,
   proposeDeadlineSuccessor,
   type GitHubAdapterConfig,
@@ -219,7 +220,22 @@ function successorRecords(transport: SuccessorTransport): GitHubIssueRecord[] {
   return [...transport.records.values()].filter((record) => record.id !== "SOURCE");
 }
 
+function deadlineReceiptFixture(): string {
+  return "<!-- craft-agent/symphony-deadline-successor@1 DEADLINE-SOURCE-DEADLINE-SUCCESSOR -->\nDeadline successor DEADLINE-SOURCE-DEADLINE-SUCCESSOR was created by Symphony from failed source acme/repo#65.";
+}
+
 describe("deadline successor apply", () => {
+  test("parses only the exact #94 successor-creation receipt", () => {
+    const expected = deadlineReceiptFixture();
+    expect(parseDeadlineSuccessorAttribution(expected)).toEqual({
+      contractId: "DEADLINE-SOURCE-DEADLINE-SUCCESSOR",
+      sourceIssueIdentifier: "acme/repo#65",
+    });
+    expect(parseDeadlineSuccessorAttribution(`${expected}\nextra`)).toBeNull();
+    expect(parseDeadlineSuccessorAttribution(expected.replace("was created", "might be created"))).toBeNull();
+    expect(parseDeadlineSuccessorAttribution(expected.replace("DEADLINE-SOURCE-DEADLINE-SUCCESSOR -->", "OTHER -->"))).toBeNull();
+  });
+
   test("creates one attributable exact contract, verifies Project ready, and writes the ready label last", async () => {
     const transport = new SuccessorTransport();
     transport.reorderSourceLabelsOnReadback = true;

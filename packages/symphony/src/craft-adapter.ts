@@ -9,6 +9,7 @@ import type {
   RunIdentity,
 } from "./domain";
 import { OwnerDirectiveLedger, parseOwnerGateDecision, type OwnerDirective, type OwnerGateDecision } from "./ledger";
+import type { FailedLifecycleDecision } from "./tracker";
 import { ModelPolicy } from "./policy";
 import { compactRunSummary } from "./status";
 import { assertRuntimeIdentity, type CraftRpcTransport, type CraftRuntimeIdentity } from "./craft-transport";
@@ -157,12 +158,18 @@ export interface DirectOwnerDirectiveInput {
 export interface ProjectDeskDirectiveTarget {
   issueId: string;
   issueIdentifier: string;
+  state?: string;
+  closed?: boolean;
+  providerMerged?: boolean;
+  usedRevivalFacts?: readonly string[];
+  revivalLimitReached?: boolean;
   gateId?: string;
 }
 
 export interface PolledOwnerDirective {
   directive: Readonly<OwnerDirective>;
   gateDecision: OwnerGateDecision | null;
+  failedDecision?: FailedLifecycleDecision | null;
   newlyIngested: boolean;
 }
 
@@ -478,6 +485,7 @@ export class CraftMobileControlPlaneAdapter implements CraftControlAdapter {
         directives.push({
           directive: existing,
           gateDecision: classified.gateId ? parseOwnerGateDecision(classified.verbatim, classified.gateId) : null,
+          failedDecision: classified.failedDecision ? { ...classified.failedDecision, evidenceId: id } : null,
           newlyIngested: false,
         });
         continue;
@@ -498,6 +506,7 @@ export class CraftMobileControlPlaneAdapter implements CraftControlAdapter {
       directives.push({
         directive: candidate,
         gateDecision: classified.gateId ? parseOwnerGateDecision(classified.verbatim, classified.gateId) : null,
+        failedDecision: classified.failedDecision ? { ...classified.failedDecision, evidenceId: id } : null,
         newlyIngested: true,
       });
     }
@@ -867,12 +876,67 @@ export class CraftMobileControlPlaneAdapter implements CraftControlAdapter {
 type ClassifiedDeskMessage =
   | { kind: "conversation" }
   | { kind: "refused"; reason: string }
-  | { kind: "directive"; target: ProjectDeskDirectiveTarget; verbatim: string; gateId?: string };
+  | {
+      kind: "directive";
+      target: ProjectDeskDirectiveTarget;
+      verbatim: string;
+      gateId?: string;
+      failedDecision?: FailedLifecycleDecision;
+    };
 
 export function classifyProjectDeskMessage(
   content: string,
   targets: readonly ProjectDeskDirectiveTarget[],
 ): ClassifiedDeskMessage {
+  const failed = /^(REVIVE|SUPERSEDE) (\S+): ([^\n]+)$/.exec(content);
+  if (failed) {
+    const kind = failed[1] === "REVIVE" ? "revive" : "supersede";
+    const reference = failed[2]!.trim();
+    const sourceMatches = targets.filter((target) => target.issueIdentifier === reference);
+    if (sourceMatches.length !== 1) {
+      return { kind: "refused", reason: `${kind} source ${reference} does not match one issue in this configured repository and Project` };
+    }
+    const source = sourceMatches[0]!;
+    if (source.state !== "failed") return { kind: "refused", reason: `${kind} ${reference} failed check: source lifecycle is ${source.state ?? "unknown"}, not failed` };
+    if (source.closed) return { kind: "refused", reason: `${kind} ${reference} failed check: source issue is closed` };
+    if (source.providerMerged) return { kind: "refused", reason: `${kind} ${reference} failed check: provider merge evidence already records delivery` };
+    const argument = failed[3]!.trim();
+    if (!argument) return { kind: "refused", reason: `${kind} ${reference} failed check: decision argument is blank` };
+    if (kind === "revive") {
+      if (source.usedRevivalFacts?.includes(argument)) {
+        return { kind: "refused", reason: `revive ${reference} failed check: change already used: ${argument}` };
+      }
+      if (source.revivalLimitReached) {
+        return { kind: "refused", reason: `revive ${reference} failed check: configured revival limit is already reached` };
+      }
+      return {
+        kind: "directive",
+        target: source,
+        verbatim: content,
+        failedDecision: { kind, issueId: source.issueId, justification: argument, evidenceId: "owner-command" },
+      };
+    }
+    const successorMatches = targets.filter((target) => target.issueIdentifier === argument);
+    if (successorMatches.length !== 1 || successorMatches[0]!.closed) {
+      return { kind: "refused", reason: `supersede ${reference} failed check: successor ${argument} is missing, closed, or outside this configured repository and Project` };
+    }
+    if (successorMatches[0]!.issueId === source.issueId) {
+      return { kind: "refused", reason: `supersede ${reference} failed check: successor must be a different issue` };
+    }
+    return {
+      kind: "directive",
+      target: source,
+      verbatim: content,
+      failedDecision: {
+        kind,
+        issueId: source.issueId,
+        successorIssueId: successorMatches[0]!.issueId,
+        successor: argument,
+        evidenceId: "owner-command",
+      },
+    };
+  }
+
   const directive = /^DIRECTIVE ([^:\n]+): ([\s\S]+)$/.exec(content);
   if (directive) {
     const reference = directive[1]!.trim();
@@ -899,6 +963,11 @@ export function classifyProjectDeskMessage(
       };
     }
     return { kind: "directive", target: match[0]!, verbatim: content, gateId: statedGateId };
+  }
+  const failedIntent = /\b(REVIVE|SUPERSEDE)\b/i.exec(content);
+  if (failedIntent) {
+    const decision = failedIntent[1]!.toLowerCase();
+    return { kind: "refused", reason: `${decision} failed check: owner instruction does not match the exact Project Desk command syntax` };
   }
   if (/^(?:DIRECTIVE|APPROVE|REJECT)(?:\s|$)/.test(content)) {
     return { kind: "refused", reason: "owner instruction does not match the exact Project Desk command syntax" };

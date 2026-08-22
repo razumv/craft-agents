@@ -6,6 +6,7 @@ import {
   CraftMobileControlPlaneAdapter,
   IdentityFactory,
   compactProjectDeskProjection,
+  classifyProjectDeskMessage,
   parseOwnerGateDecision,
   validateCraftCliConfig,
   type Claim,
@@ -510,6 +511,47 @@ describe("v4.3 Craft mobile control-plane adapter", () => {
     expect(poll.refusals).toEqual([
       "Project Desk message stale-gate: owner decision gate gate-old does not match the currently open gate (gate-current)",
     ]);
+  });
+
+  test("failed decisions require exact same-Project commands and reject stale or reused inputs before ingestion", () => {
+    const source = {
+      issueId: "SOURCE", issueIdentifier: "acme/repo#65", state: "failed", closed: false,
+      providerMerged: false, usedRevivalFacts: ["quota reset OPS-41"], revivalLimitReached: false,
+    };
+    const successor = { issueId: "SUCCESSOR", issueIdentifier: "acme/repo#66", state: "ready", closed: false };
+    const targets = [source, successor];
+
+    expect(classifyProjectDeskMessage("REVIVE acme/repo#65: quota reset OPS-42", targets)).toMatchObject({
+      kind: "directive",
+      target: source,
+      failedDecision: { kind: "revive", issueId: "SOURCE", justification: "quota reset OPS-42" },
+    });
+    expect(classifyProjectDeskMessage("SUPERSEDE acme/repo#65: acme/repo#66", targets)).toMatchObject({
+      kind: "directive",
+      target: source,
+      failedDecision: { kind: "supersede", issueId: "SOURCE", successor: "acme/repo#66" },
+    });
+    expect(classifyProjectDeskMessage("REVIVE acme/repo#65: quota reset OPS-41", targets)).toMatchObject({
+      kind: "refused", reason: expect.stringContaining("change already used"),
+    });
+    expect(classifyProjectDeskMessage("SUPERSEDE acme/repo#65: other/repo#66", targets)).toMatchObject({
+      kind: "refused", reason: expect.stringContaining("outside this configured repository and Project"),
+    });
+    expect(classifyProjectDeskMessage("REVIVE acme/repo#65 quota reset", targets)).toEqual({
+      kind: "refused", reason: "revive failed check: owner instruction does not match the exact Project Desk command syntax",
+    });
+    expect(classifyProjectDeskMessage("revive acme/repo#65: changed", targets)).toEqual({
+      kind: "refused", reason: "revive failed check: owner instruction does not match the exact Project Desk command syntax",
+    });
+    expect(classifyProjectDeskMessage("SUPERSEDE  acme/repo#65: acme/repo#66", targets)).toEqual({
+      kind: "refused", reason: "supersede failed check: owner instruction does not match the exact Project Desk command syntax",
+    });
+    expect(classifyProjectDeskMessage("Please revive acme/repo#65", targets)).toEqual({
+      kind: "refused", reason: "revive failed check: owner instruction does not match the exact Project Desk command syntax",
+    });
+    expect(classifyProjectDeskMessage("REVIVE acme/repo#65: changed", [{ ...source, state: "ready" }])).toMatchObject({
+      kind: "refused", reason: expect.stringContaining("source lifecycle is ready, not failed"),
+    });
   });
 
   test("gate decisions require the exact immutable command", async () => {
