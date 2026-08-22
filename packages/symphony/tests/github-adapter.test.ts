@@ -71,6 +71,7 @@ class MemoryGitHubTransport implements GitHubTransport {
 
   addIssue(number: number, state: LifecycleState = "ready", dependencies: string[] = [], risk: "low" | "medium" | "high" = "low"): GitHubIssueRecord {
     const id = `I_${number}`;
+    const day = String(((number - 1) % 28) + 1).padStart(2, "0");
     const record: GitHubIssueRecord = {
       id,
       number,
@@ -78,8 +79,9 @@ class MemoryGitHubTransport implements GitHubTransport {
       body: contract(`WORK-${number}`, dependencies, risk),
       url: `https://github.test/acme/repo/issues/${number}`,
       state: state === "done" ? "CLOSED" : "OPEN",
-      createdAt: `2026-08-${String(number).padStart(2, "0")}T10:00:00Z`,
-      updatedAt: `2026-08-${String(number).padStart(2, "0")}T10:00:00Z`,
+      createdAt: `2026-08-${day}T10:00:00Z`,
+      updatedAt: `2026-08-${day}T10:00:00Z`,
+      closedAt: state === "done" ? `2026-08-${day}T12:00:00Z` : null,
       assigneeId: null,
     };
     this.issues.push(record);
@@ -253,13 +255,14 @@ function config(
   claimFenceIssueId = "FENCE",
   configuredClaimFenceIssueIds: readonly string[] = [claimFenceIssueId],
   onDiagnostic?: (message: string) => void,
+  repository = "acme/repo",
 ): GitHubAdapterConfig {
   const states = Object.fromEntries(lifecycleStates.map((state) => [state, {
     label: `state:${state}`,
     projectStatusOptionId: `opt-${state}`,
   }])) as Record<LifecycleState, { label: string; projectStatusOptionId: string }>;
   return {
-    repository: "acme/repo",
+    repository,
     projectId: "PROJECT",
     claimFenceIssueId,
     configuredClaimFenceIssueIds,
@@ -269,7 +272,7 @@ function config(
     states,
     workflow: {
       ...workflow.config,
-      project: { ...workflow.config.project, repository: "acme/repo" },
+      project: { ...workflow.config.project, repository },
       tracker: { ...workflow.config.tracker, kind: "github" },
     },
     eventAuthorLogin: "craft-bot",
@@ -277,12 +280,12 @@ function config(
   };
 }
 
-function setup(): { transport: MemoryGitHubTransport; truth: MemoryWorkspaceTruth; adapter: GitHubIssuesProjectsAdapter } {
+function setup(repository = "acme/repo"): { transport: MemoryGitHubTransport; truth: MemoryWorkspaceTruth; adapter: GitHubIssuesProjectsAdapter } {
   const transport = new MemoryGitHubTransport();
   transport.branches.set("main", { name: "main", url: "https://github.test/acme/repo/tree/main", oid: "b".repeat(40) });
   transport.comments.set("FENCE", []);
   const truth = new MemoryWorkspaceTruth();
-  return { transport, truth, adapter: new GitHubIssuesProjectsAdapter(config(), transport, truth) };
+  return { transport, truth, adapter: new GitHubIssuesProjectsAdapter(config("FENCE", ["FENCE"], undefined, repository), transport, truth) };
 }
 
 function compactConfig(): GitHubAdapterConfig {
@@ -316,6 +319,7 @@ function attachPr(
   merged = false,
   checks: { state: string | null; count: number } = { state: "SUCCESS", count: 1 },
   mergeable: "MERGEABLE" | "CONFLICTING" | "UNKNOWN" = "MERGEABLE",
+  headRefName = "v4/acme-repo-1",
 ): void {
   transport.prs.set(issueId, [{
     mergeable,
@@ -324,15 +328,15 @@ function attachPr(
     id: "PR_1",
     url: "https://github.test/acme/repo/pull/1",
     state: merged ? "MERGED" : "OPEN",
-    headRefName: "v4/acme-repo-1",
+    headRefName,
     headRefOid: "d".repeat(40),
     baseRefName: "main",
     baseRefOid: "b".repeat(40),
     mergedAt: merged ? "2026-08-18T19:20:00Z" : null,
     mergeCommitSha: merged ? "c".repeat(40) : null,
   }]);
-  transport.branches.set("v4/acme-repo-1", {
-    name: "v4/acme-repo-1",
+  transport.branches.set(headRefName, {
+    name: headRefName,
     url: "https://github.test/acme/repo/tree/v4/acme-repo-1",
     oid: "d".repeat(40),
   });
@@ -1240,6 +1244,155 @@ describe("v4.2 GitHub Issues and Projects adapter", () => {
     expect(superseded.snapshot.evidence.mergedAt).toBeUndefined();
     expect(superseded.snapshot.evidence.deploymentUrl).toBeUndefined();
     await expect(adapter.transition("I_1", "merged", 3_500)).rejects.toThrow("merged requires exact provider PR evidence");
+  });
+
+  test("exact magicmarkets closed-done successor supersedes only the source and duplicate commands are no-ops", async () => {
+    const { transport, adapter } = setup("razumv/magicmarkets");
+    transport.addIssue(94, "failed");
+    const successorRecord = transport.addIssue(152, "done");
+    successorRecord.body = contract("WORK-94-DEADLINE-SUCCESSOR", []);
+    attachPr(
+      transport,
+      "I_152",
+      true,
+      { state: "SUCCESS", count: 1 },
+      "MERGEABLE",
+      "v4/razumv-magicmarkets-152",
+    );
+    transport.comments.set("I_152", [{
+      databaseId: 2152,
+      body: "<!-- craft-agent/symphony-deadline-successor@1 malformed -->",
+      authorLogin: "untrusted-user",
+      createdAt: "2026-08-12T11:00:00Z",
+      updatedAt: "2026-08-12T11:00:00Z",
+    }]);
+
+    const successorBefore = structuredClone({
+      record: successorRecord,
+      labels: transport.labels.get("I_152"),
+      fields: transport.fields.get("ITEM_152"),
+      comments: transport.comments.get("I_152"),
+      prs: transport.prs.get("I_152"),
+      branch: transport.branches.get("v4/razumv-magicmarkets-152"),
+    });
+    const validation = await adapter.validateClosedFailedSupersession(
+      "I_94",
+      "I_152",
+      "razumv/magicmarkets#152",
+    );
+    expect(validation).toEqual({
+      accepted: true,
+      reason: "closed successor razumv/magicmarkets#152 is the exact delivered continuation",
+    });
+
+    const accepted = await adapter.supersedeFailed("I_94", "razumv/magicmarkets#152", 5_000);
+    expect(accepted).toMatchObject({ accepted: true, snapshot: { issue: { state: "cancelled" } } });
+    expect(accepted.snapshot.events.at(-1)).toMatchObject({
+      kind: "supersession",
+      successor: "razumv/magicmarkets#152",
+      state: "cancelled",
+    });
+    expect({
+      record: successorRecord,
+      labels: transport.labels.get("I_152"),
+      fields: transport.fields.get("ITEM_152"),
+      comments: transport.comments.get("I_152"),
+      prs: transport.prs.get("I_152"),
+      branch: transport.branches.get("v4/razumv-magicmarkets-152"),
+    }).toEqual(successorBefore);
+
+    const sourceWrites = transport.comments.get("I_94")!.length;
+    const duplicate = await adapter.supersedeFailed("I_94", "razumv/magicmarkets#152", 5_100);
+    expect(duplicate).toMatchObject({ accepted: false, reason: "supersession refused: issue is cancelled, not failed" });
+    expect(transport.comments.get("I_94")).toHaveLength(sourceWrites);
+    expect(transport.comments.get("I_152")).toEqual(successorBefore.comments);
+  });
+
+  test("closed successor lookalikes and incomplete lineage fail closed without writes", async () => {
+    const cases: Array<{
+      name: string;
+      mutate: (transport: MemoryGitHubTransport, successor: GitHubIssueRecord) => void;
+      reason: string;
+    }> = [
+      {
+        name: "closed-cancelled",
+        mutate: (transport) => {
+          transport.labels.set("I_2", ["v4", "state:cancelled"]);
+          transport.fields.set("ITEM_2", [
+            { kind: "single-select", fieldId: "STATUS", fieldName: "Status", optionId: "opt-cancelled", value: "cancelled" },
+            { kind: "text", fieldId: "GATE", fieldName: "Gate", value: null },
+          ]);
+        },
+        reason: "lacks literal managed done label",
+      },
+      {
+        name: "outside-project",
+        mutate: (transport) => transport.items.set("I_2", [{ id: "ITEM_2", projectId: "OTHER" }]),
+        reason: "missing or ambiguous",
+      },
+      {
+        name: "unmerged",
+        mutate: (transport) => transport.prs.set("I_2", []),
+        reason: "lacks exact merge and delivery evidence",
+      },
+      {
+        name: "similarly-named-contract",
+        mutate: (_transport, successor) => { successor.body = contract("WORK-1-DEADLINE-SUCCESSORISH", []); },
+        reason: "lacks durable exact source lineage",
+      },
+    ];
+
+    for (const fixture of cases) {
+      const { transport, adapter } = setup();
+      transport.addIssue(1, "failed");
+      const successor = transport.addIssue(2, "done");
+      successor.body = contract("WORK-1-DEADLINE-SUCCESSOR", []);
+      attachPr(transport, "I_2", true, { state: "SUCCESS", count: 1 }, "MERGEABLE", "v4/acme-repo-2");
+      fixture.mutate(transport, successor);
+      const sourceBefore = structuredClone(transport.comments.get("I_1"));
+      const successorBefore = structuredClone(transport.comments.get("I_2"));
+
+      const validation = await adapter.validateClosedFailedSupersession("I_1", "I_2", "acme/repo#2");
+      expect(validation.accepted, fixture.name).toBeFalse();
+      expect(validation.reason, fixture.name).toContain(fixture.reason);
+      expect(transport.comments.get("I_1"), fixture.name).toEqual(sourceBefore);
+      expect(transport.comments.get("I_2"), fixture.name).toEqual(successorBefore);
+    }
+  });
+
+  test("a pre-closure authenticated receipt supplies lineage, while a mismatched receipt is zero-write", async () => {
+    const { transport, adapter } = setup();
+    transport.addIssue(1, "failed");
+    const successor = transport.addIssue(2, "done");
+    successor.body = contract("INDEPENDENT-CONTINUATION", []);
+    attachPr(transport, "I_2", true, { state: "SUCCESS", count: 1 }, "MERGEABLE", "v4/acme-repo-2");
+    const exactReceipt = {
+      databaseId: 2002,
+      body: "<!-- craft-agent/symphony-deadline-successor@1 INDEPENDENT-CONTINUATION -->\nDeadline successor INDEPENDENT-CONTINUATION was created by Symphony from failed source acme/repo#1.",
+      authorLogin: "craft-bot",
+      createdAt: "2026-08-02T11:00:00Z",
+      updatedAt: "2026-08-02T11:00:00Z",
+    };
+    transport.comments.set("I_2", [exactReceipt]);
+
+    expect(await adapter.validateClosedFailedSupersession("I_1", "I_2", "acme/repo#2")).toEqual({
+      accepted: true,
+      reason: "closed successor acme/repo#2 is the exact delivered continuation",
+    });
+
+    transport.comments.set("I_2", [{
+      ...exactReceipt,
+      body: exactReceipt.body.replace("source acme/repo#1", "source acme/repo#9"),
+    }]);
+    const sourceBefore = structuredClone(transport.comments.get("I_1"));
+    const successorBefore = structuredClone(transport.comments.get("I_2"));
+    const mismatch = await adapter.validateClosedFailedSupersession("I_1", "I_2", "acme/repo#2");
+    expect(mismatch).toEqual({
+      accepted: false,
+      reason: "successor acme/repo#2 creation receipt does not match the exact source and contract",
+    });
+    expect(transport.comments.get("I_1")).toEqual(sourceBefore);
+    expect(transport.comments.get("I_2")).toEqual(successorBefore);
   });
 
   test("closing a failed issue remains an owner decision and refuses later lifecycle rewrites", async () => {
