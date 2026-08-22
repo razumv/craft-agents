@@ -22,6 +22,14 @@ export type LifecycleDecisionResult =
   | { accepted: true; snapshot: TrackerIssueSnapshot; reason: string }
   | { accepted: false; snapshot: TrackerIssueSnapshot; reason: string };
 
+export interface PreservationRecord {
+  issueId: string;
+  attempt: number;
+  branch: string;
+  preservedBranch: string;
+  commit: string;
+}
+
 /** Provider-grounded PR state, separated by whether another actor/event can advance it. */
 export interface PullRequestVerdict {
   disposition: "ready" | "waiting" | "stuck";
@@ -79,6 +87,8 @@ export interface TrackerAdapter {
   pullRequestVerdict?(issueId: string): Promise<PullRequestVerdict>;
   /** Durable, idempotent issue-visible receipt for one immutable Project Desk directive. */
   recordOwnerDirective?(directive: Readonly<OwnerDirective>): Promise<{ recorded: boolean }>;
+  /** Durable receipt written only after the preservation ref is provider-visible. */
+  recordPreservation?(record: Readonly<PreservationRecord>): Promise<{ recorded: boolean }>;
   fetchIssuesByIds(ids: readonly string[]): Promise<TrackerIssueSnapshot[]>;
   activeClaims(): Awaitable<TrackerIssueSnapshot[]>;
   get(issueId: string): Awaitable<TrackerIssueSnapshot>;

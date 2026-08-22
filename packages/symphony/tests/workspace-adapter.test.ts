@@ -21,6 +21,10 @@ async function fixture(options: { onPreserved?: (info: PreservedInfo) => void } 
   await git(root, ["add", "README.md"]);
   await git(root, ["-c", "user.name=Craft Agent Tests", "-c", "user.email=tests@example.invalid", "commit", "-m", "fixture"]);
   const baseSha = (await git(root, ["rev-parse", "HEAD"])).trim();
+  const remote = await mkdtemp(resolve(tmpdir(), "craft-v4-tracker-"));
+  roots.push(remote);
+  await git(remote, ["init", "--bare"]);
+  await git(root, ["remote", "add", "tracker", remote]);
   const workspaceRoot = resolve(root, ".worktrees", "v4-runs");
   const issue: NormalizedIssue = {
     id: "I_52",
@@ -69,10 +73,10 @@ async function fixture(options: { onPreserved?: (info: PreservedInfo) => void } 
   };
   const context: CraftStartContext = { claim, issue, contract };
   const adapter = new GitWorktreeAdapter({
-    repositoryRoot: root, workspaceRoot, gitExecutable: "/usr/bin/git",
+    repositoryRoot: root, workspaceRoot, gitExecutable: "/usr/bin/git", trackerRemote: "tracker",
     ...(options.onPreserved ? { onPreserved: options.onPreserved } : {}),
   });
-  return { root, workspaceRoot, issue, identity, claim, context, adapter };
+  return { root, remote, workspaceRoot, issue, identity, claim, context, adapter };
 }
 
 describe("v4 live git worktree adapter", () => {
@@ -221,6 +225,9 @@ describe("v4 live git worktree adapter", () => {
     const info = preserved[0]!;
     expect(info.attempt).toBe(1);
     expect(info.preservedBranch).toStartWith("v4-preserved/v4-razumv-craft-protocol-52-a1-");
+    expect(await git(first.root, ["ls-remote", "--heads", "tracker", `refs/heads/${info.preservedBranch}`])).toBe(
+      `${info.commit}\trefs/heads/${info.preservedBranch}\n`,
+    );
     await git(first.root, ["branch", `${info.preservedBranch}-unrelated`, info.commit]);
     expect(await first.adapter.findPreservedBranches(first.context.contract.requiredBranch)).toEqual([{
       branch: info.preservedBranch,
@@ -250,6 +257,75 @@ describe("v4 live git worktree adapter", () => {
     expect(preserved).toHaveLength(1);
     expect(preserved[0]!.commit).toBe(head);
     expect((await git(first.root, ["rev-parse", preserved[0]!.preservedBranch])).trim()).toBe(head);
+  });
+
+  test("a failed preservation push records nothing and retains the local branch and interrupted worktree", async () => {
+    const receipts: PreservedInfo[] = [];
+    const first = await fixture({ onPreserved: (info) => receipts.push(info) });
+    const created = await first.adapter.ensure(first.identity, first.context);
+    await writeFile(resolve(created.workspacePath, "must-survive.txt"), "work\n", "utf8");
+    const broken = new GitWorktreeAdapter({ ...first.adapter.config, trackerRemote: "missing-tracker-remote" });
+    const secondIdentity = new IdentityFactory(first.workspaceRoot).forAttempt(first.issue, 2);
+    const secondClaim: Claim = { ...first.claim, ...secondIdentity, attempt: 2, fence: "claim-52-a2" };
+
+    await expect(broken.ensure(secondIdentity, { ...first.context, claim: secondClaim })).rejects.toThrow(
+      /preservation push failed for v4-preserved\/.*missing-tracker-remote.*local branch .* interrupted worktree was not released/s,
+    );
+    expect(receipts).toHaveLength(0);
+    expect((await git(first.root, ["worktree", "list", "--porcelain"]))).toContain(`worktree ${await realpath(created.workspacePath)}`);
+    expect((await git(created.workspacePath, ["status", "--porcelain"]))).toBe("");
+    expect(await git(created.workspacePath, ["show", "HEAD:must-survive.txt"])).toBe("work\n");
+    expect((await git(first.root, ["branch", "--list", "v4-preserved/*"]))).not.toBe("");
+  });
+
+  test("replaying the same preservation is idempotent when the remote branch and receipt already exist", async () => {
+    let ledgerEntries = 0;
+    let interruptAfterReceipt = true;
+    const keys = new Set<string>();
+    const first = await fixture({ onPreserved: async (info) => {
+      const key = `${info.issueId}:${info.attempt}:${info.preservedBranch}:${info.commit}`;
+      if (!keys.has(key)) { keys.add(key); ledgerEntries += 1; }
+      if (interruptAfterReceipt) { interruptAfterReceipt = false; throw new Error("simulated crash after durable receipt"); }
+    } });
+    const created = await first.adapter.ensure(first.identity, first.context);
+    await writeFile(resolve(created.workspacePath, "replay.txt"), "work\n", "utf8");
+    const secondIdentity = new IdentityFactory(first.workspaceRoot).forAttempt(first.issue, 2);
+    const secondClaim: Claim = { ...first.claim, ...secondIdentity, attempt: 2, fence: "claim-52-a2" };
+
+    await expect(first.adapter.ensure(secondIdentity, { ...first.context, claim: secondClaim })).rejects.toThrow("simulated crash");
+    await first.adapter.ensure(secondIdentity, { ...first.context, claim: secondClaim });
+    expect(ledgerEntries).toBe(1);
+    expect(keys.size).toBe(1);
+  });
+
+  test("remote-only preservation discovery supplies a claimable deadline-successor base", async () => {
+    const preserved: PreservedInfo[] = [];
+    const first = await fixture({ onPreserved: (info) => preserved.push(info) });
+    const created = await first.adapter.ensure(first.identity, first.context);
+    await writeFile(resolve(created.workspacePath, "successor-base.txt"), "remote base\n", "utf8");
+    const retryIdentity = new IdentityFactory(first.workspaceRoot).forAttempt(first.issue, 2);
+    const retryClaim: Claim = { ...first.claim, ...retryIdentity, attempt: 2, fence: "claim-52-a2" };
+    await first.adapter.ensure(retryIdentity, { ...first.context, claim: retryClaim });
+    const record = preserved[0]!;
+
+    const consumer = await fixture();
+    await git(consumer.root, ["remote", "remove", "tracker"]);
+    await git(consumer.root, ["remote", "add", "origin", first.remote]);
+    const successorIdentity = new IdentityFactory(consumer.workspaceRoot).forAttempt(consumer.issue, 1);
+    const successorClaim: Claim = { ...consumer.claim, ...successorIdentity, baseSha: record.commit };
+    const successorContract = { ...consumer.context.contract, baseBranch: record.preservedBranch, requiredBranch: "v4/deadline-successor-52" };
+    const successor = await consumer.adapter.ensure(successorIdentity, { ...consumer.context, claim: successorClaim, contract: successorContract });
+
+    expect(await git(successor.workspacePath, ["show", "HEAD:successor-base.txt"])).toBe("remote base\n");
+  });
+
+  test("the one-off audit reports legacy local preservation refs missing from the tracker remote", async () => {
+    const first = await fixture();
+    const legacy = "v4-preserved/v4-legacy-a1-" + first.claim.baseSha.slice(0, 7);
+    await git(first.root, ["branch", legacy, first.claim.baseSha]);
+    expect(await first.adapter.auditPreservedBranches()).toContainEqual({
+      branch: legacy, commit: first.claim.baseSha, remoteCommit: null, durable: false,
+    });
   });
 });
 

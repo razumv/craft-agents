@@ -43,6 +43,7 @@ import { OwnerDirectiveLedger, type OwnerDirective } from "./ledger";
 import type {
   LifecycleDecisionResult,
   PullRequestVerdict,
+  PreservationRecord,
   StartupReconciliation,
   TrackerAdapter,
   TrackerBacklogIssue,
@@ -58,6 +59,9 @@ const fenceSchema = "craft-protocol/v4/wip-fence@1";
 const directiveReceiptPrefix = "<!-- craft-protocol-v4:directive-receipt\n";
 const directiveReceiptSuffix = "\n-->";
 const directiveReceiptSchema = "craft-protocol/v4/directive-receipt@1";
+const preservationReceiptPrefix = "<!-- craft-protocol-v4:preservation-receipt\n";
+const preservationReceiptSuffix = "\n-->";
+const preservationReceiptSchema = "craft-protocol/v4/preservation-receipt@1";
 
 export interface GitHubStateProjection {
   label: string;
@@ -107,6 +111,11 @@ interface LedgerEvent {
 interface DirectiveReceipt {
   schema: typeof directiveReceiptSchema;
   directive: OwnerDirective;
+}
+
+interface PreservationReceipt {
+  schema: typeof preservationReceiptSchema;
+  record: PreservationRecord;
 }
 
 interface SharedFenceEvent {
@@ -355,6 +364,31 @@ export class GitHubIssuesProjectsAdapter implements TrackerAdapter {
       const written = await this.transport.appendComment(directive.issueId, body);
       if (written.body !== body || (this.config.eventAuthorLogin && written.authorLogin !== this.config.eventAuthorLogin)) {
         throw new Error("owner directive receipt did not read back exactly from the configured provider author");
+      }
+      return { recorded: true };
+    });
+  }
+
+  async recordPreservation(record: Readonly<PreservationRecord>): Promise<{ recorded: boolean }> {
+    const detailed = await this.detailed(record.issueId);
+    return this.#withStateLock(async () => {
+      const comments = await collectPages((cursor) => this.transport.listComments(record.issueId, cursor));
+      const matching = comments.flatMap((comment) => {
+        if (this.config.eventAuthorLogin && comment.authorLogin !== this.config.eventAuthorLogin) return [];
+        const receipt = parsePreservationReceipt(comment.body);
+        return receipt?.record.attempt === record.attempt ? [receipt] : [];
+      });
+      if (matching.length > 1) throw new Error(`preservation receipt for attempt ${record.attempt} is duplicated on the issue`);
+      if (matching.length === 1) {
+        if (JSON.stringify(matching[0]!.record) !== JSON.stringify(record)) {
+          throw new Error(`preservation receipt for attempt ${record.attempt} is immutable`);
+        }
+        return { recorded: false };
+      }
+      const body = serializePreservationReceipt(detailed.snapshot.issue.identifier, record);
+      const written = await this.transport.appendComment(record.issueId, body);
+      if (written.body !== body || (this.config.eventAuthorLogin && written.authorLogin !== this.config.eventAuthorLogin)) {
+        throw new Error("preservation receipt did not read back exactly from the configured provider author");
       }
       return { recorded: true };
     });
@@ -1654,6 +1688,37 @@ function parseDirectiveReceipt(body: string): DirectiveReceipt | null {
   if (receipt.schema !== directiveReceiptSchema || !receipt.directive) throw new Error("owner directive receipt schema is invalid");
   new OwnerDirectiveLedger().append(receipt.directive);
   return receipt as DirectiveReceipt;
+}
+
+function serializePreservationReceipt(issueIdentifier: string, record: Readonly<PreservationRecord>): string {
+  const receipt: PreservationReceipt = { schema: preservationReceiptSchema, record: { ...record } };
+  return [
+    `Preserved interrupted work from **${issueIdentifier}** attempt ${record.attempt} on remote branch \`${record.preservedBranch}\` at \`${record.commit}\`.`,
+    "",
+    `${preservationReceiptPrefix}${JSON.stringify(receipt)}${preservationReceiptSuffix}`,
+  ].join("\n");
+}
+
+function parsePreservationReceipt(body: string): PreservationReceipt | null {
+  const start = body.indexOf(preservationReceiptPrefix);
+  if (start < 0) return null;
+  const jsonStart = start + preservationReceiptPrefix.length;
+  const end = body.indexOf(preservationReceiptSuffix, jsonStart);
+  if (end < 0 || body.indexOf(preservationReceiptPrefix, jsonStart) >= 0) throw new Error("preservation receipt is malformed");
+  let parsed: unknown;
+  try { parsed = JSON.parse(body.slice(jsonStart, end)); } catch { throw new Error("preservation receipt contains invalid JSON"); }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("preservation receipt is invalid");
+  const receipt = parsed as Partial<PreservationReceipt>;
+  const record = receipt.record as Partial<PreservationRecord> | undefined;
+  if (receipt.schema !== preservationReceiptSchema || !record
+    || typeof record.issueId !== "string" || !record.issueId
+    || !Number.isInteger(record.attempt) || record.attempt! < 1
+    || typeof record.branch !== "string" || !record.branch
+    || typeof record.preservedBranch !== "string" || !record.preservedBranch
+    || typeof record.commit !== "string" || !/^[0-9a-f]{40,64}$/i.test(record.commit)) {
+    throw new Error("preservation receipt schema is invalid");
+  }
+  return receipt as PreservationReceipt;
 }
 
 async function collectPages<T>(load: (cursor: string | null) => Promise<Page<T>>): Promise<T[]> {

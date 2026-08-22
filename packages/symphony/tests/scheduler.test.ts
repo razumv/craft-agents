@@ -80,6 +80,24 @@ describe("v4.1 deterministic scheduler core", () => {
     expect(simulator.github.get("issue-45").issue.state).toBe("running");
   });
 
+  test("a preservation push failure becomes a durable diagnostic without escaping the lane tick", async () => {
+    const simulator = new CrashRestartSimulator(workflow);
+    simulator.seed(issue(), contract());
+    const diagnostic = "preservation push failed for v4-preserved/v4-CP-45-a1-1234567: remote rejected; local branch remains and the interrupted worktree was not released";
+    const scheduler = new DeterministicScheduler(workflow.config, {
+      github: simulator.github,
+      craft: simulator.craft,
+      workspaces: { ensure: async () => { throw new Error(diagnostic); } },
+    }, simulator.clock);
+
+    await expect(scheduler.tick()).resolves.toBeUndefined();
+    expect(simulator.github.get("issue-45")).toMatchObject({
+      issue: { state: "retry-wait" },
+      retry: { failureClass: "runtime", reason: diagnostic },
+    });
+    expect(simulator.craft.count()).toBe(0);
+  });
+
   test("shadow preview is restart-stable and creates no claim, session, or worktree", async () => {
     const simulator = new CrashRestartSimulator(workflow);
     simulator.seed(issue(), contract());

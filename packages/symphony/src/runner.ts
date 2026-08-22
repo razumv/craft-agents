@@ -771,12 +771,16 @@ export async function createLiveRunner(config: LiveRunnerConfig): Promise<LiveV4
     repositoryRoot: config.repositoryRoot,
     workspaceRoot: config.workspaceRoot,
     gitExecutable: config.git.executable,
-    // Rescued work that nobody is told about is only marginally better than
-    // rescued work that was deleted, so the branch name goes where every other
-    // scheduler diagnostic goes.
-    onPreserved: ({ issueId, attempt, preservedBranch, commit }) => console.warn(
-      `[symphony] preserved interrupted work from ${issueId} attempt ${attempt} on ${preservedBranch} (${commit.slice(0, 7)}) before releasing its branch`,
-    ),
+    trackerRepository: config.github.repository,
+    // The callback is the durable issue ledger write. The worktree adapter has
+    // already pushed and read back the exact ref before this runs; a receipt
+    // failure propagates and therefore retains the original worktree for replay.
+    onPreserved: async (info) => {
+      const receipt = await tracker.recordPreservation(info);
+      if (receipt.recorded) console.warn(
+        `[symphony] preserved interrupted work from ${info.issueId} attempt ${info.attempt} on remote branch ${info.preservedBranch} (${info.commit.slice(0, 7)}); local preservation branch and original worktree are retained if any later release step fails`,
+      );
+    },
   });
   const scheduler = new DeterministicScheduler(
     workflow,
