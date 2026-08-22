@@ -426,7 +426,18 @@ export class LiveV4Runner {
       if (successor.issue.id !== decision.successorIssueId || successor.issue.identifier !== decision.successor) {
         return `successor ${decision.successor} does not match exact configured repository and Project readback`;
       }
-      if (successor.issue.closed) return `successor ${decision.successor} is closed`;
+      if (successor.issue.id === snapshot.issue.id) return `successor ${decision.successor} must be a different issue`;
+      if (successor.issue.closed) {
+        if (!this.tracker.validateClosedFailedSupersession) {
+          return `closed successor ${decision.successor} cannot be proven as the exact delivered continuation`;
+        }
+        const validation = await this.tracker.validateClosedFailedSupersession(
+          snapshot.issue.id,
+          successor.issue.id,
+          successor.issue.identifier,
+        );
+        if (!validation.accepted) return validation.reason;
+      }
     }
     return null;
   }

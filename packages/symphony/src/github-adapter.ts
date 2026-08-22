@@ -55,6 +55,7 @@ import {
 import { OwnerDirectiveLedger, type OwnerDirective } from "./ledger";
 import type {
   FailedDecisionReceiptPoll,
+  FailedSupersessionValidation,
   LifecycleDecisionResult,
   PullRequestVerdict,
   PreservationRecord,
@@ -452,8 +453,11 @@ export class GitHubIssuesProjectsAdapter implements TrackerAdapter {
         continue;
       }
       if (successor.snapshot.issue.closed) {
-        refusals.push(`supersede ${receipt.sourceIssueIdentifier} failed check: successor ${successor.snapshot.issue.identifier} is closed`);
-        continue;
+        const validation = await this.#validateClosedFailedSupersession(source, successor);
+        if (!validation.accepted) {
+          refusals.push(`supersede ${receipt.sourceIssueIdentifier} failed check: ${validation.reason}`);
+          continue;
+        }
       }
       const alreadyApplied = source.snapshot.issue.state === "cancelled"
         && source.snapshot.events.some((event) => event.kind === "supersession" && event.successor === successor.snapshot.issue.identifier);
@@ -492,6 +496,103 @@ export class GitHubIssuesProjectsAdapter implements TrackerAdapter {
       });
     }
     return { decisions, refusals };
+  }
+
+  async validateClosedFailedSupersession(
+    issueId: string,
+    successorIssueId: string,
+    successor: string,
+  ): Promise<FailedSupersessionValidation> {
+    const entries = [...(await this.loadAll(false)).values()];
+    const sources = entries.filter((entry) => entry.snapshot.issue.id === issueId);
+    if (sources.length !== 1) {
+      return { accepted: false, reason: "source is missing or ambiguous in this configured repository and Project" };
+    }
+    const successors = entries.filter((entry) => (
+      entry.snapshot.issue.id === successorIssueId
+      && entry.snapshot.issue.identifier === successor
+    ));
+    if (successors.length !== 1) {
+      return { accepted: false, reason: `successor ${successor} is missing or ambiguous in this configured repository and Project` };
+    }
+    return this.#validateClosedFailedSupersession(sources[0]!, successors[0]!);
+  }
+
+  async #validateClosedFailedSupersession(
+    source: CoreHydrated,
+    successor: CoreHydrated,
+  ): Promise<FailedSupersessionValidation> {
+    const reference = successor.snapshot.issue.identifier;
+    if (source.snapshot.issue.id === successor.snapshot.issue.id) {
+      return { accepted: false, reason: `successor ${reference} must be a different issue` };
+    }
+    if (source.record.state !== "OPEN" || source.snapshot.issue.closed || source.snapshot.issue.state !== "failed") {
+      return { accepted: false, reason: "source is not uniquely open and failed" };
+    }
+    if (source.snapshot.evidence.mergedAt || source.snapshot.evidence.mergeCommitSha) {
+      return { accepted: false, reason: "source provider evidence records delivery" };
+    }
+    if (successor.record.state !== "CLOSED" || !successor.snapshot.issue.closed) {
+      return { accepted: false, reason: `successor ${reference} is not provider-closed` };
+    }
+    const doneLabel = normalizeLabel(this.config.states.done.label);
+    if (
+      successor.snapshot.issue.state !== "done"
+      || successor.projectionDrift
+      || successor.labels.filter((label) => normalizeLabel(label) === doneLabel).length !== 1
+    ) {
+      return { accepted: false, reason: `successor ${reference} lacks literal managed done label and exact Project done projection` };
+    }
+    if (
+      !successor.snapshot.evidence.prUrl
+      || !successor.snapshot.evidence.mergedAt
+      || !successor.snapshot.evidence.mergeCommitSha
+    ) {
+      return { accepted: false, reason: `successor ${reference} lacks exact merge and delivery evidence` };
+    }
+    const acceptanceContinues = successor.contract.acceptance.length > 0
+      && successor.contract.acceptance.length <= source.contract.acceptance.length
+      && successor.contract.acceptance.every((criterion) => source.contract.acceptance.includes(criterion));
+    if (!acceptanceContinues) {
+      return { accepted: false, reason: `successor ${reference} contract does not continue literal source acceptance` };
+    }
+
+    const contractLineage = successor.contract.id === `${source.contract.id}-DEADLINE-SUCCESSOR`;
+    const comments = await collectPages((cursor) => this.transport.listComments(successor.snapshot.issue.id, cursor));
+    const receiptLike = comments.filter((comment) => comment.body.includes("craft-agent/symphony-deadline-successor@1"));
+    let receiptLineage = false;
+    let receiptFailure: string | null = null;
+    if (receiptLike.length > 0) {
+      const exact = receiptLike.flatMap((comment) => {
+        if (this.config.eventAuthorLogin && comment.authorLogin !== this.config.eventAuthorLogin) return [];
+        const receipt = parseDeadlineSuccessorAttribution(comment.body);
+        return receipt ? [{ comment, receipt }] : [];
+      });
+      if (exact.length !== 1 || exact.length !== receiptLike.length) {
+        receiptFailure = `successor ${reference} creation receipt is malformed, ambiguous, or has the wrong provider author`;
+      } else {
+        const [{ comment, receipt }] = exact;
+        if (receipt.contractId !== successor.contract.id || receipt.sourceIssueIdentifier !== source.snapshot.issue.identifier) {
+          receiptFailure = `successor ${reference} creation receipt does not match the exact source and contract`;
+        } else {
+          const closedAt = successor.record.closedAt ? Date.parse(successor.record.closedAt) : Number.NaN;
+          const createdAt = Date.parse(comment.createdAt);
+          if (!Number.isFinite(closedAt) || !Number.isFinite(createdAt) || createdAt >= closedAt) {
+            receiptFailure = `successor ${reference} creation receipt is not proven to predate provider closure`;
+          } else {
+            receiptLineage = true;
+          }
+        }
+      }
+    }
+    // Receipt evidence and parser-valid contract lineage are alternatives. A
+    // stray receipt-like comment cannot poison exact contract lineage, but a
+    // successor relying on receipt lineage still fails closed on every defect.
+    if (receiptFailure && !contractLineage) return { accepted: false, reason: receiptFailure };
+    if (!receiptLineage && !contractLineage) {
+      return { accepted: false, reason: `successor ${reference} lacks durable exact source lineage` };
+    }
+    return { accepted: true, reason: `closed successor ${reference} is the exact delivered continuation` };
   }
 
   async fetchIssuesByStates(states: readonly LifecycleState[]): Promise<TrackerIssueSnapshot[]> {
@@ -1097,6 +1198,18 @@ export class GitHubIssuesProjectsAdapter implements TrackerAdapter {
     }
     if (current.snapshot.issue.closed) {
       return { accepted: false, snapshot: current.snapshot, reason: "supersession refused: issue is closed" };
+    }
+    const entries = [...(await this.loadAll(false)).values()];
+    const matchingSources = entries.filter((entry) => entry.snapshot.issue.id === issueId);
+    const matchingSuccessors = entries.filter((entry) => entry.snapshot.issue.identifier === successorRef);
+    if (matchingSuccessors.length === 1 && matchingSuccessors[0]!.snapshot.issue.closed) {
+      if (matchingSources.length !== 1) {
+        return { accepted: false, snapshot: current.snapshot, reason: "supersession refused: source is missing or ambiguous in this configured repository and Project" };
+      }
+      const validation = await this.#validateClosedFailedSupersession(matchingSources[0]!, matchingSuccessors[0]!);
+      if (!validation.accepted) {
+        return { accepted: false, snapshot: current.snapshot, reason: `supersession refused: ${validation.reason}` };
+      }
     }
     const message = `cancelled because work continued at ${successorRef}`;
     const event = nextEvent(current.snapshot, "supersession", "cancelled", nowMs, null, {

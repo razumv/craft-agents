@@ -487,6 +487,116 @@ describe("v4 live runner mutation scope", () => {
     expect(diagnostics).toContainEqual(expect.stringContaining("failed decision supersede"));
   });
 
+  test("preflights a closed-done successor before writing a Desk receipt and calls only supersedeFailed", async () => {
+    const base = transitionFixture("settled").runner;
+    const status = await base.readStatus();
+    const source = structuredClone(status.snapshot!);
+    source.issue.id = "MAGIC_94";
+    source.issue.identifier = "razumv/magicmarkets#94";
+    source.issue.state = "failed";
+    source.issue.closed = false;
+    source.claim = null;
+    source.events = [{ sequence: 4, atMs: 2_000, state: "failed", kind: "failure", message: "attempt failed" }];
+    const successor = structuredClone(source);
+    successor.issue.id = "MAGIC_152";
+    successor.issue.identifier = "razumv/magicmarkets#152";
+    successor.issue.state = "done";
+    successor.issue.closed = true;
+    successor.evidence = { prUrl: "https://github.test/pr/152", mergedAt: "2026-08-20T12:00:00Z", mergeCommitSha: "c".repeat(40) };
+    let validations = 0;
+    let receipts = 0;
+    let supersessions = 0;
+    let directTransitions = 0;
+    const tracker = {
+      fetchIssuesByStates: async () => [structuredClone(source), structuredClone(successor)],
+      get: async (issueId: string) => structuredClone(issueId === successor.issue.id ? successor : source),
+      validateClosedFailedSupersession: async () => { validations += 1; return { accepted: true as const, reason: "exact delivered continuation" }; },
+      recordOwnerDirective: async () => { receipts += 1; return { recorded: true }; },
+      supersedeFailed: async (_issueId: string, reference: string) => {
+        supersessions += 1;
+        source.issue.state = "cancelled";
+        source.version += 1;
+        source.events.push({ sequence: 5, atMs: 2_100, state: "cancelled", kind: "supersession", message: "superseded", successor: reference });
+        return { accepted: true as const, snapshot: structuredClone(source), reason: "superseded" };
+      },
+      transition: async () => { directTransitions += 1; return structuredClone(source); },
+    } as unknown as GitHubIssuesProjectsAdapter;
+    const directive = {
+      id: "directive-magic-94", issueId: source.issue.id, receivedAtMs: 2_050, acknowledgedAtMs: 2_050,
+      verbatim: "SUPERSEDE razumv/magicmarkets#94: razumv/magicmarkets#152",
+      sourceSessionId: "owner-desk", sourceMessageId: "message-magic-94", acknowledgementId: "ack-magic-94",
+    };
+    const craft = {
+      pollOwnerDesk: async () => ({
+        directives: [{
+          directive, gateDecision: null, newlyIngested: true,
+          failedDecision: {
+            kind: "supersede" as const, issueId: source.issue.id, successorIssueId: successor.issue.id,
+            successor: successor.issue.identifier, evidenceId: directive.id,
+          },
+        }],
+        refusals: [], providerReadCalls: 4 as const, providerWriteCalls: 0 as const,
+      }),
+      get: async () => structuredClone(status.execution),
+    } as unknown as CraftMobileControlPlaneAdapter;
+    const runner = new LiveV4Runner(
+      { issueId: source.issue.id } as LiveRunnerConfig,
+      { scheduler: { maxRevivals: 2 } } as WorkflowConfig,
+      tracker, craft, {} as CraftCliRpcTransport, { tick: async () => {} } as unknown as DeterministicScheduler,
+    );
+
+    await runner.tick();
+
+    expect(validations).toBe(2);
+    expect(receipts).toBe(1);
+    expect(supersessions).toBe(1);
+    expect(directTransitions).toBe(0);
+    expect(String(source.issue.state)).toBe("cancelled");
+  });
+
+  test("a closed successor lineage refusal makes the Desk command zero-write", async () => {
+    const base = transitionFixture("settled").runner;
+    const status = await base.readStatus();
+    const source = structuredClone(status.snapshot!);
+    source.issue.state = "failed";
+    source.issue.closed = false;
+    const successor = structuredClone(source);
+    successor.issue.id = "CLOSED_LOOKALIKE";
+    successor.issue.identifier = "acme/repo#152";
+    successor.issue.state = "done";
+    successor.issue.closed = true;
+    let receipts = 0;
+    let supersessions = 0;
+    const tracker = {
+      fetchIssuesByStates: async () => [structuredClone(source), structuredClone(successor)],
+      get: async (issueId: string) => structuredClone(issueId === successor.issue.id ? successor : source),
+      validateClosedFailedSupersession: async () => ({ accepted: false as const, reason: "successor lacks durable exact source lineage" }),
+      recordOwnerDirective: async () => { receipts += 1; return { recorded: true }; },
+      supersedeFailed: async () => { supersessions += 1; throw new Error("must not mutate"); },
+    } as unknown as GitHubIssuesProjectsAdapter;
+    const craft = {
+      pollOwnerDesk: async () => ({ directives: [{
+        directive: {
+          id: "bad-lineage", issueId: source.issue.id, receivedAtMs: 2_000, acknowledgedAtMs: 2_000,
+          verbatim: "SUPERSEDE acme/repo#1: acme/repo#152", sourceSessionId: "desk", sourceMessageId: "bad", acknowledgementId: "ack-bad",
+        },
+        gateDecision: null, newlyIngested: true,
+        failedDecision: { kind: "supersede" as const, issueId: source.issue.id, successorIssueId: successor.issue.id, successor: successor.issue.identifier, evidenceId: "bad-lineage" },
+      }], refusals: [], providerReadCalls: 4 as const, providerWriteCalls: 0 as const }),
+      get: async () => structuredClone(status.execution),
+    } as unknown as CraftMobileControlPlaneAdapter;
+    const runner = new LiveV4Runner(
+      { issueId: source.issue.id } as LiveRunnerConfig,
+      {} as WorkflowConfig, tracker, craft, {} as CraftCliRpcTransport,
+      { tick: async () => {} } as unknown as DeterministicScheduler,
+    );
+
+    await runner.tick();
+
+    expect(receipts).toBe(0);
+    expect(supersessions).toBe(0);
+  });
+
   test("applies an exact current gate approval only after its issue receipt", async () => {
     const base = transitionFixture("settled").runner;
     const status = await base.readStatus();

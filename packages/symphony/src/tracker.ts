@@ -23,6 +23,10 @@ export type LifecycleDecisionResult =
   | { accepted: true; snapshot: TrackerIssueSnapshot; reason: string }
   | { accepted: false; snapshot: TrackerIssueSnapshot; reason: string };
 
+export type FailedSupersessionValidation =
+  | { accepted: true; reason: string }
+  | { accepted: false; reason: string };
+
 export type FailedLifecycleDecision =
   | { kind: "revive"; issueId: string; justification: string; evidenceId: string }
   | { kind: "supersede"; issueId: string; successorIssueId: string; successor: string; evidenceId: string };
@@ -99,6 +103,12 @@ export interface TrackerAdapter {
   recordOwnerDirective?(directive: Readonly<OwnerDirective>): Promise<{ recorded: boolean }>;
   /** Exact #94 successor-creation receipts that can supersede their failed sources. */
   pollFailedDecisionReceipts?(): Promise<FailedDecisionReceiptPoll>;
+  /** Read-only proof that a closed-done successor is the exact delivered continuation of a failed source. */
+  validateClosedFailedSupersession?(
+    issueId: string,
+    successorIssueId: string,
+    successor: string,
+  ): Awaitable<FailedSupersessionValidation>;
   /** Durable receipt written only after the preservation ref is provider-visible. */
   recordPreservation?(record: Readonly<PreservationRecord>): Promise<{ recorded: boolean }>;
   fetchIssuesByIds(ids: readonly string[]): Promise<TrackerIssueSnapshot[]>;

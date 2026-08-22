@@ -531,6 +531,22 @@ describe("v4.3 Craft mobile control-plane adapter", () => {
       target: source,
       failedDecision: { kind: "supersede", issueId: "SOURCE", successor: "acme/repo#66" },
     });
+    const magicSource = { ...source, issueId: "MAGIC_94", issueIdentifier: "razumv/magicmarkets#94" };
+    const completedMagicSuccessor = {
+      issueId: "MAGIC_152", issueIdentifier: "razumv/magicmarkets#152", state: "done", closed: true, providerMerged: true,
+    };
+    expect(classifyProjectDeskMessage(
+      "SUPERSEDE razumv/magicmarkets#94: razumv/magicmarkets#152",
+      [magicSource, completedMagicSuccessor],
+    )).toMatchObject({
+      kind: "directive",
+      target: magicSource,
+      failedDecision: { kind: "supersede", issueId: "MAGIC_94", successorIssueId: "MAGIC_152" },
+    });
+    expect(classifyProjectDeskMessage(
+      "SUPERSEDE razumv/magicmarkets#94: razumv/magicmarkets#152",
+      [magicSource, { ...completedMagicSuccessor, state: "cancelled" }],
+    )).toMatchObject({ kind: "refused", reason: expect.stringContaining("lacks literal done lifecycle") });
     expect(classifyProjectDeskMessage("REVIVE acme/repo#65: quota reset OPS-41", targets)).toMatchObject({
       kind: "refused", reason: expect.stringContaining("change already used"),
     });

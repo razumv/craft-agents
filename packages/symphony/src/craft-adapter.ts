@@ -917,10 +917,14 @@ export function classifyProjectDeskMessage(
       };
     }
     const successorMatches = targets.filter((target) => target.issueIdentifier === argument);
-    if (successorMatches.length !== 1 || successorMatches[0]!.closed) {
-      return { kind: "refused", reason: `supersede ${reference} failed check: successor ${argument} is missing, closed, or outside this configured repository and Project` };
+    if (successorMatches.length !== 1) {
+      return { kind: "refused", reason: `supersede ${reference} failed check: successor ${argument} is missing, ambiguous, or outside this configured repository and Project` };
     }
-    if (successorMatches[0]!.issueId === source.issueId) {
+    const successor = successorMatches[0]!;
+    if (successor.closed && (successor.state !== "done" || !successor.providerMerged)) {
+      return { kind: "refused", reason: `supersede ${reference} failed check: closed successor ${argument} lacks literal done lifecycle and exact provider delivery evidence` };
+    }
+    if (successor.issueId === source.issueId) {
       return { kind: "refused", reason: `supersede ${reference} failed check: successor must be a different issue` };
     }
     return {

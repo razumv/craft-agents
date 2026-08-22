@@ -14,6 +14,8 @@ export interface GitHubIssueRecord {
   state: "OPEN" | "CLOSED";
   createdAt: string;
   updatedAt: string;
+  /** Provider closure instant; required to prove a creation receipt predates completed delivery. */
+  closedAt?: string | null;
   assigneeId: string | null;
   /**
    * Label names carried by the listing itself, when the transport can supply
@@ -229,7 +231,7 @@ export class GhCliTransport implements GitHubTransport {
     // into O(pages) for everything the lane does not manage. GitHub's `since`
     // filter is inclusive, so issues sharing the boundary timestamp are safely
     // repeated instead of being skipped due to timestamp precision.
-    const data = await this.graphql<{ repository: { issues: GraphPage<GitHubIssueRecord> } }>(`query Issues($owner:String!,$name:String!,$cursor:String,$since:DateTime){repository(owner:$owner,name:$name){issues(first:100,after:$cursor,filterBy:{since:$since},orderBy:{field:UPDATED_AT,direction:ASC}){nodes{id number title body url state createdAt updatedAt assignees(first:1){nodes{id}}labels(first:LABEL_PAGE){nodes{name}totalCount}parent{id number title state url}}pageInfo{hasNextPage endCursor}}}}`.replace("LABEL_PAGE", String(LISTING_LABEL_PAGE_SIZE)), { owner, name, cursor, since: updatedSince });
+    const data = await this.graphql<{ repository: { issues: GraphPage<GitHubIssueRecord> } }>(`query Issues($owner:String!,$name:String!,$cursor:String,$since:DateTime){repository(owner:$owner,name:$name){issues(first:100,after:$cursor,filterBy:{since:$since},orderBy:{field:UPDATED_AT,direction:ASC}){nodes{id number title body url state createdAt updatedAt closedAt assignees(first:1){nodes{id}}labels(first:LABEL_PAGE){nodes{name}totalCount}parent{id number title state url}}pageInfo{hasNextPage endCursor}}}}`.replace("LABEL_PAGE", String(LISTING_LABEL_PAGE_SIZE)), { owner, name, cursor, since: updatedSince });
     return page({
       ...data.repository.issues,
       nodes: data.repository.issues.nodes.map((issue) => {
@@ -272,8 +274,8 @@ export class GhCliTransport implements GitHubTransport {
     }
     const data = await this.graphql<{ nodes: ({
       id: string; number: number; title: string; body: string; url: string; state: "OPEN" | "CLOSED";
-      createdAt: string; updatedAt: string; assignees: { nodes: { id: string }[] };
-    } | null)[] }>(`query IssueNodes($ids:[ID!]!){nodes(ids:$ids){... on Issue{id number title body url state createdAt updatedAt assignees(first:1){nodes{id}}}}}`, { ids });
+      createdAt: string; updatedAt: string; closedAt: string | null; assignees: { nodes: { id: string }[] };
+    } | null)[] }>(`query IssueNodes($ids:[ID!]!){nodes(ids:$ids){... on Issue{id number title body url state createdAt updatedAt closedAt assignees(first:1){nodes{id}}}}}`, { ids });
     return data.nodes.map((issue) => issue ? { ...issue, assigneeId: issue.assignees.nodes[0]?.id ?? null } : null);
   }
 
